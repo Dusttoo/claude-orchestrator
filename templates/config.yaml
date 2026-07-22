@@ -29,10 +29,17 @@ merge_to_integration: merge     # merge | squash. `merge` preserves per-PR histo
 merge_to_production: squash     # squash -> one clean commit per release
 
 # --- CI required checks --------------------------------------------------- both
-# Exact GitHub check-run names, comma-separated. Defines what "CI green" means on
-# each target. The gate polls these before allowing merge-on-green.
-ci_checks_integration: TypeScript, Vitest, Build
-ci_checks_production: TypeScript, Vitest, Build, Playwright
+# Exact GitHub check-run names. Defines what "CI green" means on each target.
+# The gate polls these before allowing merge-on-green.
+ci_checks_integration:
+  - TypeScript
+  - Vitest
+  - Build
+ci_checks_production:
+  - TypeScript
+  - Vitest
+  - Build
+  - Playwright
 
 # --- Self-check gate ------------------------------------------------------ both
 # Runs in the implementer's worktree before it pushes, and again by the gate.
@@ -40,6 +47,16 @@ ci_checks_production: TypeScript, Vitest, Build, Playwright
 # name them well. This is where a repo declares its own conventions (a hex-color
 # grep, a lint rule, a codegen-drift check) WITHOUT the framework hardcoding them.
 # A check passes on exit 0. Negate a "must find nothing" grep with `! grep ...`.
+#
+# `run` values are passed verbatim to `bash -c` (the parser strips only a pair of
+# matching outer quotes; it does no YAML escape processing). Quote a value when it
+# starts with `!` or contains a space-then-`#`. Prefer SINGLE quotes when the value
+# needs literal backslashes: YAML single-quotes pass them through unchanged.
+# Do not put an inline `# comment` after a `run:` value.
+#
+# Watch the exit codes: `! grep PATTERN path` reports success both when the
+# pattern is absent AND when `path` is missing (grep exits 2), so a mistyped
+# path silently passes. Point the check at a path you know exists.
 self_check:
   - name: typecheck
     run: npx tsc --noEmit
@@ -49,7 +66,7 @@ self_check:
     run: npm test
   # Example repo-specific convention (delete if not applicable):
   # - name: no-hex-in-components
-  #   run: "! grep -rn '#[0-9a-fA-F]\\{3,\\}' src/components --include=*.tsx --include=*.ts"
+  #   run: '! grep -rqn "#[0-9a-fA-F]\{3,\}" src/components'
 
 # --- Heavy / optional verification --------------------------------------- agent
 # End-to-end and visual-QA gates. These are opt-in because they assume
