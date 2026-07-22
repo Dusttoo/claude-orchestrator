@@ -94,6 +94,7 @@ hard all-green gate, enforced by a hook, before anything lands.
 | `commands/` | `/orchestrate`, `/gate`, `/release`, `/orchestration-init` |
 | `hooks/` | `PreToolUse` merge-guard + `Stop` worktree sweep |
 | `scripts/` | The mechanics: config reader, gate runner, merge-guard, safe-merge, worktree lifecycle, verification |
+| `skills/` | Relevance-triggered procedures: `scope-ticket`, `recover-agent-work` |
 | `templates/` | The per-repo `config.yaml` and `ORCHESTRATION.md` to copy in |
 | `tests/` | Shell test suites for the scripts (`bash tests/run.sh`) |
 
