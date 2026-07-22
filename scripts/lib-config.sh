@@ -66,6 +66,37 @@ orch_list() {
   ' "$f"
 }
 
+# orch_named <block> <name> <field> -- within a top-level list-of-maps `block:`,
+# find the entry whose `name:` equals <name> and print its `<field>:` value.
+# Emits nothing if the block, entry, or field is absent. Strips one pair of outer
+# quotes (no YAML escape processing), matching orch_selfchecks' `run` handling.
+orch_named() {
+  local blk="$1" want="$2" fld="$3" f
+  f="$(orch_config_file)"
+  [ -f "$f" ] || return 0
+  awk -v blk="$blk" -v want="$want" -v fld="$fld" '
+    function trim(s)   { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    function unquote(s,  n, a, b) {
+      n = length(s); if (n < 2) return s
+      a = substr(s, 1, 1); b = substr(s, n, 1)
+      if ((a == "\"" && b == "\"") || (a == "\x27" && b == "\x27")) return substr(s, 2, n - 2)
+      return s
+    }
+    $0 ~ "^" blk ":[[:space:]]*(#.*)?$" { inblk = 1; cur = ""; next }
+    inblk {
+      if ($0 ~ /^[^[:space:]]/) { inblk = 0; next }        # dedent to col 0 ends block
+      if ($0 ~ /^[[:space:]]+-[[:space:]]+name:/) {
+        line = $0; sub(/^[[:space:]]+-[[:space:]]+name:[[:space:]]*/, "", line)
+        cur = unquote(trim(line)); next
+      }
+      if (cur == want && $0 ~ ("^[[:space:]]+" fld ":")) {
+        line = $0; sub("^[[:space:]]+" fld ":[[:space:]]*", "", line)
+        print unquote(trim(line)); exit
+      }
+    }
+  ' "$f"
+}
+
 # orch_selfchecks -- emit one line per self_check entry as: name<TAB>run
 # The run value is passed through verbatim except that a single pair of matching
 # outer quotes is stripped (no YAML escape processing -- see the template docs).

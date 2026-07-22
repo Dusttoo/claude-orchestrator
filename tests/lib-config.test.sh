@@ -55,6 +55,10 @@ eq "selfchecks: first run"    "npx tsc --noEmit" "$(orch_selfchecks | head -1 | 
 eq "selfchecks: literal backslash run" '! grep -rqn "#[0-9a-fA-F]\{3,\}" src' \
    "$(orch_selfchecks | sed -n 2p | cut -f2)"
 
+eq "named: verification e2e run" "npx playwright test" "$(orch_named verification e2e run)"
+eq "named: missing entry is empty" "" "$(orch_named verification nope run)"
+eq "named: missing field is empty" "" "$(orch_named verification e2e when)"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi
 [ "$fails" -eq 0 ]

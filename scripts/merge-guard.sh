@@ -12,7 +12,11 @@
 #   exit 2 : BLOCK; stderr is fed back to the model as the reason.
 #
 # Recorder modes (called by the orchestrator ONLY after all gates PASS + CI green):
-#   merge-guard.sh --record-green <pr>   # stamp a marker with the PR's current head sha
+#   merge-guard.sh --record-green <pr> [result_file]
+#       Stamp a marker with the PR's current head sha. If a result_file from
+#       run-verification.sh is given, its embedded sha MUST match the PR head, so
+#       a marker cannot be recorded without the verification actually having run
+#       on the current commit.
 #   merge-guard.sh --clear <pr>          # drop the marker (e.g. after a rebase)
 #
 # Fail-closed by design: if the payload cannot be parsed (e.g. python3 absent),
@@ -43,15 +47,37 @@ iso_to_epoch() {
 
 case "${1:-}" in
   --record-green)
-    PR="${2:?usage: merge-guard.sh --record-green <pr>}"
+    PR="${2:?usage: merge-guard.sh --record-green <pr> [result_file]}"
+    RESULT_FILE="${3:-}"
     SHA="$(resolve_pr_head_sha "$PR")"
     if [ -z "$SHA" ]; then
       echo "merge-guard: REFUSED: could not resolve PR #$PR head sha (gh authed? PR number right?)." >&2
       exit 2
     fi
-    printf 'all-green pr=%s sha=%s recorded_at=%s\n' "$PR" "$SHA" "$(date -u +%FT%TZ)" \
-      > "${STATUS_DIR}/pr-${PR}.green"
-    echo "merge-guard: recorded all-green for PR #$PR (sha=$SHA)."
+    # If a verification result file is supplied, its sha must match the PR head,
+    # so a marker cannot be stamped without the verification having run on this
+    # exact commit.
+    VERIFIED_BY=""
+    if [ -n "$RESULT_FILE" ]; then
+      if [ ! -f "$RESULT_FILE" ]; then
+        echo "merge-guard: REFUSED: result file '$RESULT_FILE' not found." >&2
+        exit 2
+      fi
+      if ! grep -q '^result=GREEN' "$RESULT_FILE"; then
+        echo "merge-guard: REFUSED: result file '$RESULT_FILE' is not GREEN." >&2
+        exit 2
+      fi
+      FILE_SHA="$(grep -Eo '^sha=[^[:space:]]+' "$RESULT_FILE" | head -1 | cut -d= -f2)"
+      if [ "$FILE_SHA" != "$SHA" ]; then
+        echo "merge-guard: REFUSED: result file sha ($FILE_SHA) != PR #$PR head ($SHA)." >&2
+        echo "The branch moved after the verification ran. Rebase, re-run it, and retry." >&2
+        exit 2
+      fi
+      VERIFIED_BY=" verified_by=${RESULT_FILE##*/}"
+    fi
+    printf 'all-green pr=%s sha=%s recorded_at=%s%s\n' \
+      "$PR" "$SHA" "$(date -u +%FT%TZ)" "$VERIFIED_BY" > "${STATUS_DIR}/pr-${PR}.green"
+    echo "merge-guard: recorded all-green for PR #$PR (sha=$SHA)${VERIFIED_BY:+, $VERIFIED_BY}."
     exit 0
     ;;
   --clear)
