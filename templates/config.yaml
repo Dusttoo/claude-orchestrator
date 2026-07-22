@@ -1,0 +1,115 @@
+# .orchestration/config.yaml
+#
+# Per-repo orchestration config. Copy this to `<repo>/.orchestration/config.yaml`
+# and edit it for your project. The plugin's scripts, agents, and commands read
+# this file so one harness works across codebases without a fork.
+#
+# Division of responsibility:
+#   - THIS FILE declares the *mechanics*: branch model, gate commands, CI check
+#     names, what triggers a security review, concurrency. Repo-specific facts.
+#   - Your repo's CLAUDE.md / AGENTS.md hold the *knowledge*: conventions,
+#     gotchas, the actual rules. The gate agents read those (see `rules_docs`).
+#     Keep engineering rules out of this file; keep wiring out of those docs.
+#
+# "read by" annotations on each block:
+#   shell  -> parsed by scripts/lib-config.sh (pure bash, no YAML dependency)
+#   agent  -> read semantically by the orchestrator / gate agents from the YAML
+#   both   -> read by shell for enforcement, and by agents for narration
+#
+# The shell parser supports two shapes only: flat `key: value` scalars, and
+# simple block lists / list-of-maps under a top-level key (see self_check).
+# Do not introduce deeper nesting under a shell-read key.
+
+# --- Branch model --------------------------------------------------------- both
+integration_branch: develop     # where feature branches merge first
+production_branch: main         # release target; merge-guard blocks direct merges here
+
+# --- Merge strategy per target -------------------------------------------- both
+merge_to_integration: merge     # merge | squash. `merge` preserves per-PR history
+merge_to_production: squash     # squash -> one clean commit per release
+
+# --- CI required checks --------------------------------------------------- both
+# Exact GitHub check-run names, comma-separated. Defines what "CI green" means on
+# each target. The gate polls these before allowing merge-on-green.
+ci_checks_integration: TypeScript, Vitest, Build
+ci_checks_production: TypeScript, Vitest, Build, Playwright
+
+# --- Self-check gate ------------------------------------------------------ both
+# Runs in the implementer's worktree before it pushes, and again by the gate.
+# Each entry is a named shell command; the gate reports pass/fail per name, so
+# name them well. This is where a repo declares its own conventions (a hex-color
+# grep, a lint rule, a codegen-drift check) WITHOUT the framework hardcoding them.
+# A check passes on exit 0. Negate a "must find nothing" grep with `! grep ...`.
+self_check:
+  - name: typecheck
+    run: npx tsc --noEmit
+  - name: build
+    run: npm run build
+  - name: unit
+    run: npm test
+  # Example repo-specific convention (delete if not applicable):
+  # - name: no-hex-in-components
+  #   run: "! grep -rn '#[0-9a-fA-F]\\{3,\\}' src/components --include=*.tsx --include=*.ts"
+
+# --- Heavy / optional verification --------------------------------------- agent
+# End-to-end and visual-QA gates. These are opt-in because they assume
+# repo-specific infrastructure (a browser suite, auth, running app). Each entry
+# runs only on the target named in `when`.
+#   when: never | integration | production | always
+# Omit or leave empty for repos that do not need them.
+verification:
+  - name: e2e
+    run: npx playwright test
+    when: production          # release-gate only, by default
+  # Visual QA: capture screens, then a visual-qa agent compares against a design
+  # reference. Needs auth + selectors for an app behind login.
+  # - name: visual-qa
+  #   when: never
+  #   capture: ${CLAUDE_PLUGIN_ROOT}/scripts/capture-screens.sh
+  #   auth:
+  #     strategy: form        # form | cookie | none
+  #     email_env: VQA_EMAIL
+  #     password_env: VQA_PASSWORD
+  #     email_selector: 'input[name="email"]'
+  #     password_selector: 'input[name="password"]'
+  #     submit_selector: 'button[type="submit"]'
+
+# --- Gate sequence -------------------------------------------------------- agent
+# Which independent review roles run, in order, before merge-on-green.
+# Drop security-review for repos with no auth / data-isolation / payment surface.
+gates:
+  - code-review
+  - security-review
+
+# --- Security-gate trigger ------------------------------------------------ agent
+# When the security gate is mandatory. Either the literal `always`, or a list of
+# path fragments / keywords matched against the PR diff. Any match -> required.
+security_required_when:
+  - migrations/
+  - rls
+  - auth
+  - policy
+  - SECURITY DEFINER
+  - webhook
+  - payment
+
+# --- Ticket system -------------------------------------------------------- agent
+# How the orchestrator resolves and transitions work items.
+ticket:
+  kind: none                  # jira | github | none
+  project: ""                 # e.g. a Jira project key; unused when kind=none
+
+# --- Concurrency ---------------------------------------------------------- both
+# Max heavy verification chains running at once. Drop to 1 under CI contention or
+# when agents would collide on a shared test branch.
+concurrency_max: 2
+
+# --- Worktrees ------------------------------------------------------------ both
+worktree_base: .claude/worktrees   # where isolated agent worktrees are created
+
+# --- Canonical rules docs ------------------------------------------------- agent
+# The docs every gate agent must read before judging a diff. This is the seam
+# that keeps project knowledge out of the harness.
+rules_docs:
+  - CLAUDE.md
+  - AGENTS.md
