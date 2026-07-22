@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // vqa-capture.mjs -- the headless Stage 4 visual-QA engine.
 //
-// Supersedes capture-screens.sh for the gate. It does everything that script did
-// (headless full-page shots at desktop + mobile widths) and adds the deterministic
-// signals an unattended run needs to FAIL a broken page without a human looking:
+// The headless capture engine behind run-visual-qa.sh: full-page shots at
+// desktop + mobile widths, plus the deterministic signals an unattended run
+// needs to FAIL a broken page without a human looking:
 //
 //   - final navigation HTTP status per route (>=400 is a hard fail)
 //   - uncaught page errors (window.onerror / unhandledrejection)

@@ -69,27 +69,23 @@ self_check:
   #   run: '! grep -rqn "#[0-9a-fA-F]\{3,\}" src/components'
 
 # --- Heavy / optional verification --------------------------------------- agent
-# End-to-end and visual-QA gates. These are opt-in because they assume
-# repo-specific infrastructure (a browser suite, auth, running app). Each entry
-# runs only on the target named in `when`.
+# Named headless pass/fail suites (e.g. the full e2e run). Opt-in: they assume a
+# browser suite / running app. run-verification.sh <name> runs one and writes a
+# sha-stamped result file the merge-guard validates. Each runs only on the target
+# named in `when`.
 #   when: never | integration | production | always
-# Omit or leave empty for repos that do not need them.
+# Omit or leave empty for repos with no heavy suite.
 verification:
   - name: e2e
     run: npx playwright test
     when: production          # release-gate only, by default
-  # Visual QA: capture screens, then a visual-qa agent compares against a design
-  # reference. Needs auth + selectors for an app behind login.
-  # - name: visual-qa
-  #   when: never
-  #   capture: ${CLAUDE_PLUGIN_ROOT}/scripts/capture-screens.sh
-  #   auth:
-  #     strategy: form        # form | cookie | none
-  #     email_env: VQA_EMAIL
-  #     password_env: VQA_PASSWORD
-  #     email_selector: 'input[name="email"]'
-  #     password_selector: 'input[name="password"]'
-  #     submit_selector: 'button[type="submit"]'
+#
+# Visual QA is a separate OPTIONAL agent stage (orchestration-visual-qa), not a
+# verification entry -- it needs vision, not a pass/fail command. It runs
+# run-visual-qa.sh, which reads BASE_URL and, for authed surfaces, AUTH=1 with
+# VQA_EMAIL / VQA_PASSWORD and (if the login form differs) LOGIN_PATH and
+# EMAIL_SELECTOR / PASSWORD_SELECTOR / SUBMIT_SELECTOR. Configure those via the
+# environment when you invoke the stage; there is nothing to declare here.
 
 # --- Gate sequence -------------------------------------------------------- agent
 # Which independent review roles run, in order, before merge-on-green.

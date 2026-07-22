@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/merge-guard.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "WT_QUIET=1 ${CLAUDE_PLUGIN_ROOT}/scripts/sweep-agent-worktrees.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
