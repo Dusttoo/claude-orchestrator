@@ -1,0 +1,14 @@
+{
+  "name": "builtbydusty",
+  "owner": {
+    "name": "Dusty Mumphrey"
+  },
+  "plugins": [
+    {
+      "name": "claude-orchestrator",
+      "source": "./",
+      "description": "Multi-agent orchestration harness for Claude Code: implement -> independent code-review -> independent security-review -> merge-on-green, with git-worktree isolation, a mechanical merge-guard hook, worktree auto-cleanup, and release/back-merge discipline. Config-driven so it ports across repositories.",
+      "category": "workflow"
+    }
+  ]
+}

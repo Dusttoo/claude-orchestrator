@@ -1,0 +1,7 @@
+{
+  "name": "claude-orchestrator",
+  "version": "0.1.0",
+  "description": "Multi-agent orchestration harness for Claude Code: implement -> independent code-review -> independent security-review -> merge-on-green, with git-worktree isolation, a mechanical merge-guard hook, worktree auto-cleanup, and release/back-merge discipline. Config-driven so it ports across repositories.",
+  "author": { "name": "Dusty Mumphrey" },
+  "keywords": ["orchestration", "agents", "code-review", "gates", "worktrees", "ci", "merge-guard"]
+}
