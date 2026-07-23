@@ -25,6 +25,44 @@ voice sections. Those are the concrete FAIL conditions for THIS repo.
    skill caught everything.
 4. Re-run the self-check YOURSELF (the `precommit` commands from config). A green
    claim from the implementer is not evidence; reproduce it.
+5. Build the **acceptance-criteria coverage matrix** (below) before you decide.
+   This is mandatory and its result feeds directly into the verdict.
+
+## Acceptance-criteria coverage matrix (mandatory)
+
+The single most valuable thing you do here is verify, independently and per line,
+that every acceptance criterion and every edge case is pinned by a test that
+would actually catch a violation. The implementer wrote the tests and the code
+together, so a test can silently drift into asserting *what the code does* rather
+than *what the ticket requires*. You did not write either; re-derive coverage
+from the ticket.
+
+Enumerate EVERY acceptance criterion and EVERY edge case from the ticket (if the
+ticket has no formal AC because there is no tracker, derive the implicit criteria
+from the spec/description). For each, produce one row:
+
+| # | Acceptance criterion / edge case | Test that pins it (`file:line`) | Coverage |
+|---|---|---|---|
+| 1 | <the criterion, verbatim or tightly paraphrased> | <test `file:line`, or NONE> | COVERED / UNCOVERED / MIRROR-ONLY / N-A |
+
+Judge each row honestly:
+- **COVERED** -- a test exists whose assertion would **FAIL against a plausible
+  buggy implementation** of this criterion. It asserts the required value,
+  behavior, or state, not merely that something rendered or did not throw.
+- **UNCOVERED** -- no test pins this criterion. Blocking.
+- **MIRROR-ONLY** -- a test exists but would **pass against the buggy code** (it
+  asserts what the implementation happens to do, checks only presence/no-throw,
+  or is tautological). Blocking. Say what a real assertion would be.
+- **N-A** -- genuinely not applicable (e.g. an edge case the ticket explicitly put
+  out of scope). Justify it in one clause; do not use N-A to wave away a gap.
+
+The proof-of-coverage question for every row is the same one: *if I broke exactly
+this criterion in the code, would some test go red?* If you cannot point to the
+test that would, the row is UNCOVERED or MIRROR-ONLY.
+
+Any UNCOVERED or MIRROR-ONLY row is a **FAIL**. Include the completed matrix in
+your response so the gap is auditable and the implementer knows exactly which
+criterion needs a test.
 
 ## Audit checklist (the recurring real failures)
 
@@ -39,10 +77,11 @@ voice sections. Those are the concrete FAIL conditions for THIS repo.
   that is a FAIL until the title or scope is corrected.
 - Is there a `Reachable via:` line and is it actually true? Trace it in the code.
 
-**Tests.**
+**Tests.** (The coverage matrix above already pins per-criterion coverage; these
+are the remaining test-quality checks.)
 - A unit test for new logic and an e2e spec for any user-visible flow?
-- Do the tests assert the REQUIREMENT, or just mirror the implementation? A test
-  that would pass against the buggy code is not a test.
+- The matrix has no UNCOVERED or MIRROR-ONLY rows (a test that would pass against
+  the buggy code is not a test).
 - Any `.skip`/`.only`/`xit`/`xdescribe`/`test.todo` or a disabled existing test?
   -> FAIL.
 - Any assertion weakened to turn a red test green without a documented contract
@@ -60,7 +99,8 @@ error) instead of fixing the cause? -> FAIL.
 
 ## Output contract
 
-End your response with EXACTLY one of these as the literal last lines:
+Include the completed acceptance-criteria coverage matrix in your response, then
+end with EXACTLY one of these as the literal last lines:
 
 ```
 VERDICT: PASS
@@ -75,6 +115,8 @@ VERDICT: FAIL
 ```
 
 Rules:
+- Any UNCOVERED or MIRROR-ONLY row in the matrix is blocking; cite it in the FAIL
+  list as `AC#N uncovered` / `AC#N mirror-only` with the assertion that would fix it.
 - Any checklist item marked FAIL is blocking. There is no "minor, merge anyway".
 - If unsure whether something is a real defect, treat it as blocking and say what
   would resolve your doubt. A false FAIL costs one loop; a false PASS ships a bug.
