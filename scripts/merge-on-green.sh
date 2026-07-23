@@ -64,7 +64,12 @@ echo "Reminder: gates must have been run against ${INTEGRATION} @ ${PRE:0:12}."
 echo "If ${INTEGRATION} moved since the gate run, abort, rebase, re-run the gate, then retry."
 
 # ---- the merge ----
-gh pr merge "$PR" "$MERGE_FLAG" --delete-branch
+# Deliberately WITHOUT --delete-branch: gh's branch deletion also removes the
+# LOCAL branch, which fails (and, under `set -e`, would abort this script BEFORE
+# the verify step) when a leftover agent worktree still holds that branch. The
+# merge is the irreversible act; branch cleanup is not, so we separate them and
+# do cleanup best-effort AFTER verification.
+gh pr merge "$PR" "$MERGE_FLAG"
 
 # ---- verify the merge propagated ----
 git fetch origin "$INTEGRATION" --quiet
@@ -87,7 +92,14 @@ else
   echo "WARNING: no verify_path given -- could not confirm added files landed. Pass one next time."
 fi
 
-# ---- housekeeping: drop the now-spent green marker (best effort) ----
+# ---- housekeeping (best effort; must NEVER fail a merge that already landed) ----
+# Drop the now-spent green marker.
 "$HERE/merge-guard.sh" --clear "$PR" >/dev/null 2>&1 || true
+# Delete the merged branch, remote then local, tolerating a worktree that still
+# holds it. A leftover agent worktree must not turn a verified merge into a
+# non-zero exit (this bit a real run: the merge succeeded but --delete-branch
+# aborted the script before it could verify).
+git push origin --delete "$BRANCH" >/dev/null 2>&1 || true
+git branch -D "$BRANCH" >/dev/null 2>&1 || true
 
 echo "== PR #$PR merged and verified on ${INTEGRATION} =="

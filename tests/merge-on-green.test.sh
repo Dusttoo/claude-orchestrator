@@ -35,6 +35,18 @@ grep -q "pid=1 pr=1 held" "$TMP/repo/.git/orchestrator-merge.lock" \
   && printf 'ok   existing lock left intact\n' \
   || { printf 'FAIL existing lock was disturbed\n'; fails=$((fails + 1)); }
 
+# 3. Regression: the merge must not use --delete-branch (that couples branch
+#    cleanup to the merge and, under set -e, aborts a verified merge when a
+#    worktree still holds the branch), and branch deletion must be best-effort.
+SRC="$HERE/../scripts/merge-on-green.sh"
+grep -Eq 'gh pr merge "\$PR" "\$MERGE_FLAG"[[:space:]]*$' "$SRC" \
+  && printf 'ok   merge invocation has no --delete-branch\n' \
+  || { printf 'FAIL merge invocation still couples --delete-branch\n'; fails=$((fails + 1)); }
+grep -Eq 'git push origin --delete "\$BRANCH".*\|\| true' "$SRC" \
+  && grep -Eq 'git branch -D "\$BRANCH".*\|\| true' "$SRC" \
+  && printf 'ok   branch deletion is best-effort (remote + local, tolerant)\n' \
+  || { printf 'FAIL branch deletion is not best-effort\n'; fails=$((fails + 1)); }
+
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi
 [ "$fails" -eq 0 ]
