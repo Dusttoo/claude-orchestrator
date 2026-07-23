@@ -94,7 +94,7 @@ hard all-green gate, enforced by a hook, before anything lands.
 | `commands/` | `/orchestrate`, `/gate`, `/release`, `/orchestration-init` |
 | `hooks/` | `PreToolUse` merge-guard + `Stop` worktree sweep |
 | `scripts/` | The mechanics: config reader, gate runner, merge-guard, safe-merge, worktree lifecycle, verification |
-| `skills/` | Relevance-triggered procedures: `scope-ticket`, `recover-agent-work` |
+| `skills/` | Relevance-triggered procedures: `orchestrate-ticket`, `scope-ticket`, `recover-agent-work` |
 | `templates/` | The per-repo `config.yaml` and `ORCHESTRATION.md` to copy in |
 | `tests/` | Shell test suites for the scripts (`bash tests/run.sh`) |
 
@@ -155,6 +155,12 @@ code review (fresh agent) -> security review (when the diff warrants) -> optiona
 verification -> record the all-green marker -> merge -> verify it landed. Any
 gate returning `VERDICT: FAIL` loops back to a fresh implementer with the
 findings; nothing merges red.
+
+The slash command is the explicit, deterministic entry point. Natural language
+works too: asking to "orchestrate BL-90" or "run this ticket through the
+pipeline" triggers the `orchestrate-ticket` skill, which runs the same flow. Use
+the slash command when you want to be explicit; use plain English when you don't
+want to remember the syntax.
 
 `/gate <pr>` runs just the review gates on an existing PR. `/release` ships the
 integration branch to production and performs the required back-merge as one
