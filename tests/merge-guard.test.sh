@@ -19,6 +19,11 @@ assert_exit() { # <desc> <expected-code> <actual-code>
   if [ "$2" = "$3" ]; then printf 'ok   %s (exit %s)\n' "$1" "$3"
   else printf 'FAIL %s: want exit %s, got %s\n' "$1" "$2" "$3"; fails=$((fails + 1)); fi
 }
+assert_true() { # <desc> <cond-cmd...>
+  local desc="$1"; shift
+  if "$@" >/dev/null 2>&1; then printf 'ok   %s\n' "$desc"
+  else printf 'FAIL %s\n' "$desc"; fails=$((fails + 1)); fi
+}
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -84,6 +89,18 @@ assert_exit "fallback blocks no-marker merge" 2 \
   "$(export MERGE_GUARD_FORCE_FALLBACK=1; run Bash 'gh pr merge 99 --merge')"
 assert_exit "fallback allows non-merge" 0 \
   "$(export MERGE_GUARD_FORCE_FALLBACK=1; run Bash 'git status')"
+
+# 10. Plugin hook mode is inert until a repo opts in with orchestration config.
+EMPTY="$TMP/empty-repo"
+mkdir -p "$EMPTY"
+git -C "$EMPTY" init -q
+unset MERGE_GUARD_STATUS_DIR
+payload Bash 'git status' | (cd "$EMPTY" && bash "$HERE/../scripts/merge-guard.sh") >/dev/null 2>&1
+assert_exit "uninitialized repo non-merge hook no-ops" 0 "$?"
+payload Bash 'gh pr merge 123 --merge' | (cd "$EMPTY" && bash "$HERE/../scripts/merge-guard.sh") >/dev/null 2>&1
+assert_exit "uninitialized repo merge hook no-ops" 0 "$?"
+assert_true "uninitialized repo hook creates no .orchestration dir" test ! -e "$EMPTY/.orchestration"
+export MERGE_GUARD_STATUS_DIR="$TMP/markers"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi

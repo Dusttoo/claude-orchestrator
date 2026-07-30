@@ -9,10 +9,9 @@ It is packaged as a Claude Code plugin and as a Codex plugin source tree. One
 orchestrator session dispatches work; each ticket is implemented by one agent
 role in an isolated git worktree, then reviewed by a *separate* code-review role
 and a *separate* security-review role that never see the implementer's
-reasoning, and only merged when every gate is green. In Claude Code, a
-`PreToolUse` hook physically blocks a merge that has not passed the gates, so
-"never merge on red" is a mechanism rather than a request. In Codex, the same
-workflow is exposed through natural-language skills and the merge scripts; branch
+reasoning, and only merged when every gate is green. In Claude Code and Codex, a
+trusted `PreToolUse` hook can physically block a merge that has not passed the
+gates, so "never merge on red" is a mechanism rather than a request. Branch
 protection remains the out-of-band enforcement layer.
 
 The harness is **config-driven**: every repo-specific fact (branch model, gate
@@ -38,9 +37,9 @@ ways:
 
 This harness addresses all four: isolated worktrees, fat per-ticket briefs,
 separate review/security agents run against the diff with fresh context, and a
-hard all-green gate before anything lands. Claude Code enforces that with a
-hook; Codex uses the same marker and merge scripts, with branch protection as the
-external backstop.
+hard all-green gate before anything lands. Claude Code and Codex can enforce
+that with the bundled hook after trust review; the marker and merge scripts are
+the shared mechanism.
 
 ## The model
 
@@ -97,7 +96,7 @@ external backstop.
 |---|---|
 | `agents/` | Role briefs: implementer, code-reviewer, security-reviewer, visual-qa |
 | `commands/` | Claude Code slash commands: `/orchestrate`, `/gate`, `/release`, `/orchestration-init` |
-| `hooks/` | Claude Code `PreToolUse` merge-guard + `Stop` worktree sweep |
+| `hooks/` | Claude Code/Codex `PreToolUse` merge-guard + `Stop` worktree sweep |
 | `scripts/` | The mechanics: config reader, gate runner, merge-guard, safe-merge, worktree lifecycle, verification |
 | `skills/` | Codex/Claude natural-language procedures: orchestrate, gate, release, init, scope, recover |
 | `templates/` | The per-repo `config.yaml` and `ORCHESTRATION.md` to copy in |
@@ -167,7 +166,7 @@ codex plugin add claude-orchestrator@personal
 Codex users invoke the same flows in natural language: "orchestrate BL-90 end to
 end", "gate PR 123", "release integration to production", or "bootstrap
 orchestration in this repo". See [docs/codex.md](docs/codex.md) for the full
-marketplace layout and the hook/guardrail caveat.
+marketplace layout and hook trust notes.
 
 ## Running a ticket
 

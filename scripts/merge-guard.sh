@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# merge-guard.sh -- Claude Code PreToolUse hook (matcher: Bash). Turns "never
-# merge on red" from orchestrator discipline into a MECHANISM: a raw
+# merge-guard.sh -- Claude Code / Codex PreToolUse hook (matcher: Bash). Turns
+# "never merge on red" from orchestrator discipline into a MECHANISM: a raw
 # `gh pr merge` is blocked unless the gate pipeline recorded an all-green marker
 # whose sha matches the PR's current head AND is recent, and a direct merge to
 # the production branch is always blocked (releases go through a human-gated
@@ -28,9 +28,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib-config.sh
 . "$HERE/lib-config.sh"
 
-PROD_BRANCH="$(orch_get production_branch main)"
+CONFIG_FILE="$(orch_config_file)"
 STATUS_DIR="${MERGE_GUARD_STATUS_DIR:-$(orch_project_root)/.orchestration/.gate-status}"
-mkdir -p "$STATUS_DIR" 2>/dev/null || true
+PROD_BRANCH="$(orch_get production_branch main)"
 MAX_AGE="${MERGE_GUARD_MAX_AGE_SECONDS:-3600}"
 
 resolve_pr_head_sha() {
@@ -47,6 +47,10 @@ iso_to_epoch() {
 
 case "${1:-}" in
   --record-green)
+    if [ ! -f "$CONFIG_FILE" ]; then
+      echo "merge-guard: REFUSED: .orchestration/config.yaml not found; run orchestration-init first." >&2
+      exit 2
+    fi
     PR="${2:?usage: merge-guard.sh --record-green <pr> [result_file]}"
     RESULT_FILE="${3:-}"
     SHA="$(resolve_pr_head_sha "$PR")"
@@ -75,6 +79,7 @@ case "${1:-}" in
       fi
       VERIFIED_BY=" verified_by=${RESULT_FILE##*/}"
     fi
+    mkdir -p "$STATUS_DIR" 2>/dev/null || true
     printf 'all-green pr=%s sha=%s recorded_at=%s%s\n' \
       "$PR" "$SHA" "$(date -u +%FT%TZ)" "$VERIFIED_BY" > "${STATUS_DIR}/pr-${PR}.green"
     echo "merge-guard: recorded all-green for PR #$PR (sha=$SHA)${VERIFIED_BY:+, $VERIFIED_BY}."
@@ -89,6 +94,14 @@ case "${1:-}" in
 esac
 
 # ---- hook mode ----------------------------------------------------------------
+# Plugin hooks may be enabled globally by Claude Code or Codex. Outside a repo
+# that has opted into this harness, the guard must be invisible and must not
+# create runtime directories.
+if [ ! -f "$CONFIG_FILE" ]; then
+  cat >/dev/null 2>&1 || true
+  exit 0
+fi
+
 PAYLOAD="$(cat)"
 
 # argv-shape check (shlex) so we fire ONLY on a literal `gh pr merge`, never on a
