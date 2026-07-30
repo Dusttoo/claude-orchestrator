@@ -7,9 +7,9 @@
 # PR branch for a review or visual-QA agent, or running the pipeline without the
 # Agent tool's built-in isolation.
 #
-# Worktrees are created as siblings of the repo (never nested inside it) under
-# ../<repo>-worktrees. The default base branch is the configured integration
-# branch.
+# Worktrees are created under the configured `worktree_base` so the Stop-hook
+# sweeper can clean finished `agent-*` worktrees. The default base branch is the
+# configured integration branch.
 #
 # Usage:
 #   new-worktree.sh <branch> [base]
@@ -23,7 +23,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib-config.sh"
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-WT_ROOT="${REPO_ROOT}/../$(basename "$REPO_ROOT")-worktrees"
+WT_BASE="$(orch_get worktree_base .claude/worktrees)"
+case "$WT_BASE" in
+  /*) WT_ROOT="${WT_BASE%/}" ;;
+  *)  WT_ROOT="${REPO_ROOT}/${WT_BASE%/}" ;;
+esac
 mkdir -p "$WT_ROOT"
 
 EXISTING=0
@@ -32,7 +36,11 @@ if [ "${1:-}" = "--existing" ]; then EXISTING=1; shift; fi
 BRANCH="${1:?usage: new-worktree.sh <branch> [base]}"
 BASE="${2:-origin/$(orch_get integration_branch develop)}"
 SLUG="$(printf '%s' "$BRANCH" | tr '/' '-')"
-WT_PATH="${WT_ROOT}/${SLUG}"
+case "$SLUG" in
+  agent-*) WT_NAME="$SLUG" ;;
+  *)       WT_NAME="agent-$SLUG" ;;
+esac
+WT_PATH="${WT_ROOT}/${WT_NAME}"
 
 git -C "$REPO_ROOT" fetch origin --quiet
 
