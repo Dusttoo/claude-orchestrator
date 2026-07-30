@@ -39,7 +39,12 @@ bash "$SCRIPTS/cleanup-worktree.sh" "$TMP/repo/../repo-worktrees/wt-clean" >/dev
 check "cleanup removed a clean worktree (exit 0)" test "$?" -eq 0
 check "cleanup deleted the clean worktree dir" test ! -d "$TMP/repo/../repo-worktrees/wt-clean"
 
-# ---- sweep: removes a clean agent-* worktree, preserves a dirty one ----------
+# ---- new-worktree + sweep: use configured worktree_base and clean agent-* ----
+out="$(bash "$SCRIPTS/new-worktree.sh" "feat/new-script" 2>/dev/null)"
+check "new-worktree reports configured agent path" grep -q 'WORKTREE: .*/.claude/worktrees/agent-feat-new-script' <<<"$out"
+check "new-worktree uses configured worktree_base" test -d ".claude/worktrees/agent-feat-new-script"
+check "new-worktree created requested branch" git -C ".claude/worktrees/agent-feat-new-script" rev-parse --verify feat/new-script
+
 mkdir -p .claude/worktrees
 git worktree add -q ".claude/worktrees/agent-clean" -b agent-clean >/dev/null 2>&1
 git worktree add -q ".claude/worktrees/agent-dirty" -b agent-dirty >/dev/null 2>&1
@@ -48,6 +53,7 @@ echo "wip" > ".claude/worktrees/agent-dirty/wip.txt"
 git worktree add -q ".claude/worktrees/session-keep" -b session-keep >/dev/null 2>&1
 
 WT_QUIET=1 bash "$SCRIPTS/sweep-agent-worktrees.sh" >/dev/null 2>&1
+check "sweep removed the new-worktree worktree"      test ! -d ".claude/worktrees/agent-feat-new-script"
 check "sweep removed the clean agent worktree"      test ! -d ".claude/worktrees/agent-clean"
 check "sweep preserved the dirty agent worktree"    test   -d ".claude/worktrees/agent-dirty"
 check "sweep ignored the non-agent worktree"        test   -d ".claude/worktrees/session-keep"

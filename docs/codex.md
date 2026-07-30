@@ -3,9 +3,11 @@
 This repository is a Codex plugin folder. The Codex manifest lives at
 `.codex-plugin/plugin.json` and exposes the natural-language skills in `skills/`.
 
-Codex does not ingest the Claude Code slash-command files in `commands/` or
-auto-register the Claude hook file in `hooks/hooks.json` from this manifest. The
-Codex path uses skills plus the same shell scripts and role briefs.
+Codex does not ingest the Claude Code slash-command files in `commands/`.
+Enabled Codex plugins can load lifecycle hooks from the default
+`hooks/hooks.json` file, so this plugin intentionally keeps its merge guard and
+worktree sweep there. Codex skips plugin-bundled hooks until you review and
+trust them with `/hooks`.
 
 ## What Codex gets
 
@@ -23,6 +25,24 @@ After install, Codex can invoke these skills by natural language:
 The skills reference role briefs in `agents/` and scripts in `scripts/`. A Codex
 agent should resolve those plugin-relative paths to absolute paths, then run the
 scripts with the target repository as the working directory.
+
+## Hook behavior
+
+When the plugin is enabled, Codex can discover `hooks/hooks.json` by default.
+Open `/hooks` to inspect, trust, disable, or re-enable the plugin-bundled hooks.
+
+The hook commands use `${CLAUDE_PLUGIN_ROOT}` because Claude Code sets that
+variable and Codex sets it for compatibility with existing plugin hooks. Codex
+also provides `${PLUGIN_ROOT}` for Codex-specific hooks.
+
+The `PreToolUse` merge guard is inert until the target repository opts into the
+harness with `.orchestration/config.yaml`. In uninitialized repositories it
+exits successfully without creating `.orchestration/` or blocking commands.
+After initialization, it blocks raw `gh pr merge` commands unless a fresh
+all-green marker exists for the PR head.
+
+The `Stop` worktree sweep only removes clean, unlocked `agent-*` worktrees under
+the configured `worktree_base`. Dirty worktrees are preserved for recovery.
 
 ## Local install
 
@@ -112,18 +132,15 @@ codex plugin add claude-orchestrator@<marketplace-name>
 Use the `name` field from `.agents/plugins/marketplace.json` as
 `<marketplace-name>`.
 
-## Guardrail caveat
+## Scripted merge path
 
-Claude Code can activate `hooks/hooks.json` as a `PreToolUse` merge guard and a
-`Stop` worktree sweep. Codex plugin manifests expose this repository's skills and
-scripts, but they do not auto-register that Claude hook file.
-
-For Codex workflows, keep merges on the scripted path:
+For Codex and Claude workflows, keep merges on the scripted path:
 
 ```bash
 scripts/merge-guard.sh --record-green <pr> [result_file]
 scripts/merge-on-green.sh <pr> <branch> all-green <verify_path>
 ```
 
-Branch protection remains the required out-of-band backstop for direct pushes,
-GitHub UI merges, or any shell that does not run through the scripted path.
+The hook is a local guardrail around agent tool calls. Branch protection remains
+the required out-of-band backstop for direct pushes, GitHub UI merges, or any
+shell that does not run through trusted hooks.
