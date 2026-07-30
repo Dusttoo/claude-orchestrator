@@ -1,0 +1,42 @@
+{
+  "name": "claude-orchestrator",
+  "version": "0.1.1",
+  "description": "Multi-agent orchestration harness for Codex and Claude Code: implement -> independent code-review -> independent security-review -> merge-on-green, with git-worktree isolation, helper scripts, and release/back-merge discipline.",
+  "author": {
+    "name": "Dusty Mumphrey",
+    "url": "https://github.com/Dusttoo"
+  },
+  "homepage": "https://github.com/Dusttoo/claude-orchestrator",
+  "repository": "https://github.com/Dusttoo/claude-orchestrator",
+  "license": "MIT",
+  "keywords": [
+    "orchestration",
+    "agents",
+    "code-review",
+    "gates",
+    "worktrees",
+    "ci",
+    "merge-guard",
+    "codex",
+    "claude-code"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Claude Orchestrator",
+    "shortDescription": "Run gated multi-agent implementation workflows",
+    "longDescription": "Drive tickets through isolated implementation, independent review and security gates, optional verification, merge-on-green, release/back-merge, ticket scoping, and recovery workflows. Codex uses the natural-language skills and helper scripts; Claude Code can also use the slash commands and hook metadata bundled in this repository.",
+    "developerName": "Dusty Mumphrey",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/Dusttoo/claude-orchestrator",
+    "defaultPrompt": [
+      "Orchestrate this ticket end to end",
+      "Run the gates on PR 123",
+      "Bootstrap orchestration in this repo"
+    ],
+    "brandColor": "#2563EB"
+  }
+}

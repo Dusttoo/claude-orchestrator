@@ -1,16 +1,19 @@
 # claude-orchestrator
 
-A reusable harness for running a small team of Claude Code agents against real
+A reusable harness for running a small team of coding agents against real
 tickets, with **independent review and security gates** and a **mechanical
 merge-guard**, so that parallel agent work does not degrade what lands on the
 integration branch.
 
-It is packaged as a Claude Code plugin. One orchestrator session dispatches
-work; each ticket is implemented by one agent in an isolated git worktree, then
-reviewed by a *separate* code-review agent and a *separate* security-review
-agent that never see the implementer's reasoning, and only merged when every
-gate is green. A `PreToolUse` hook physically blocks a merge that has not passed
-the gates, so "never merge on red" is a mechanism rather than a request.
+It is packaged as a Claude Code plugin and as a Codex plugin source tree. One
+orchestrator session dispatches work; each ticket is implemented by one agent
+role in an isolated git worktree, then reviewed by a *separate* code-review role
+and a *separate* security-review role that never see the implementer's
+reasoning, and only merged when every gate is green. In Claude Code, a
+`PreToolUse` hook physically blocks a merge that has not passed the gates, so
+"never merge on red" is a mechanism rather than a request. In Codex, the same
+workflow is exposed through natural-language skills and the merge scripts; branch
+protection remains the out-of-band enforcement layer.
 
 The harness is **config-driven**: every repo-specific fact (branch model, gate
 commands, CI check names) lives in one small config file, and the actual rules
@@ -35,13 +38,15 @@ ways:
 
 This harness addresses all four: isolated worktrees, fat per-ticket briefs,
 separate review/security agents run against the diff with fresh context, and a
-hard all-green gate, enforced by a hook, before anything lands.
+hard all-green gate before anything lands. Claude Code enforces that with a
+hook; Codex uses the same marker and merge scripts, with branch protection as the
+external backstop.
 
 ## The model
 
 ```
                           +---------------------+
-                          |   ORCHESTRATOR      |  (one Claude Code session)
+                          |   ORCHESTRATOR      |  (one Claude Code/Codex session)
                           |   - reads the ticket|
                           |   - dispatches work |
                           |   - owns the queue  |
@@ -91,12 +96,13 @@ hard all-green gate, enforced by a hook, before anything lands.
 | Layer | What it is |
 |---|---|
 | `agents/` | Role briefs: implementer, code-reviewer, security-reviewer, visual-qa |
-| `commands/` | `/orchestrate`, `/gate`, `/release`, `/orchestration-init` |
-| `hooks/` | `PreToolUse` merge-guard + `Stop` worktree sweep |
+| `commands/` | Claude Code slash commands: `/orchestrate`, `/gate`, `/release`, `/orchestration-init` |
+| `hooks/` | Claude Code `PreToolUse` merge-guard + `Stop` worktree sweep |
 | `scripts/` | The mechanics: config reader, gate runner, merge-guard, safe-merge, worktree lifecycle, verification |
-| `skills/` | Relevance-triggered procedures: `orchestrate-ticket`, `scope-ticket`, `recover-agent-work` |
+| `skills/` | Codex/Claude natural-language procedures: orchestrate, gate, release, init, scope, recover |
 | `templates/` | The per-repo `config.yaml` and `ORCHESTRATION.md` to copy in |
 | `tests/` | Shell test suites for the scripts (`bash tests/run.sh`) |
+| `.codex-plugin/` | Codex plugin manifest exposing the `skills/` directory |
 
 ## Configuration
 
@@ -119,6 +125,8 @@ The config parser is pure bash (no YAML dependency); the scripts read only the
 mechanics, the agents read the file semantically.
 
 ## Installation
+
+### Claude Code
 
 The plugin is a marketplace-installable Claude Code plugin. In an interactive
 Claude Code session:
@@ -143,6 +151,23 @@ and gitignores the runtime marker directory.
 Exact `/plugin` syntax can vary by Claude Code version; if your version wires
 plugins differently, `/orchestration-init` still scaffolds the config and can
 add the hooks to `.claude/settings.json` directly.
+
+### Codex
+
+This repository is also a Codex plugin folder via
+[`.codex-plugin/plugin.json`](.codex-plugin/plugin.json). Codex installs plugins
+from marketplace roots, so local development typically means cloning or
+symlinking this repo to `~/plugins/claude-orchestrator`, ensuring the personal
+marketplace entry points at `./plugins/claude-orchestrator`, then running:
+
+```
+codex plugin add claude-orchestrator@personal
+```
+
+Codex users invoke the same flows in natural language: "orchestrate BL-90 end to
+end", "gate PR 123", "release integration to production", or "bootstrap
+orchestration in this repo". See [docs/codex.md](docs/codex.md) for the full
+marketplace layout and the hook/guardrail caveat.
 
 ## Running a ticket
 
