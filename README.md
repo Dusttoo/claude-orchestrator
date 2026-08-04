@@ -222,6 +222,28 @@ bash tests/run.sh
 The harness is designed to move across codebases with only a config change. See
 [docs/porting.md](docs/porting.md) for the checklist and what stays repo-side.
 
+## Releasing a change (always bump the version)
+
+**Every change that should reach installed sessions MUST bump the version** in
+BOTH manifests, in the same PR as the change:
+
+- [`.claude-plugin/plugin.json`](.claude-plugin/plugin.json) (`version`)
+- [`.codex-plugin/plugin.json`](.codex-plugin/plugin.json) (`version`) -- keep the
+  two in lockstep
+
+Use semver: patch for prompt/doc/script fixes, minor for new commands/skills/agents
+or behavior changes, major for breaking config or contract changes.
+
+Why this is non-optional: an installed plugin is a **pinned snapshot**, not a live
+checkout of this repo (Claude Code caches it under
+`~/.claude/plugins/cache/<marketplace>/claude-orchestrator/<version>/`). Update
+detection keys off the version string. Merging to `main` without bumping the
+version means a user's next plugin update sees the same version and does nothing --
+the fix never lands, silently. A merge is not a release; the version bump is.
+
+After merging, users pick up the change by updating the plugin (`/plugin` ->
+update the marketplace, then the plugin), not by starting a new session.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
