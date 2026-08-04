@@ -89,6 +89,11 @@ the shared mechanism.
   `AGENTS.md`, which the gate agents read. The harness stays repo-agnostic.
 - **Worktree isolation by default.** Parallel agents never share a checkout, and
   a `Stop` hook sweeps finished ones while preserving any with unsaved work.
+- **The orchestrator relays grep targets, not stale facts.** Summarizing agent
+  reports into briefs into docs drops the uncertainty marker at each hop, so the
+  orchestrator never hands down a `file:line` or an unrun snippet (both drift),
+  labels every relayed claim's provenance, and re-derives any fact before it enters
+  a durable artifact -- anything learned before a merge it performed is stale.
 
 ## Components
 

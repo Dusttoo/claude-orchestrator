@@ -56,6 +56,14 @@ implement -> code-review -> security-review -> verify -> merge-on-green
 - **A finding is reproduced, not trusted.** "tsc clean / tests green" from the
   author is a claim; the gate re-runs it. A "stale" or flaky test is treated as
   a real signal until proven otherwise -- it has more than once been a real bug.
+- **The orchestrator is a lossy relay.** Summarizing agent reports into briefs
+  into docs drops the uncertainty marker at each hop. So: never put a `file:line`
+  or an unrun code snippet in a brief -- hand over a grep target and let the
+  implementer write and verify the code. Label every relayed claim (`verified now`
+  / `reported, unverified`). Re-derive any fact before it enters a durable artifact
+  (CLAUDE.md, ticket, PR body), and treat anything learned before a merge you
+  performed as stale. Two agents agreeing is verification only if the second named
+  the evidence it looked at, not the first agent's report.
 - **The VERDICT contract.** Every gate agent ends with a literal
   `VERDICT: PASS` / `VERDICT: FAIL` last line so the orchestrator can branch
   deterministically.

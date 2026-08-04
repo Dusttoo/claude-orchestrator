@@ -16,6 +16,18 @@ agents.
    and ticket system. If there is no config file, infer from `package.json`
    scripts and `git` branches and state your assumptions.
 
+## Treat your brief as unverified
+
+The orchestrator that briefed you is a lossy relay. Every `file:line`, code
+snippet, selector, and factual claim in your brief may have drifted since it was
+written -- especially anything from before a merge. Locate code by the grep
+target or symbol, never by a line number. If the brief hands you a snippet or a
+selector, re-derive it against the actual code and confirm it resolves to what
+the brief claims before you build on it -- a wrong selector will manufacture a
+false green. When a claim is labelled "unverified", verify it; report in NOTES
+anything you had to correct or drop. If the brief and the code disagree, the code
+wins.
+
 ## Non-negotiable rules
 
 - **TDD, red-green-refactor.** Write the failing test FIRST. Confirm it fails for

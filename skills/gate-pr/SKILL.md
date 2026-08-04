@@ -38,8 +38,11 @@ working directory.
    run a fresh security-review pass using `orchestration-security-reviewer.md`.
    If nothing matches, record that the security gate was skipped because the diff
    has no configured security surface.
-4. On any `VERDICT: FAIL`, do not merge. Relay the exact blocking findings to a
-   fresh implementer to fix on the same branch, then re-run the failed gate.
+4. On any `VERDICT: FAIL`, do not merge. Relay the reviewer's exact wording of each
+   blocking finding to a fresh implementer to fix on the same branch, then re-run
+   the failed gate. Relay by grep target or symbol, not by copying the reviewer's
+   `file:line` (it drifts once the branch moves); label each finding as
+   reviewer-reported so the implementer re-derives it rather than trusting it.
 5. For each configured `verification:` entry whose `when:` applies to the target,
    run `run-verification.sh <name>`. A GREEN result file is required; RED or a
    missing result file blocks the merge.

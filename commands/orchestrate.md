@@ -8,6 +8,22 @@ Drive ONE unit of work through the full pipeline. Target: `$ARGUMENTS`.
 Read `.orchestration/config.yaml` and `.orchestration/ORCHESTRATION.md` first for
 this repo's branch model, gate sequence, concurrency cap, and ticket system.
 
+**You are a lossy relay -- do not hand down stale facts.** Every hop from an
+agent's report into a brief into a durable doc can drop the uncertainty marker.
+Before you write anything into a brief or a durable artifact:
+- Put a **grep target or symbol**, never a `file:line`, in a brief -- line numbers
+  drift the moment a branch moves; a grep target is self-verifying.
+- Never hand over a **selector, snippet, or query you did not run**. State intent +
+  constraint and let the implementer write and verify the code.
+- **Label provenance** on every relayed claim (`verified now` / `reported by
+  <agent>, unverified` / `from the ticket, unverified`) and tell the receiver to
+  verify and report what they drop.
+- Two agents agreeing is verification **only if the second named the evidence it
+  looked at** -- otherwise it is transitive trust.
+- **Re-derive before any durable write** (CLAUDE.md, ticket, PR body): open the
+  file, now, on this branch. Anything learned before a merge you performed is
+  stale.
+
 Steps:
 
 1. **Scope check.** If `ticket.kind != none`, confirm the ticket is Ready (a
