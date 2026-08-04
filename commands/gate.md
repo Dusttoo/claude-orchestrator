@@ -17,9 +17,11 @@ CI check names, and merge strategy.
    security surface, note that and skip.
 
 3. **Decision.**
-   - Any `VERDICT: FAIL` -> relay the exact blocking findings to a fresh
-     implementer to fix on the same branch, then re-run the failed gate. Never
-     merge on a FAIL.
+   - Any `VERDICT: FAIL` -> relay the reviewer's exact wording of each blocking
+     finding to a fresh implementer to fix on the same branch, then re-run the
+     failed gate. Relay by grep target/symbol, not by copying the reviewer's
+     `file:line` (it drifts on rebase); label each as reviewer-reported so the
+     implementer re-derives it. Never merge on a FAIL.
    - All gates `PASS` AND every required `verification:` is GREEN AND the
      integration CI checks green -> record the marker
      (`scripts/merge-guard.sh --record-green <pr> [result_file]`) and merge via

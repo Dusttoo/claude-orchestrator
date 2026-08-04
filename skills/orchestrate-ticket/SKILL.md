@@ -15,6 +15,40 @@ First read `.orchestration/config.yaml` (branch model, gates, CI checks,
 `rules_docs` (CLAUDE.md / AGENTS.md). Those govern the specifics; this skill is
 the shape.
 
+## Relaying information (do not hand down stale facts)
+
+You are a lossy relay. Every hop -- an agent's report into your brief, a brief
+into a durable doc -- can drop the uncertainty marker and turn a "maybe" into an
+asserted fact. These rules keep drift out of what you hand down. Each costs one
+grep; skipping one costs review rounds.
+
+- **Grep targets, not line numbers.** Never put a `file:line` in a brief. Give the
+  symbol name or the exact string to grep for. Line numbers drift the moment a
+  branch moves; a grep target is self-verifying. (A test `file:line` a reviewer
+  produced in its own fresh checkout is fine *for that reviewer*; do not copy it
+  forward into a brief or a doc.)
+- **Never hand over code you did not run.** No selector, snippet, or query written
+  from memory. Describe the intent and the constraint and let the implementer
+  write the code and confirm it resolves to what you meant. An unexecuted snippet
+  is a guess in the costume of a fact -- and a wrong selector manufactures a false
+  green.
+- **Label provenance on every claim you pass down.** Mark each as `verified by me
+  just now`, `reported by <agent>, unverified`, or `from the ticket, unverified`,
+  and tell the receiver to verify every claim and report what they had to drop.
+  Where you label, receivers catch your errors; where you assert, they propagate.
+- **Agreement is not verification.** Two agents concurring is independent
+  confirmation only if the second names the evidence it actually looked at. A
+  reviewer who read the implementer's report and agreed has verified nothing --
+  that is transitive trust, not a second opinion.
+- **Re-derive before any durable write.** A brief is cheap to correct mid-flight;
+  CLAUDE.md, a ticket, a PR body are read months later by someone who cannot tell
+  which sentences you checked. The bar for a durable artifact is: *I opened the
+  file, just now, on this branch, and re-read the fact* -- not "an agent told me
+  hours ago."
+- **A merge invalidates everything before it.** Any fact you learned before a
+  merge you performed (migration maxes, "current" state, line ranges) is stale by
+  default. Re-derive after every merge.
+
 ## Plugin paths
 
 The role briefs and scripts below live in this plugin, not necessarily in the
