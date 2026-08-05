@@ -22,7 +22,7 @@ git clone -q "$TMP/origin.git" "$TMP/repo"
 cd "$TMP/repo"
 git config user.email t@t.t; git config user.name t
 mkdir -p .orchestration
-printf 'integration_branch: main\nworktree_base: .claude/worktrees\n' > .orchestration/config.yaml
+printf 'integration_branch: main\nproduction_branch: main\nworktree_base: .claude/worktrees\n' > .orchestration/config.yaml
 git checkout -q -b main
 git add -A; git commit -qm init; git push -q origin main
 

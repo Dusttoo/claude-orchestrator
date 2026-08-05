@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# workflow-engine.test.sh -- table-driven checks for schema_version 2 workflow
+# validation and transition enforcement.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$HERE/.."
+ENGINE="$ROOT/scripts/orchestration-engine.py"
+FIX="$HERE/fixtures/workflows"
+
+fails=0
+ok() { printf 'ok   %s\n' "$1"; }
+fail_case() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }
+eq() {
+  if [ "$2" = "$3" ]; then ok "$1"; else
+    printf 'FAIL %s\n     want: [%s]\n     got:  [%s]\n' "$1" "$2" "$3"
+    fails=$((fails + 1))
+  fi
+}
+run_ok() {
+  local desc="$1"; shift
+  if "$@" >/dev/null 2>&1; then ok "$desc"; else fail_case "$desc"; fi
+}
+run_fail() {
+  local desc="$1"; shift
+  if "$@" >/dev/null 2>&1; then fail_case "$desc"; else ok "$desc"; fi
+}
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+for fixture in gecktopia-adr-008 protected-mainline simple-integration legacy-v1; do
+  run_ok "valid fixture: $fixture" "$ENGINE" --config "$FIX/$fixture.yaml" validate-config
+done
+run_fail "invalid fixture: unsupported schema" "$ENGINE" --config "$FIX/invalid-unsupported-version.yaml" validate-config
+run_fail "invalid fixture: undefined branch role" "$ENGINE" --config "$FIX/invalid-undefined-branch.yaml" validate-config
+run_fail "invalid fixture: undefined adapter" "$ENGINE" --config "$FIX/invalid-undefined-adapter.yaml" validate-config
+
+eq "branch role resolves Gecktopia candidate template" "release/2026.08.05" \
+  "$("$ENGINE" --config "$FIX/gecktopia-adr-008.yaml" branch-name candidate --var candidate_id=2026.08.05)"
+eq "branch role resolves custom simple topic template" "work/ABC-1-thing" \
+  "$("$ENGINE" --config "$FIX/simple-integration.yaml" branch-name topic --var ticket_key=ABC-1 --var slug=thing)"
+run_fail "omitted integration role is rejected only when referenced" \
+  "$ENGINE" --config "$FIX/protected-mainline.yaml" branch-name integration
+
+eq "Gecktopia state graph has ADR release states" "from=draft
+to=frozen" \
+  "$("$ENGINE" --config "$FIX/gecktopia-adr-008.yaml" plan-transition freeze --var candidate_id=rc1 | awk '/^(from|to)=/')"
+eq "mainline fixture has different state names" "from=created
+to=verified" \
+  "$("$ENGINE" --config "$FIX/protected-mainline.yaml" plan-transition verify --var ticket_key=ONE --var slug=x | awk '/^(from|to)=/')"
+
+setup_repo() {
+  local name="$1" fixture="$2"
+  local dir="$TMP/$name"
+  mkdir -p "$dir/.orchestration"
+  cp "$FIX/$fixture.yaml" "$dir/.orchestration/config.yaml"
+  (cd "$dir" && git init -q && git config user.email t@t.t && git config user.name t && : > init.txt && git add init.txt && git commit -qm init)
+  printf '%s' "$dir"
+}
+
+ev() {
+  local dir="$1" name="$2"
+  mkdir -p "$dir/evidence"
+  : > "$dir/evidence/$name"
+  printf '%s=%s/evidence/%s' "$name" "$dir" "$name"
+}
+
+GECK_REPO="$(setup_repo geck gecktopia-adr-008)"
+cd "$GECK_REPO" || exit 1
+run_ok "Gecktopia candidate initialized" "$ENGINE" init-candidate rc1 --candidate-sha sha-a
+run_fail "transition refuses missing evidence" "$ENGINE" transition rc1 freeze --candidate-sha sha-a --ci integration=green
+run_ok "freeze accepts transition-specific evidence and CI" "$ENGINE" transition rc1 freeze \
+  --candidate-sha sha-a \
+  --evidence "$(ev "$GECK_REPO" release_membership)" \
+  --evidence "$(ev "$GECK_REPO" candidate_branch)" \
+  --ci integration=green
+run_fail "artifact identity is required before candidate verification" "$ENGINE" transition rc1 start-verification \
+  --candidate-sha sha-a \
+  --evidence "$(ev "$GECK_REPO" candidate_deployed)" \
+  --evidence "$(ev "$GECK_REPO" artifact_recorded)" \
+  --ci candidate=green
+run_ok "candidate verification records exact artifact identity" "$ENGINE" transition rc1 start-verification \
+  --candidate-sha sha-a --artifact-id artifact-a \
+  --evidence "$(ev "$GECK_REPO" candidate_deployed)" \
+  --evidence "$(ev "$GECK_REPO" artifact_recorded)" \
+  --ci candidate=green
+run_fail "human QA approval is required by policy" "$ENGINE" transition rc1 qa-approve \
+  --candidate-sha sha-a --artifact-id artifact-a \
+  --evidence "$(ev "$GECK_REPO" qa_evidence)" \
+  --ci candidate=green
+run_fail "non-human QA approval is rejected" "$ENGINE" record-approval rc1 qa-approve qa qa-bot independent-agent \
+  --candidate-sha sha-a --artifact-id artifact-a
+run_ok "human QA approval is recorded separately from state" "$ENGINE" record-approval rc1 qa-approve qa qa-user human \
+  --candidate-sha sha-a --artifact-id artifact-a
+run_ok "QA approval transition accepts bound human approval" "$ENGINE" transition rc1 qa-approve \
+  --candidate-sha sha-a --artifact-id artifact-a \
+  --evidence "$(ev "$GECK_REPO" qa_evidence)" \
+  --ci candidate=green
+run_fail "artifact mismatch blocks candidate merge" "$ENGINE" transition rc1 merge-candidate \
+  --candidate-sha sha-a --artifact-id artifact-b \
+  --evidence "$(ev "$GECK_REPO" merge_record)" \
+  --ci production=green
+run_ok "candidate merge requires prior QA transition and exact artifact" "$ENGINE" transition rc1 merge-candidate \
+  --candidate-sha sha-a --artifact-id artifact-a \
+  --evidence "$(ev "$GECK_REPO" merge_record)" \
+  --ci production=green
+run_fail "production promotion requires a tag" "$ENGINE" transition rc1 promote-production \
+  --candidate-sha sha-a --artifact-id artifact-a \
+  --evidence "$(ev "$GECK_REPO" promotion_record)"
+run_ok "production promotion keeps artifact identity separate from merge" "$ENGINE" transition rc1 promote-production \
+  --candidate-sha sha-a --artifact-id artifact-a --tag release/rc1 \
+  --evidence "$(ev "$GECK_REPO" promotion_record)"
+run_ok "release reconciliation is an explicit transition" "$ENGINE" transition rc1 reconcile \
+  --candidate-sha sha-a \
+  --evidence "$(ev "$GECK_REPO" reconciliation_record)"
+run_ok "release cleanup closes the candidate" "$ENGINE" transition rc1 close \
+  --candidate-sha sha-a \
+  --evidence "$(ev "$GECK_REPO" cleanup_record)"
+eq "candidate reached terminal state" "state=closed" "$(grep '^state=' .orchestration/candidates/rc1/state.env)"
+
+run_ok "stale approval candidate initialized" "$ENGINE" init-candidate stale --candidate-sha old-sha
+run_ok "stale approval freeze" "$ENGINE" transition stale freeze \
+  --candidate-sha old-sha \
+  --evidence "$(ev "$GECK_REPO" release_membership)" \
+  --evidence "$(ev "$GECK_REPO" candidate_branch)" \
+  --ci integration=green
+run_ok "stale approval verification" "$ENGINE" transition stale start-verification \
+  --candidate-sha old-sha --artifact-id artifact-old \
+  --evidence "$(ev "$GECK_REPO" candidate_deployed)" \
+  --evidence "$(ev "$GECK_REPO" artifact_recorded)" \
+  --ci candidate=green
+run_ok "approval bound to old candidate identity" "$ENGINE" record-approval stale qa-approve qa qa-user human \
+  --candidate-sha old-sha --artifact-id artifact-old
+run_ok "candidate can move to blocked" "$ENGINE" transition stale block \
+  --candidate-sha old-sha \
+  --evidence "$(ev "$GECK_REPO" blocking_finding)"
+run_ok "configured release-fix transition updates candidate identity" "$ENGINE" transition stale resume-verification \
+  --candidate-sha new-sha \
+  --evidence "$(ev "$GECK_REPO" fix_merged_to_integration)" \
+  --evidence "$(ev "$GECK_REPO" candidate_updated)" \
+  --ci candidate=green
+run_fail "approval becomes stale after candidate identity changes" "$ENGINE" transition stale qa-approve \
+  --candidate-sha new-sha --artifact-id artifact-old \
+  --evidence "$(ev "$GECK_REPO" qa_evidence)" \
+  --ci candidate=green
+run_ok "manual-edit candidate initialized" "$ENGINE" init-candidate skip --candidate-sha sha-skip
+printf 'candidate_id=skip\nstate=qa-approved\ncandidate_sha=sha-skip\nartifact_id=artifact-skip\n' \
+  > .orchestration/candidates/skip/state.env
+run_fail "manual state edit cannot skip required transitions" "$ENGINE" transition skip merge-candidate \
+  --candidate-sha sha-skip --artifact-id artifact-skip \
+  --evidence "$(ev "$GECK_REPO" merge_record)" \
+  --ci production=green
+cd "$ROOT" || exit 1
+
+MAINLINE_REPO="$(setup_repo mainline protected-mainline)"
+cd "$MAINLINE_REPO" || exit 1
+run_ok "mainline candidate initialized without integration branch" "$ENGINE" init-candidate main1
+run_ok "mainline verification omits human approval by policy" "$ENGINE" transition main1 verify \
+  --evidence "$(ev "$MAINLINE_REPO" review_notes)" \
+  --ci review=green
+run_ok "mainline merge uses only configured production branch" "$ENGINE" transition main1 merge \
+  --evidence "$(ev "$MAINLINE_REPO" merge_record)"
+cd "$ROOT" || exit 1
+
+run_fail "legacy config refuses configurable transition commands" \
+  "$ENGINE" --config "$FIX/legacy-v1.yaml" plan-transition freeze
+
+if rg -n "Vercel|Supabase|TestFlight|Play Console|Jira|GECK" "$ROOT/scripts/orchestration-engine.py" >/dev/null; then
+  fail_case "provider or ticket prefix leaked into core engine"
+else
+  ok "provider-specific names do not leak into core engine"
+fi
+
+echo
+if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi
+[ "$fails" -eq 0 ]

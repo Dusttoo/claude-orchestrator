@@ -16,13 +16,19 @@
 #   agent  -> read semantically by the orchestrator / gate agents from the YAML
 #   both   -> read by shell for enforcement, and by agents for narration
 #
-# The shell parser supports two shapes only: flat `key: value` scalars, and
+# The legacy shell parser supports two shapes only: flat `key: value` scalars, and
 # simple block lists / list-of-maps under a top-level key (see self_check).
 # Do not introduce deeper nesting under a shell-read key.
 
+# --- Schema version ------------------------------------------------------- both
+# schema_version: 1 is the legacy ticket pipeline. Existing repositories keep
+# their current behavior and do NOT adopt release-candidate states until they
+# explicitly migrate to schema_version: 2.
+schema_version: 1
+
 # --- Branch model --------------------------------------------------------- both
-integration_branch: develop     # where feature branches merge first
-production_branch: main         # release target; merge-guard blocks direct merges here
+integration_branch: ""          # fill for schema v1, e.g. the branch feature work targets
+production_branch: ""           # fill for schema v1, e.g. the protected release/history target
 
 # --- Merge strategy per target -------------------------------------------- both
 merge_to_integration: merge     # merge | squash. `merge` preserves per-PR history
@@ -110,7 +116,7 @@ security_required_when:
 # How the orchestrator resolves and transitions work items.
 ticket:
   kind: none                  # jira | github | none
-  project: ""                 # e.g. a Jira project key; unused when kind=none
+  project: ""                 # optional tracker project/key; unused when kind=none
 
 # --- Concurrency ---------------------------------------------------------- both
 # Max heavy verification chains running at once. Drop to 1 under CI contention or
@@ -126,3 +132,134 @@ worktree_base: .claude/worktrees   # where isolated agent worktrees are created
 rules_docs:
   - CLAUDE.md
   - AGENTS.md
+
+# --- Configurable workflow opt-in ---------------------------------------- both
+# To use the generic state-machine engine, migrate this file to schema_version: 2
+# and define branch roles, states, transitions, evidence, approvals, CI
+# categories, environments, adapters, tags, and ticket behavior. The engine
+# validates this schema before any mutating transition:
+#
+#   scripts/orchestration-engine.py validate-config
+#
+# Keep this block commented until the repository has intentionally migrated.
+# It is a shape example, not a default workflow.
+#
+# schema_version: 2
+# state_dir: .orchestration/candidates
+#
+# branches:
+#   integration:
+#     name: next
+#     protected: true
+#   production:
+#     name: stable
+#     protected: true
+#   candidate:
+#     template: "candidate/{candidate_id}"
+#     temporary: true
+#   hotfix:
+#     template: "fix/{ticket_key}-{slug}"
+#     temporary: true
+#
+# merge_guard:
+#   block_squash: true
+#   blocked_merge_roles:
+#     - production
+#
+# ci_categories:
+#   candidate:
+#     checks:
+#       - Unit
+#       - Build
+#   production:
+#     checks:
+#       - Unit
+#       - Build
+#       - Smoke
+#
+# approvals:
+#   qa:
+#     actor_types:
+#       - human
+#     human_required: true
+#     bind_to:
+#       - candidate_sha
+#       - artifact_id
+#
+# environments:
+#   preview:
+#     deploy_adapter: preview-deploy
+#     verify_adapter: preview-verify
+#   integration:
+#     deploy_adapter: integration-deploy
+#     verify_adapter: integration-verify
+#   candidate:
+#     deploy_adapter: candidate-deploy
+#     verify_adapter: candidate-verify
+#   production:
+#     promote_adapter: production-promote
+#     verify_adapter: production-verify
+#
+# adapters:
+#   candidate-deploy:
+#     command: "./ops/deploy candidate"
+#   candidate-verify:
+#     command: "./ops/verify candidate"
+#   production-promote:
+#     command: "./ops/promote exact-artifact"
+#
+# release:
+#   branch_prefix: "candidate/"
+#   hotfix_prefix: "fix/"
+#   candidate_template: "candidate/{candidate_id}"
+#   tag_template: "release/{candidate_id}"
+#   tag_type: annotated
+#   immutable_tags: true
+#   artifact_identity_required: true
+#
+# hotfix:
+#   source_role: production
+#   branch_role: hotfix
+#   reconcile_role: integration
+#   reconcile_immediately: true
+#
+# ticket:
+#   kind: none
+#
+# workflow:
+#   state_dir: .orchestration/candidates
+#   states:
+#     - draft
+#     - frozen
+#     - verifying
+#     - blocked
+#     - qa-approved
+#     - merged
+#     - promoted
+#     - reconciled
+#     - closed
+#   initial_state: draft
+#   terminal_states:
+#     - closed
+#   transitions:
+#     - name: freeze
+#       from: draft
+#       to: frozen
+#       source_role: integration
+#       destination_role: candidate
+#       branch_operation: create
+#       required_evidence:
+#         - candidate_branch
+#       required_ci:
+#         - candidate
+#       candidate_identity_required: true
+#     - name: qa-approve
+#       from: verifying
+#       to: qa-approved
+#       required_approvals:
+#         - qa
+#       human_approval: true
+#       required_evidence:
+#         - qa_evidence
+#       candidate_identity_required: true
+#       artifact_identity_required: true

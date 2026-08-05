@@ -3,8 +3,22 @@ description: Run the independent review gates (code-review, then security-review
 argument-hint: <pr-number>
 ---
 
-Gate PR #$ARGUMENTS. Read `.orchestration/config.yaml` for the gate sequence,
-CI check names, and merge strategy.
+Gate PR #$ARGUMENTS. Read `.orchestration/config.yaml` and validate it before
+mutation:
+
+```bash
+scripts/orchestration-engine.py validate-config
+```
+
+For `schema_version: 2`, use the configured transition plan for the target gate
+or merge transition. Branch roles, evidence, approvals, CI categories, and
+adapters come from:
+
+```bash
+scripts/orchestration-engine.py adapter-plan --host claude <transition>
+```
+
+For legacy configs, use the existing review gates below.
 
 1. **Code review.** Launch the `orchestration-code-reviewer` agent (a FRESH
    agent, no implementer context) on the PR. It must re-derive correctness, run
@@ -23,10 +37,10 @@ CI check names, and merge strategy.
      `file:line` (it drifts on rebase); label each as reviewer-reported so the
      implementer re-derives it. Never merge on a FAIL.
    - All gates `PASS` AND every required `verification:` is GREEN AND the
-     integration CI checks green -> record the marker
+     configured target CI checks green -> record the marker
      (`scripts/merge-guard.sh --record-green <pr> [result_file]`) and merge via
      `scripts/merge-on-green.sh`. The merge-guard hook blocks a direct merge with
-     no recorded all-green marker and any direct merge to the production branch.
+     no recorded all-green marker and any merge target blocked by configuration.
 
 Report each gate's verdict, the blocking findings (if any), and the merge result.
 CI-green alone is NOT the gate -- the independent verdicts are mandatory.

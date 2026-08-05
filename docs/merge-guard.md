@@ -51,10 +51,11 @@ a command whose first three tokens are `gh pr merge` is treated as one.
    re-gate. This closes the gap where a marker is recorded, the run stalls for
    hours, then a merge fires against a world that has changed.
 
-4. **Any direct merge to the production branch, and any `--squash`.** Releases go
-   through the human-gated `/release` flow, never a direct agent merge. The
-   production branch is sacred; the guard refuses to let an agent touch it
-   directly regardless of markers.
+4. **Any merge target or squash strategy blocked by configuration.** Legacy
+   configs preserve the old protected release-target and squash blocking
+   behavior. Schema v2 configs declare `merge_guard.blocked_merge_roles` and
+   `merge_guard.block_squash`. The guard resolves those branch roles through
+   `orchestration-engine.py` and blocks before the command executes.
 
 ## Recording a marker
 
@@ -100,10 +101,11 @@ not the whole defense:
 Every path above is covered in [tests/merge-guard.test.sh](../tests/merge-guard.test.sh):
 a non-merge command passes through; a commit body mentioning the words passes
 through; a no-marker merge blocks; a valid fresh marker allows; a moved-SHA
-marker blocks; an expired marker blocks; production-branch and `--squash` always
-block; a non-Bash tool is ignored; and the fail-closed fallback both blocks a
-no-marker merge and allows a plain non-merge command with `python3` forced off.
+marker blocks; an expired marker blocks; configured blocked branches and
+configured squash policy block; a non-Bash tool is ignored; and the fail-closed
+fallback both blocks a no-marker merge and allows a plain non-merge command with
+the precise command parser forced off.
 
 Isolation seams for the tests: `MERGE_GUARD_STATUS_DIR` redirects the marker
 directory, `MERGE_GUARD_PR_HEAD_SHA` stubs the live head-SHA lookup, and
-`MERGE_GUARD_FORCE_FALLBACK` exercises the no-`python3` path.
+`MERGE_GUARD_FORCE_FALLBACK` exercises the fallback parser path.

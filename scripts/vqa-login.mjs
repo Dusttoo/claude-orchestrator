@@ -3,8 +3,8 @@
 // storageState, so vqa-capture.mjs can shoot authenticated surfaces unattended.
 //
 // This logs in like a user (fills the login form, waits for the redirect) rather
-// than hand-crafting Supabase session cookies, so it stays correct as the auth
-// stack changes. Run it once per session/tenant; the saved state is reused for
+// than hand-crafting provider-specific session cookies, so it stays correct as
+// the auth stack changes. Run it once per session; the saved state is reused for
 // every capture until it expires.
 //
 // Inputs via env:

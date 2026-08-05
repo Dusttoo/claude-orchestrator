@@ -1,21 +1,21 @@
 ---
 name: release-integration
-description: Release the integration branch to production and immediately back-merge production into integration so release ancestry is preserved. Use when the user asks to release, ship integration to production, run a release PR, or run the equivalent of the Claude /release command.
+description: Advance a configured release or candidate workflow through the shared orchestration engine. The skill name is retained for compatibility; release policy comes from repository configuration, not from this skill.
 ---
 
-# Release integration to production
+# Advance a configured release workflow
 
-Ship the integration branch to production and immediately record the required
-back-merge. This treats the squash merge and back-merge as one indivisible flow,
-so the next release PR does not inherit avoidable ancestry conflicts.
+Use the repository's schema-versioned workflow configuration. This skill is the
+natural-language entry point for the same behavior exposed by the Claude
+`/release` command. Do not independently implement release policy here.
 
 ## Plugin paths
 
-The scripts below live in this plugin, not necessarily in the target repository.
 Resolve these paths from this skill file before executing them:
 
-- `../../scripts/merge-on-green.sh`
+- `../../scripts/orchestration-engine.py`
 - `../../scripts/merge-guard.sh`
+- `../../scripts/merge-on-green.sh`
 - `../../scripts/run-verification.sh`
 
 Execute scripts by absolute path while keeping the target repository as the
@@ -23,29 +23,36 @@ working directory.
 
 ## Procedure
 
-1. Read `.orchestration/config.yaml` for `integration_branch`,
-   `production_branch`, merge strategy, and production CI check names.
-2. Open or locate the release PR from integration to production. If the user
-   provides a PR number, use it; otherwise create one.
-3. Wait for every configured production CI check to be green and confirm the PR
-   head is the current integration tip. If integration moved after the release PR
-   was cut, say which commits are not in this release.
-4. Surface that the release PR is ready for the human-gated production squash
-   merge. Do not bypass branch protection.
-5. Immediately after the production squash lands, back-merge production into
-   integration:
+1. Run `orchestration-engine.py validate-config`. Stop before mutation on any
+   unsupported schema version, undefined branch role, invalid transition, missing
+   adapter, or incomplete guard.
+2. Determine the requested transition and candidate identity from the user or the
+   repository's current release state.
+3. Run:
    ```bash
-   git fetch origin <production> <integration>
-   git checkout -b chore/back-merge-after-<pr> origin/<integration>
-   git merge -s ours origin/<production> -m "chore: merge <production> back into <integration> after release #<pr>"
-   git diff origin/<integration> --stat
-   git merge-base --is-ancestor origin/<production> HEAD
+   orchestration-engine.py adapter-plan --host codex <transition> \
+     --var candidate_id=<id>
    ```
-6. Add one small real doc change in a second commit so paths-filtered CI has a
-   file change to evaluate. Push, open a PR to integration, and merge it only
-   after the required check posts green.
-7. Verify `git merge-base --is-ancestor origin/<production>
-   origin/<integration>` passes after the back-merge PR lands.
+   The output is authoritative for branch roles, evidence, approvals, CI
+   categories, environment roles, artifact identity, tags, reconciliation, and
+   cleanup.
+4. Collect each configured evidence item and approval record. Approval must be a
+   separate verifiable record, created by the engine or by a configured external
+   adapter; never treat a free-form state edit as approval.
+5. Execute the transition through:
+   ```bash
+   orchestration-engine.py transition <candidate-id> <transition> \
+     --evidence <name>=<path> \
+     --ci <category>=green \
+     --candidate-sha <sha> \
+     --artifact-id <artifact> \
+     --tag <tag>
+   ```
+   Pass only arguments required by the configured plan.
+6. For legacy configs without `schema_version: 2`, do not invent candidate
+   states. Continue using the repository's existing release process or migrate
+   to a schema-versioned workflow before using release-candidate transitions.
 
-Report what shipped, the production PR, the back-merge PR, and the final ancestry
-check result.
+Report the transition, final state, candidate identity, artifact identity,
+approval records, evidence paths, and any configured reconciliation or cleanup
+work that remains.

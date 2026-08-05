@@ -18,6 +18,7 @@ executing them:
 - `../../templates/config.yaml`
 - `../../templates/ORCHESTRATION.md`
 - `../../hooks/hooks.json`
+- `../../scripts/orchestration-engine.py`
 - `../../scripts/preflight.sh`
 - `../../scripts/merge-guard.sh`
 - `../../scripts/sweep-agent-worktrees.sh`
@@ -28,14 +29,15 @@ working directory.
 ## Procedure
 
 1. Detect the target repo's stack:
-   - branches from `git branch -r`, inferring integration and production
+   - branches from `git branch -r`, inferring configured branch roles
    - CI check names from `.github/workflows/*.yml`
    - self-check commands from `package.json` or the repo's language equivalent
-   - ticket system from branch names, recent commits, or repo docs, defaulting to
-     `none` when unclear
+   - ticket system from branch names, recent commits, or repo docs, defaulting
+     to `none` when unclear
 2. Scaffold `.orchestration/config.yaml` from `templates/config.yaml`, filled
    with the detected values. Show the filled config and let the user correct
-   branch names, checks, or ticket settings before writing.
+   branch names, checks, or ticket settings before writing. After writing, run
+   `orchestration-engine.py validate-config`.
 3. Copy `templates/ORCHESTRATION.md` to `.orchestration/ORCHESTRATION.md`.
 4. Confirm a repo rules document exists. Prefer both `CLAUDE.md` and `AGENTS.md`
    in `rules_docs`; if missing, offer to create a starter so the project's real
@@ -50,8 +52,8 @@ working directory.
 7. Optionally propose branch protection via `gh api`: strict required status
    checks, no direct pushes, and admin enforcement on production. Show the
    payload before applying it.
-8. Smoke-test `preflight.sh`, `merge-guard.sh`, and config reads in the target
-   repo.
+8. Smoke-test `preflight.sh`, `merge-guard.sh`, and shared-engine config
+   validation in the target repo.
 
 Report the files created or changed and any manual review left, especially
 config values and rules-doc content.

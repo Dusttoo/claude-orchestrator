@@ -1,0 +1,63 @@
+schema_version: 2
+state_dir: .orchestration/simple-state
+
+branches:
+  integration:
+    name: next
+    protected: true
+  production:
+    name: stable
+    protected: true
+  topic:
+    template: "work/{ticket_key}-{slug}"
+    temporary: true
+
+merge_guard:
+  block_squash: true
+  blocked_merge_roles:
+    - production
+
+ci_categories:
+  integration:
+    checks:
+      - Unit
+  production:
+    checks:
+      - Unit
+      - Smoke
+
+workflow:
+  state_dir: .orchestration/simple-state
+  states:
+    - created
+    - verified
+    - merged
+    - closed
+  initial_state: created
+  terminal_states:
+    - closed
+  transitions:
+    - name: verify
+      from: created
+      to: verified
+      source_role: topic
+      destination_role: integration
+      required_evidence:
+        - self_check
+      required_ci:
+        - integration
+    - name: merge
+      from: verified
+      to: merged
+      source_role: integration
+      destination_role: production
+      branch_operation: merge
+      required_evidence:
+        - release_record
+      required_ci:
+        - production
+    - name: close
+      from: merged
+      to: closed
+      required_evidence:
+        - cleanup_record

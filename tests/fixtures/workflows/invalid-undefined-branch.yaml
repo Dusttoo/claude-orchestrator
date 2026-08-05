@@ -1,0 +1,19 @@
+schema_version: 2
+state_dir: .orchestration/bad-state
+branches:
+  production:
+    name: trunk
+workflow:
+  state_dir: .orchestration/bad-state
+  states:
+    - created
+    - merged
+  initial_state: created
+  terminal_states:
+    - merged
+  transitions:
+    - name: merge
+      from: created
+      to: merged
+      source_role: topic
+      destination_role: production

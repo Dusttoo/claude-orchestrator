@@ -8,13 +8,14 @@
 # Agent tool's built-in isolation.
 #
 # Worktrees are created under the configured `worktree_base` so the Stop-hook
-# sweeper can clean finished `agent-*` worktrees. The default base branch is the
-# configured integration branch.
+# sweeper can clean finished `agent-*` worktrees. The default base branch comes
+# from the configured branch role in ORCH_BASE_ROLE, or the legacy integration
+# role when ORCH_BASE_ROLE is unset.
 #
 # Usage:
 #   new-worktree.sh <branch> [base]
-#   new-worktree.sh feat/x-add-widget                     # new branch off origin/<integration>
-#   new-worktree.sh feat/x-add-widget origin/develop      # explicit base
+#   new-worktree.sh feat/x-add-widget                     # new branch off origin/<configured role>
+#   new-worktree.sh feat/x-add-widget origin/<branch>     # explicit base
 #   new-worktree.sh --existing feat/x-add-widget          # check out an existing remote branch
 set -euo pipefail
 
@@ -34,7 +35,8 @@ EXISTING=0
 if [ "${1:-}" = "--existing" ]; then EXISTING=1; shift; fi
 
 BRANCH="${1:?usage: new-worktree.sh <branch> [base]}"
-BASE="${2:-origin/$(orch_get integration_branch develop)}"
+BASE_ROLE="${ORCH_BASE_ROLE:-integration}"
+BASE="${2:-origin/$(orch_branch_name "$BASE_ROLE")}"
 SLUG="$(printf '%s' "$BRANCH" | tr '/' '-')"
 case "$SLUG" in
   agent-*) WT_NAME="$SLUG" ;;

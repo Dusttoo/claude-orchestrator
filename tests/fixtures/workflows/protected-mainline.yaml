@@ -1,0 +1,57 @@
+schema_version: 2
+state_dir: .orchestration/mainline-state
+
+branches:
+  production:
+    name: trunk
+    protected: true
+  topic:
+    template: "change/{ticket_key}-{slug}"
+    temporary: true
+
+merge_guard:
+  block_squash: false
+
+ci_categories:
+  review:
+    checks:
+      - Unit
+
+approvals:
+  review:
+    actor_types:
+      - human
+      - independent-agent
+
+workflow:
+  state_dir: .orchestration/mainline-state
+  states:
+    - created
+    - verified
+    - merged
+    - closed
+  initial_state: created
+  terminal_states:
+    - closed
+  transitions:
+    - name: verify
+      from: created
+      to: verified
+      branch_role: topic
+      required_evidence:
+        - review_notes
+      required_ci:
+        - review
+    - name: merge
+      from: verified
+      to: merged
+      source_role: topic
+      destination_role: production
+      branch_operation: merge
+      required_evidence:
+        - merge_record
+    - name: close
+      from: merged
+      to: closed
+      required_evidence:
+        - cleanup_record

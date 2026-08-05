@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
-# merge-on-green.sh -- the sanctioned merge step. Merges a PR to the integration
-# branch, but ONLY after the gates are green, only one merge at a time (a lock
-# serialises concurrent agents), and verifies the work actually landed.
+# merge-on-green.sh -- the sanctioned merge step. Merges a PR to the configured
+# target branch role, but ONLY after the gates are green, only one merge at a
+# time (a lock serialises concurrent agents), and verifies the work landed.
 #
 # This script does NOT decide green/red -- the orchestrator passes that in after
 # the gate pipeline. Its job is the safe-merge mechanics: refuse-unless-green,
 # lock, note the base sha, merge with the configured strategy, verify the branch
 # advanced and (optionally) that an added file propagated, then report.
 #
-# Branch model and merge strategy come from .orchestration/config.yaml
-# (integration_branch, merge_to_integration).
+# Branch roles and merge strategy come from .orchestration/config.yaml. Legacy
+# configs default this script to the "integration" role; set MERGE_TARGET_ROLE to
+# use another configured role.
 #
 # Usage:
 #   merge-on-green.sh <pr_number> <branch> <gate_status> [verify_path]
 #     gate_status  : must be the literal "all-green" or the merge is refused.
 #     verify_path  : a repo-relative path to a file the PR ADDED; used to confirm
-#                    the merge reached origin/<integration>. Recommended for any
+#                    the merge reached origin/<target>. Recommended for any
 #                    PR that adds files.
 #
 # Example:
@@ -34,8 +35,13 @@ VERIFY_PATH="${4:-}"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
-INTEGRATION="$(orch_get integration_branch develop)"
-case "$(orch_get merge_to_integration merge)" in
+TARGET_ROLE="${MERGE_TARGET_ROLE:-integration}"
+TARGET_BRANCH="$(orch_branch_name "$TARGET_ROLE")"
+if [ -z "$TARGET_BRANCH" ]; then
+  echo "REFUSED: could not resolve branch role '${TARGET_ROLE}' from orchestration config." >&2
+  exit 2
+fi
+case "$(orch_get "merge_to_${TARGET_ROLE}" merge)" in
   squash) MERGE_FLAG="--squash" ;;
   *)      MERGE_FLAG="--merge" ;;
 esac
@@ -54,14 +60,14 @@ if ! ( set -o noclobber; echo "pid=$$ pr=$PR $(date -u +%FT%TZ)" > "$LOCK" ) 2>/
 fi
 trap 'rm -f "$LOCK"' EXIT
 
-echo "== Merging PR #$PR ($BRANCH) -> ${INTEGRATION} (${MERGE_FLAG}) =="
+echo "== Merging PR #$PR ($BRANCH) -> ${TARGET_BRANCH} (${MERGE_FLAG}) =="
 
-# ---- note the base sha; a moved integration branch invalidates earlier gates ----
-git fetch origin "$INTEGRATION" --quiet
-PRE="$(git rev-parse "origin/${INTEGRATION}")"
-echo "${INTEGRATION} is at ${PRE:0:12}"
-echo "Reminder: gates must have been run against ${INTEGRATION} @ ${PRE:0:12}."
-echo "If ${INTEGRATION} moved since the gate run, abort, rebase, re-run the gate, then retry."
+# ---- note the base sha; a moved target branch invalidates earlier gates ----
+git fetch origin "$TARGET_BRANCH" --quiet
+PRE="$(git rev-parse "origin/${TARGET_BRANCH}")"
+echo "${TARGET_BRANCH} is at ${PRE:0:12}"
+echo "Reminder: gates must have been run against ${TARGET_BRANCH} @ ${PRE:0:12}."
+echo "If ${TARGET_BRANCH} moved since the gate run, abort, rebase, re-run the gate, then retry."
 
 # ---- the merge ----
 # Deliberately WITHOUT --delete-branch: gh's branch deletion also removes the
@@ -72,20 +78,20 @@ echo "If ${INTEGRATION} moved since the gate run, abort, rebase, re-run the gate
 gh pr merge "$PR" "$MERGE_FLAG"
 
 # ---- verify the merge propagated ----
-git fetch origin "$INTEGRATION" --quiet
-POST="$(git rev-parse "origin/${INTEGRATION}")"
-echo "${INTEGRATION} now at ${POST:0:12}"
+git fetch origin "$TARGET_BRANCH" --quiet
+POST="$(git rev-parse "origin/${TARGET_BRANCH}")"
+echo "${TARGET_BRANCH} now at ${POST:0:12}"
 
 if [ "$POST" = "$PRE" ]; then
-  echo "ERROR: origin/${INTEGRATION} did not advance after merge. Investigate before continuing." >&2
+  echo "ERROR: origin/${TARGET_BRANCH} did not advance after merge. Investigate before continuing." >&2
   exit 3
 fi
 
 if [ -n "$VERIFY_PATH" ]; then
-  if git cat-file -e "origin/${INTEGRATION}:${VERIFY_PATH}" 2>/dev/null; then
-    echo "VERIFIED: ${VERIFY_PATH} is present on origin/${INTEGRATION}."
+  if git cat-file -e "origin/${TARGET_BRANCH}:${VERIFY_PATH}" 2>/dev/null; then
+    echo "VERIFIED: ${VERIFY_PATH} is present on origin/${TARGET_BRANCH}."
   else
-    echo "ERROR: ${VERIFY_PATH} is NOT on origin/${INTEGRATION} after merge. Possible orphaned work." >&2
+    echo "ERROR: ${VERIFY_PATH} is NOT on origin/${TARGET_BRANCH} after merge. Possible orphaned work." >&2
     exit 4
   fi
 else
@@ -102,4 +108,4 @@ fi
 git push origin --delete "$BRANCH" >/dev/null 2>&1 || true
 git branch -D "$BRANCH" >/dev/null 2>&1 || true
 
-echo "== PR #$PR merged and verified on ${INTEGRATION} =="
+echo "== PR #$PR merged and verified on ${TARGET_BRANCH} =="
