@@ -6,18 +6,21 @@ Set up the orchestration harness in THIS repository. Be conservative: detect,
 propose, confirm before writing.
 
 1. **Detect the stack.**
-   - Branches: `git branch -r` -> infer the integration branch (develop/main/master)
-     and the production branch.
+   - Branches: `git branch -r` -> infer the repository's configured branch roles.
    - CI check names: read `.github/workflows/*.yml` -> the `name:` of each job
      that gates merges (e.g. TypeScript, Vitest, Build, Playwright).
    - Pre-commit commands: read `package.json` scripts (typecheck/build/test) or
      the equivalent for the repo's language.
-   - Ticket system: look for a Jira/Linear/GitHub-issues convention in branch
-     names or recent commits. Default to `none` if unclear.
+   - Ticket system: look for a tracker convention in branch names, recent
+     commits, or repo docs. Default to `none` if unclear.
 
 2. **Scaffold `.orchestration/config.yaml`** from the plugin's
    `templates/config.yaml`, filled in with what you detected. Show the user the
    filled config and let them correct it before writing.
+   After writing, validate it:
+   ```bash
+   ${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py validate-config
+   ```
 
 3. **Copy `templates/ORCHESTRATION.md`** to `.orchestration/ORCHESTRATION.md`
    (the process doc this repo's agents reference).
@@ -40,8 +43,8 @@ propose, confirm before writing.
    confirmation.
 
 7. **Smoke test.** Confirm `${CLAUDE_PLUGIN_ROOT}/scripts/sweep-agent-worktrees.sh`
-   and `merge-guard.sh` run without error in this repo, and that `orch_get`
-   reads the new config (`production_branch`, `integration_branch`).
+   and `merge-guard.sh` run without error in this repo, and that the shared
+   engine validates the new config.
 
 Report what was created/changed and the one manual step left (usually: review
 the generated config + CLAUDE.md).

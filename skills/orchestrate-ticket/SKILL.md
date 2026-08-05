@@ -10,10 +10,13 @@ Claude Code `/orchestrate` command, reached by natural language. If the user
 named a ticket, that is the target; otherwise treat their description as the
 spec.
 
-First read `.orchestration/config.yaml` (branch model, gates, CI checks,
-`security_required_when`, `concurrency_max`, ticket system) and the repo's
-`rules_docs` (CLAUDE.md / AGENTS.md). Those govern the specifics; this skill is
-the shape.
+First read `.orchestration/config.yaml` and validate it with
+`orchestration-engine.py validate-config`. For `schema_version: 2`, branch roles,
+transition guards, CI categories, approvals, ticket adapters, and target branches
+come from the configured workflow; use `orchestration-engine.py adapter-plan
+--host codex <transition>` when the repo declares the ticket flow as explicit
+transitions. For legacy configs, keep the existing implement -> review ->
+security -> verify -> merge-on-green flow below.
 
 ## Relaying information (do not hand down stale facts)
 
@@ -61,6 +64,7 @@ reading them:
 - `../../agents/orchestration-visual-qa.md`
 - `../../scripts/merge-guard.sh`
 - `../../scripts/merge-on-green.sh`
+- `../../scripts/orchestration-engine.py`
 - `../../scripts/run-verification.sh`
 - `../../scripts/run-visual-qa.sh`
 
@@ -78,9 +82,10 @@ working directory.
    `orchestration-implementer.md`, passing the ticket body and the click-path. If
    the host supports subagents, launch a fresh implementer with
    `isolation: "worktree"`; otherwise perform that role as a distinct pass in an
-   isolated git worktree. One agent-role, one ticket, one worktree, one branch
-   off the integration branch, one PR to it. Wait for its structured report (PR
-   number, branch, worktree, SELF_CHECK).
+   isolated git worktree. Use configured branch roles. In legacy configs, this
+   remains one agent-role, one ticket, one worktree, one branch off the legacy
+   configured source branch, one PR to the legacy configured target branch. Wait for its structured report
+   (PR number, branch, worktree, SELF_CHECK).
 
 3. **Gate.** Run the review gates on the PR: a fresh code-review role using
    `orchestration-code-reviewer.md` (no implementer context), then a fresh
@@ -90,22 +95,22 @@ working directory.
    to fix on the same branch, then re-gate. Never merge on a FAIL.
 
 4. **Verify (when configured).** For each `verification:` entry whose `when:`
-   matches the integration target, run the resolved `run-verification.sh <name>`
+   matches the configured target, run the resolved `run-verification.sh <name>`
    on the rebased branch (GREEN writes a sha-stamped result file; RED = no
    merge). If the change has a user-visible surface, run the visual-QA role from
    `orchestration-visual-qa.md` against the click-path; it must end
    `VERDICT: PASS`.
 
 5. **Merge on green.** Only after every gate PASSES, every required verification
-   is GREEN, and the integration CI checks are green: record the marker
+   is GREEN, and the configured target CI checks are green: record the marker
    (`merge-guard.sh --record-green <pr> [result_file]`), then merge with
    `merge-on-green.sh <pr> <branch> all-green <verify_path>`. Claude Code also
    enforces this with the merge-guard hook; Codex relies on the scripted merge
    path plus branch protection for out-of-band enforcement.
 
-6. **Close the loop.** Transition the ticket if there is a tracker. Confirm the
-   work landed (`git cat-file -e origin/<integration>:<a new file>`). Report what
-   merged and the click path.
+6. **Close the loop.** Transition the ticket if there is a configured tracker or
+   ticket adapter. Confirm the work landed on the configured target branch.
+   Report what merged and the click path.
 
 Respect `concurrency_max`: at most that many heavy verification chains at once,
 on non-conflicting areas. Dual gates on ONE PR run sequentially. CI-green alone

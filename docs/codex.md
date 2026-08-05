@@ -17,14 +17,15 @@ After install, Codex can invoke these skills by natural language:
 |---|---|
 | `orchestrate-ticket` | Run one ticket end to end: implement, review, security, verify, merge |
 | `gate-pr` | Gate an existing PR and merge only after all green proof exists |
-| `release-integration` | Release integration to production and immediately back-merge |
+| `release-integration` | Advance a configured release/candidate transition through the shared engine |
 | `orchestration-init` | Bootstrap `.orchestration/` config in a target repo |
 | `scope-ticket` | Turn a thin ticket into testable acceptance criteria |
 | `recover-agent-work` | Recover work from a stopped or interrupted agent worktree |
 
 The skills reference role briefs in `agents/` and scripts in `scripts/`. A Codex
 agent should resolve those plugin-relative paths to absolute paths, then run the
-scripts with the target repository as the working directory.
+scripts with the target repository as the working directory. Configured
+workflow policy is planned and enforced through `scripts/orchestration-engine.py`.
 
 ## Hook behavior
 

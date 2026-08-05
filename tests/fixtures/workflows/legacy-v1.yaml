@@ -1,0 +1,12 @@
+integration_branch: develop
+production_branch: main
+merge_to_integration: merge
+merge_to_production: squash
+ci_checks_integration:
+  - TypeScript
+  - Unit
+self_check:
+  - name: unit
+    run: "true"
+ticket:
+  kind: none

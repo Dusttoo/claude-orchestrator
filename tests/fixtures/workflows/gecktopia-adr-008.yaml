@@ -1,0 +1,225 @@
+schema_version: 2
+state_dir: .orchestration/candidates
+
+branches:
+  integration:
+    name: develop
+    protected: true
+  production:
+    name: main
+    protected: true
+  ticket:
+    template: "ticket/{ticket_key}-{slug}"
+    temporary: true
+    target_role: integration
+  candidate:
+    template: "release/{candidate_id}"
+    temporary: true
+  hotfix:
+    template: "hotfix/{ticket_key}-{slug}"
+    temporary: true
+    source_role: production
+
+merge_guard:
+  block_squash: true
+  blocked_merge_roles:
+    - production
+
+ci_categories:
+  integration:
+    checks:
+      - TypeScript
+      - Unit
+      - Build
+  candidate:
+    checks:
+      - TypeScript
+      - Unit
+      - Build
+      - End-to-end
+  production:
+    checks:
+      - TypeScript
+      - Unit
+      - Build
+      - End-to-end
+
+approvals:
+  qa:
+    actor_types:
+      - human
+    human_required: true
+    bind_to:
+      - candidate_sha
+      - artifact_id
+
+environments:
+  preview:
+    deploy_adapter: web-preview
+    verify_adapter: web-preview-verify
+  integration:
+    deploy_adapter: integration-deploy
+    verify_adapter: integration-verify
+  candidate:
+    deploy_adapter: candidate-deploy
+    verify_adapter: candidate-verify
+  production:
+    promote_adapter: production-promote
+    verify_adapter: production-verify
+
+adapters:
+  web-preview:
+    command: "./ops/deploy preview"
+  web-preview-verify:
+    command: "./ops/verify preview"
+  integration-deploy:
+    command: "./ops/deploy integration"
+  integration-verify:
+    command: "./ops/verify integration"
+  candidate-deploy:
+    command: "./ops/deploy candidate"
+  candidate-verify:
+    command: "./ops/verify candidate"
+  production-promote:
+    command: "./ops/promote exact-artifact"
+  production-verify:
+    command: "./ops/verify production"
+  ticket-provider:
+    command: "./ops/ticket transition"
+
+release:
+  branch_prefix: "release/"
+  hotfix_prefix: "hotfix/"
+  candidate_template: "release/{candidate_id}"
+  tag_template: "release/{candidate_id}"
+  tag_type: annotated
+  immutable_tags: true
+  artifact_identity_required: true
+
+hotfix:
+  source_role: production
+  branch_role: hotfix
+  reconcile_role: integration
+  reconcile_immediately: true
+
+ticket:
+  kind: adapter
+  adapter: ticket-provider
+  release_membership: required_for_candidate
+
+workflow:
+  state_dir: .orchestration/candidates
+  states:
+    - draft
+    - frozen
+    - verifying
+    - blocked
+    - qa-approved
+    - merged
+    - promoted
+    - reconciled
+    - closed
+  initial_state: draft
+  terminal_states:
+    - closed
+  transitions:
+    - name: freeze
+      from: draft
+      to: frozen
+      source_role: integration
+      destination_role: candidate
+      branch_operation: create
+      required_evidence:
+        - release_membership
+        - candidate_branch
+      required_ci:
+        - integration
+      candidate_identity_required: true
+    - name: start-verification
+      from: frozen
+      to: verifying
+      environment_role: candidate
+      adapter: candidate-deploy
+      required_evidence:
+        - candidate_deployed
+        - artifact_recorded
+      required_ci:
+        - candidate
+      candidate_identity_required: true
+      artifact_identity_required: true
+    - name: block
+      from: verifying
+      to: blocked
+      required_evidence:
+        - blocking_finding
+      candidate_identity_required: true
+    - name: resume-verification
+      from: blocked
+      to: verifying
+      source_role: integration
+      destination_role: candidate
+      branch_operation: merge-fix
+      required_evidence:
+        - fix_merged_to_integration
+        - candidate_updated
+      required_ci:
+        - candidate
+      candidate_identity_required: true
+      candidate_identity_updates: true
+    - name: qa-approve
+      from: verifying
+      to: qa-approved
+      required_approvals:
+        - qa
+      human_approval: true
+      required_evidence:
+        - qa_evidence
+      required_ci:
+        - candidate
+      candidate_identity_required: true
+      artifact_identity_required: true
+    - name: merge-candidate
+      from: qa-approved
+      to: merged
+      source_role: candidate
+      destination_role: production
+      branch_operation: merge
+      requires_completed:
+        - qa-approve
+      required_evidence:
+        - merge_record
+      required_ci:
+        - production
+      candidate_identity_required: true
+      artifact_identity_required: true
+    - name: promote-production
+      from: merged
+      to: promoted
+      environment_role: production
+      adapter: production-promote
+      required_evidence:
+        - promotion_record
+      candidate_identity_required: true
+      artifact_identity_required: true
+      tag_required: true
+    - name: reconcile
+      from: promoted
+      to: reconciled
+      source_role: production
+      destination_role: integration
+      branch_operation: reconcile
+      required_evidence:
+        - reconciliation_record
+      reconciliation_actions:
+        - merge-production-history
+        - return-release-fixes-through-integration
+      candidate_identity_required: true
+    - name: close
+      from: reconciled
+      to: closed
+      required_evidence:
+        - cleanup_record
+      cleanup_actions:
+        - delete-candidate-branch
+        - archive-state
+      candidate_identity_required: true

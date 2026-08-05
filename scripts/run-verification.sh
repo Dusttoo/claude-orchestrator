@@ -9,8 +9,8 @@
 # merge-guard's --record-green refuses to register a marker unless a result file
 # whose sha matches the PR head exists (see merge-guard.sh).
 #
-# Run from INSIDE the PR's worktree, AFTER rebasing onto the integration branch,
-# so the verification exercises the actual post-merge state.
+# Run from INSIDE the PR's worktree, AFTER rebasing onto the configured target
+# branch, so the verification exercises the actual post-merge state.
 #
 # Usage:
 #   run-verification.sh <name>          # e.g. run-verification.sh e2e

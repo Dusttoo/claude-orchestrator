@@ -16,8 +16,10 @@ assert_true() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then printf 'ok   
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/repo/.orchestration"
 cp "$HERE"/../scripts/lib-config.sh "$HERE"/../scripts/run-verification.sh \
-   "$HERE"/../scripts/merge-guard.sh "$TMP/repo/"
+   "$HERE"/../scripts/merge-guard.sh "$HERE"/../scripts/orchestration-engine.py \
+   "$TMP/repo/"
 cat > "$TMP/repo/.orchestration/config.yaml" <<'YAML'
+integration_branch: develop
 production_branch: main
 verification:
   - name: green-check

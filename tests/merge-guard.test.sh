@@ -30,8 +30,9 @@ trap 'rm -rf "$TMP"' EXIT
 export MERGE_GUARD_STATUS_DIR="$TMP/markers"
 mkdir -p "$MERGE_GUARD_STATUS_DIR"
 mkdir -p "$TMP/repo/.orchestration"
-cp "$HERE/../scripts/lib-config.sh" "$HERE/../scripts/merge-guard.sh" "$TMP/repo/"
-echo "production_branch: main" > "$TMP/repo/.orchestration/config.yaml"
+cp "$HERE/../scripts/lib-config.sh" "$HERE/../scripts/merge-guard.sh" \
+   "$HERE/../scripts/orchestration-engine.py" "$TMP/repo/"
+printf 'integration_branch: develop\nproduction_branch: main\n' > "$TMP/repo/.orchestration/config.yaml"
 cd "$TMP/repo" && git init -q
 GUARD="$TMP/repo/merge-guard.sh"
 

@@ -1,16 +1,17 @@
 # Orchestration pipeline
 
-The invariant process this harness runs. The specifics (branch names, CI checks,
-commands, ticket system) come from `.orchestration/config.yaml`; the rules being
-enforced come from this repo's `CLAUDE.md` / `AGENTS.md`. This file is the
-process, not the knowledge.
+The process this harness runs. The specifics (branch roles, state graph, CI
+checks/categories, commands, approvals, adapters, ticket system) come from
+`.orchestration/config.yaml`; the rules being enforced come from this repo's
+`CLAUDE.md` / `AGENTS.md`. This file is process guidance, not project knowledge.
 
 ## The unit of work
 
 **One ticket = one agent = one worktree = one branch = one PR.** Agents never
-build on each other's unmerged branches. Every feature branch is cut from the
-latest integration branch and targets it directly. No stacked PRs (they silently
-orphan work when the base merges first).
+build on each other's unmerged branches. Branch source and destination roles are
+resolved from config. In legacy configs, feature branches are cut from the
+legacy configured source branch and target the legacy configured target branch.
+No stacked PRs unless the configured workflow explicitly allows them.
 
 ## The pipeline
 
@@ -21,7 +22,7 @@ implement -> code-review -> security-review -> verify -> merge-on-green
 
 1. **Implement** (`orchestration-implementer`). Isolated worktree. TDD
    red-green. Runs the repo's pre-commit self-checks. Opens a PR to the
-   integration branch. Returns a structured report ending in a click-path.
+   configured target branch. Returns a structured report ending in a click-path.
 
 2. **Code review** (`orchestration-code-reviewer`). A FRESH agent with no
    implementer context. Re-derives correctness from the ticket + diff, runs the
@@ -41,11 +42,12 @@ implement -> code-review -> security-review -> verify -> merge-on-green
    end in a verdict the orchestrator branches on.
 
 5. **Merge on green.** Only after every gate PASSES, every required verification
-   is GREEN, **and** the integration CI checks are green. The orchestrator records
-   the marker (`merge-guard.sh --record-green`, validated against a result file
-   when one exists), then merges via `merge-on-green.sh`. The merge-guard hook
-   mechanically blocks a direct `gh pr merge` that has no recorded all-green
-   marker, and blocks any direct merge to the production branch.
+   is GREEN, **and** the configured target CI checks are green. The orchestrator
+   records the marker (`merge-guard.sh --record-green`, validated against a
+   result file when one exists), then merges via `merge-on-green.sh`. The
+   merge-guard hook mechanically blocks a direct `gh pr merge` that has no
+   recorded all-green marker, and blocks any merge target or strategy blocked by
+   configuration.
 
 ## The non-negotiables (why this beats "just run CI")
 
@@ -74,18 +76,24 @@ implement -> code-review -> security-review -> verify -> merge-on-green
   never bloats; it preserves dirty worktrees so a rate-limited / dead-mid-edit
   agent's work survives for recovery.
 
-## Release
+## Release And Candidate Workflows
 
-Releasing the integration branch to production is a deliberate step:
+If this repository uses `schema_version: 2`, release and candidate behavior is a
+configured state machine. Before any release mutation, run:
 
-1. Open the release PR (integration -> production). It runs the full e2e suite
-   (the canonical end-to-end checkpoint).
-2. A human squash-merges it to production.
-3. **Immediately back-merge production -> integration** (a `-s ours` merge that
-   records production as an ancestor + one small doc-diff so the required check
-   posts). Skipping this is invisible the same day and produces phantom
-   conflicts on the *next* release. The `/orchestration:release` command does
-   the squash and the back-merge as ONE flow so it can't be dropped.
+```bash
+scripts/orchestration-engine.py validate-config
+scripts/orchestration-engine.py adapter-plan --host claude <transition>
+```
+
+The plan declares required evidence, CI categories, approval classes, branch
+roles, candidate identity, artifact identity, tags, environment roles,
+reconciliation, and cleanup. Execute the transition only through
+`scripts/orchestration-engine.py transition ...`.
+
+If this repository still uses the legacy schema, continue following the
+repository's existing release process. Legacy configs do not automatically adopt
+release-candidate states.
 
 ## Recovery: a dead agent's work is not lost
 

@@ -2,9 +2,8 @@
 # merge-guard.sh -- Claude Code / Codex PreToolUse hook (matcher: Bash). Turns
 # "never merge on red" from orchestrator discipline into a MECHANISM: a raw
 # `gh pr merge` is blocked unless the gate pipeline recorded an all-green marker
-# whose sha matches the PR's current head AND is recent, and a direct merge to
-# the production branch is always blocked (releases go through a human-gated
-# release command).
+# whose sha matches the PR's current head AND is recent. Additional blocked
+# merge targets and squash policy are read from the configured workflow.
 #
 # Hook contract:
 #   stdin  : the PreToolUse JSON (.tool_name, .tool_input.command)
@@ -30,7 +29,6 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CONFIG_FILE="$(orch_config_file)"
 STATUS_DIR="${MERGE_GUARD_STATUS_DIR:-$(orch_project_root)/.orchestration/.gate-status}"
-PROD_BRANCH="$(orch_get production_branch main)"
 MAX_AGE="${MERGE_GUARD_MAX_AGE_SECONDS:-3600}"
 
 resolve_pr_head_sha() {
@@ -45,10 +43,18 @@ iso_to_epoch() {
     || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null
 }
 
+regex_escape() {
+  printf '%s' "$1" | sed 's/[][\\.^$*+?{}|()]/\\&/g'
+}
+
 case "${1:-}" in
   --record-green)
     if [ ! -f "$CONFIG_FILE" ]; then
       echo "merge-guard: REFUSED: .orchestration/config.yaml not found; run orchestration-init first." >&2
+      exit 2
+    fi
+    if ! orch_validate_config; then
+      echo "merge-guard: REFUSED: orchestration config is invalid; validate it before recording a green marker." >&2
       exit 2
     fi
     PR="${2:?usage: merge-guard.sh --record-green <pr> [result_file]}"
@@ -145,16 +151,27 @@ fi
 [ "$TOOL" = "Bash" ] || exit 0
 [ "$IS_MERGE" = "1" ] || exit 0
 
-# A squash, or any merge targeting the production branch, is never auto-performed.
-if printf '%s' "$CMD" | grep -Eq '\-\-squash' \
-   || printf '%s' "$CMD" | grep -Eq -- "--base[[:space:]=]+${PROD_BRANCH}([[:space:]]|$)" \
-   || printf '%s' "$CMD" | grep -Eq "[[:space:]]${PROD_BRANCH}([[:space:]]|\$)"; then
-  {
-    echo "BLOCKED by merge-guard: direct 'gh pr merge --squash' or a merge to '${PROD_BRANCH}' is out of scope."
-    echo "Release to '${PROD_BRANCH}' via the human-gated release command, not a direct merge."
-  } >&2
+# Configured policy can block selected merge targets and squash merges. If the
+# policy cannot be read, block the merge rather than under-enforcing.
+POLICY="$(python3 "$HERE/orchestration-engine.py" guard-policy 2>/dev/null)"
+if [ "$?" -ne 0 ]; then
+  echo "BLOCKED by merge-guard: orchestration config is invalid or guard policy cannot be resolved." >&2
   exit 2
 fi
+BLOCK_SQUASH="$(printf '%s\n' "$POLICY" | awk -F= '$1=="block_squash"{print $2; exit}')"
+if [ "$BLOCK_SQUASH" = "true" ] && printf '%s' "$CMD" | grep -Eq '\-\-squash'; then
+  echo "BLOCKED by merge-guard: configured policy blocks direct squash merges." >&2
+  exit 2
+fi
+while IFS= read -r BLOCKED_BRANCH; do
+  [ -n "$BLOCKED_BRANCH" ] || continue
+  BR_RE="$(regex_escape "$BLOCKED_BRANCH")"
+  if printf '%s' "$CMD" | grep -Eq -- "--base[[:space:]=]+${BR_RE}([[:space:]]|$)" \
+     || printf '%s' "$CMD" | grep -Eq "[[:space:]]${BR_RE}([[:space:]]|\$)"; then
+    echo "BLOCKED by merge-guard: configured policy blocks direct merges to '${BLOCKED_BRANCH}'." >&2
+    exit 2
+  fi
+done < <(printf '%s\n' "$POLICY" | awk -F= '$1=="blocked_branch"{print $2}')
 
 # PR id = first token after 'merge', strip any URL prefix.
 PR="$(printf '%s' "$CMD" | grep -Eo 'gh[[:space:]]+pr[[:space:]]+merge[[:space:]]+[^[:space:]]+' | head -1 | awk '{print $4}')"

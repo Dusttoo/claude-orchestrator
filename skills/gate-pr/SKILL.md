@@ -20,6 +20,7 @@ reading them:
 - `../../agents/orchestration-security-reviewer.md`
 - `../../scripts/merge-guard.sh`
 - `../../scripts/merge-on-green.sh`
+- `../../scripts/orchestration-engine.py`
 - `../../scripts/run-gates.sh`
 - `../../scripts/run-verification.sh`
 
@@ -28,8 +29,12 @@ working directory.
 
 ## Procedure
 
-1. Read `.orchestration/config.yaml` for the gate sequence, CI check names,
-   security triggers, verification entries, and merge strategy.
+1. Read `.orchestration/config.yaml` and run
+   `orchestration-engine.py validate-config`. For `schema_version: 2`, use
+   `orchestration-engine.py adapter-plan --host codex <transition>` for the
+   configured gate or merge transition; branch roles, evidence, approvals, CI
+   categories, and adapters come from that plan. For legacy configs, continue
+   with the existing review gates below.
 2. Run the code-review gate as a fresh review pass. If the host supports
    subagents, launch one with `orchestration-code-reviewer.md`; otherwise apply
    that brief yourself without using the implementer's reasoning as evidence.
@@ -46,7 +51,7 @@ working directory.
 5. For each configured `verification:` entry whose `when:` applies to the target,
    run `run-verification.sh <name>`. A GREEN result file is required; RED or a
    missing result file blocks the merge.
-6. Confirm every required integration CI check is green.
+6. Confirm every required configured target CI check is green.
 7. Record the all-green marker with `merge-guard.sh --record-green <pr>
    [result_file]`, then merge with `merge-on-green.sh <pr> <branch> all-green
    <verify_path>`.

@@ -53,11 +53,11 @@ re-run the ticket from scratch; recover what is already there.
    `self_check` commands from config in the worktree, and finish anything the
    agent left half-done. A recovered commit still has to pass the same gates.
 
-5. **Open the PR yourself.** Push the branch and open the PR to the integration
-   branch, exactly as the implementer would have:
+5. **Open the PR yourself.** Push the branch and open the PR to the configured
+   target branch role, exactly as the implementer would have:
    ```
    git -C <worktree> push -u origin HEAD
-   gh pr create --base <integration_branch> ...
+   gh pr create --base <configured-target-branch> ...
    ```
    Then it re-enters the normal pipeline at the gate stage.
 

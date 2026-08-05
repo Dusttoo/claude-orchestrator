@@ -1,0 +1,23 @@
+schema_version: 2
+state_dir: .orchestration/bad-adapter-state
+branches:
+  production:
+    name: trunk
+environments:
+  production:
+    promote_adapter: missing-promotion
+workflow:
+  state_dir: .orchestration/bad-adapter-state
+  states:
+    - built
+    - deployed
+  initial_state: built
+  terminal_states:
+    - deployed
+  transitions:
+    - name: deploy
+      from: built
+      to: deployed
+      destination_role: production
+      environment_role: production
+      adapter: missing-promotion

@@ -13,9 +13,27 @@
 # Usage:
 #   . "$(dirname "$0")/lib-config.sh"
 #   root="$(orch_project_root)"
-#   prod="$(orch_get production_branch main)"
+#   prod="$(orch_get production_branch)"
 #   orch_list ci_checks_integration            # one check name per line
 #   orch_selfchecks                            # "name<TAB>run" per line
+
+orch_script_dir() {
+  cd "$(dirname "${BASH_SOURCE[0]}")" && pwd
+}
+
+orch_engine() {
+  printf '%s/orchestration-engine.py' "$(orch_script_dir)"
+}
+
+orch_branch_name() {
+  local role="${1:?branch role required}"
+  shift || true
+  python3 "$(orch_engine)" branch-name "$role" "$@"
+}
+
+orch_validate_config() {
+  python3 "$(orch_engine)" validate-config >/dev/null
+}
 
 # --- location -----------------------------------------------------------------
 

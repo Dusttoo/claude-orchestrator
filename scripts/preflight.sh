@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # preflight.sh -- one-time environment check before dispatching a wave of agents.
 # Run from the repo root. Exits non-zero (and prints why) if the environment is
-# not ready. Universal checks (git, gh, integration branch, stale lock) always
+# not ready. Universal checks (git, gh, configured base branch, stale lock) always
 # run; language-specific checks run only when the repo shows evidence of that
 # toolchain, so the harness is not Node-specific.
 set -euo pipefail
@@ -13,7 +13,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fail() { echo "PREFLIGHT FAIL: $*" >&2; exit 1; }
 ok()   { echo "  ok: $*"; }
 
-INTEGRATION="$(orch_get integration_branch develop)"
+BASE_ROLE="${PREFLIGHT_BRANCH_ROLE:-integration}"
+BASE_BRANCH="$(orch_branch_name "$BASE_ROLE")"
 CONCURRENCY="$(orch_get concurrency_max 2)"
 
 echo "== orchestration preflight =="
@@ -30,10 +31,10 @@ ok "git, gh present"
 gh auth status >/dev/null 2>&1 || fail "gh is not authenticated -- run 'gh auth login'"
 ok "gh authenticated"
 
-# Integration branch reachable
-git fetch origin "$INTEGRATION" --quiet || fail "cannot fetch origin/${INTEGRATION}"
-HEAD_SHA="$(git rev-parse "origin/${INTEGRATION}")"
-ok "origin/${INTEGRATION} @ ${HEAD_SHA:0:12}"
+# Configured base branch reachable
+git fetch origin "$BASE_BRANCH" --quiet || fail "cannot fetch origin/${BASE_BRANCH}"
+HEAD_SHA="$(git rev-parse "origin/${BASE_BRANCH}")"
+ok "origin/${BASE_BRANCH} @ ${HEAD_SHA:0:12}"
 
 # Stale merge lock from a crashed run
 if [ -f .git/orchestrator-merge.lock ]; then
