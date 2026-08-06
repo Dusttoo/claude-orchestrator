@@ -21,6 +21,10 @@ cp "$HERE"/../scripts/lib-config.sh "$HERE"/../scripts/merge-guard.sh \
    "$TMP/repo/"
 printf 'integration_branch: develop\nproduction_branch: main\nmerge_to_integration: merge\n' > "$TMP/repo/.orchestration/config.yaml"
 cd "$TMP/repo" && git init -q
+git config user.email t@t.t
+git config user.name t
+git add -A
+git commit -qm init
 MOG="$TMP/repo/merge-on-green.sh"
 
 # 1. A non-"all-green" gate status is refused before anything else happens.
@@ -35,8 +39,19 @@ assert_exit "refuses when merge lock is held" 75 "$?"
 grep -q "pid=1 pr=1 held" "$TMP/repo/.git/orchestrator-merge.lock" \
   && printf 'ok   existing lock left intact\n' \
   || { printf 'FAIL existing lock was disturbed\n'; fails=$((fails + 1)); }
+rm "$TMP/repo/.git/orchestrator-merge.lock"
 
-# 3. Regression: the merge must not use --delete-branch (that couples branch
+# 3. A linked worktree has a .git file, not a directory. Its merge wrapper must
+#    use the shared Git common directory and observe a lock created elsewhere.
+git worktree add -q --detach "$TMP/worktree"
+echo "pid=1 pr=1 held-from-primary" > "$TMP/repo/.git/orchestrator-merge.lock"
+cd "$TMP/worktree"
+bash "$MOG" 42 feat/x all-green >/dev/null 2>&1
+assert_exit "linked worktree observes shared merge lock" 75 "$?"
+rm "$TMP/repo/.git/orchestrator-merge.lock"
+cd "$TMP/repo"
+
+# 4. Regression: the merge must not use --delete-branch (that couples branch
 #    cleanup to the merge and, under set -e, aborts a verified merge when a
 #    worktree still holds the branch), and branch deletion must be best-effort.
 SRC="$HERE/../scripts/merge-on-green.sh"

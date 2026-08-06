@@ -52,7 +52,15 @@ if [ "$GATE" != "all-green" ]; then
 fi
 
 # ---- merge lock: only one merge at a time across concurrent agents ----
-LOCK="$REPO_ROOT/.git/orchestrator-merge.lock"
+# Use Git's common directory rather than <worktree>/.git. In a linked worktree,
+# .git is a gitfile, while --git-common-dir points at the shared repository
+# metadata directory and therefore keeps the lock visible to every worktree.
+GIT_COMMON_DIR="$(git rev-parse --git-common-dir)"
+case "$GIT_COMMON_DIR" in
+  /*) ;;
+  *) GIT_COMMON_DIR="$REPO_ROOT/$GIT_COMMON_DIR" ;;
+esac
+LOCK="$GIT_COMMON_DIR/orchestrator-merge.lock"
 if ! ( set -o noclobber; echo "pid=$$ pr=$PR $(date -u +%FT%TZ)" > "$LOCK" ) 2>/dev/null; then
   echo "MERGE LOCK HELD by:" >&2; cat "$LOCK" >&2
   echo "Queue PR #$PR and retry after the current merge completes." >&2
