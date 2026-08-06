@@ -237,10 +237,11 @@ The harness is designed to move across codebases with only a config change. See
 [docs/workflow-configuration.md](docs/workflow-configuration.md) for schema v2
 workflow design.
 
-## Releasing a change (always bump the version)
+## Releasing a change (every PR bumps the version)
 
-**Every change that should reach installed sessions MUST bump the version** in
-BOTH manifests, in the same PR as the change:
+**Every PR MUST bump the version** in BOTH manifests, including PRs limited to
+documentation, tests, scripts, prompts, or repository tooling. Keep the bump in
+the same PR as the change:
 
 - [`.claude-plugin/plugin.json`](.claude-plugin/plugin.json) (`version`)
 - [`.codex-plugin/plugin.json`](.codex-plugin/plugin.json) (`version`) -- keep the
