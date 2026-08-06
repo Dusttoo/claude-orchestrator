@@ -1,6 +1,6 @@
 {
   "name": "claude-orchestrator",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Multi-agent orchestration harness for Claude Code: isolated implementation, independent review gates, merge-on-green, configurable workflow state machines, a mechanical merge-guard hook, and worktree auto-cleanup.",
   "author": {
     "name": "Dusty Mumphrey"
