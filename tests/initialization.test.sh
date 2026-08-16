@@ -30,6 +30,18 @@ check "Claude init command validates through shared engine" \
   rg -q 'orchestration-engine\.py validate-config' "$ROOT/commands/orchestration-init.md"
 check "Codex init skill validates through shared engine" \
   rg -q 'orchestration-engine\.py validate-config' "$ROOT/skills/orchestration-init/SKILL.md"
+check "Claude init runs plugin-owned conformance tests" \
+  rg -q 'run-plugin-conformance\.sh' "$ROOT/commands/orchestration-init.md"
+check "Codex init runs plugin-owned conformance tests" \
+  rg -q 'run-plugin-conformance\.sh' "$ROOT/skills/orchestration-init/SKILL.md"
+check_not "Claude init does not copy process docs into target repos" \
+  rg -q 'Copy `templates/ORCHESTRATION\.md`' "$ROOT/commands/orchestration-init.md"
+check_not "Codex init does not copy process docs into target repos" \
+  rg -q 'Copy `templates/ORCHESTRATION\.md`' "$ROOT/skills/orchestration-init/SKILL.md"
+check "plugin conformance runner owns merge-guard suite" \
+  rg -q 'merge-guard\.test\.sh' "$ROOT/scripts/run-plugin-conformance.sh"
+check "plugin conformance runner owns worktree-cleanup suite" \
+  rg -q 'worktree\.test\.sh' "$ROOT/scripts/run-plugin-conformance.sh"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi

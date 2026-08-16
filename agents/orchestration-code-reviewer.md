@@ -31,6 +31,15 @@ voice sections. Those are the concrete FAIL conditions for THIS repo.
    claim from the implementer is not evidence; reproduce it.
 5. Build the **acceptance-criteria coverage matrix** (below) before you decide.
    This is mandatory and its result feeds directly into the verdict.
+6. Re-run the ticket's **adversarial test matrix**. Confirm it covers every
+   relevant parser/interpreter form, boundary, external-command failure, partial
+   state, permission mode, concurrency case, and recovery path exposed by the
+   diff. A missing row or a row without a falsifying assertion is blocking.
+
+Do not stop when you find the first blocker. Finish all steps, every checklist
+item, the complete diff, and both matrices, then batch every finding into one
+response. On a later round, repeat the full sweep; never review only the last
+patch or the previous findings.
 
 ## Acceptance-criteria coverage matrix (mandatory)
 
@@ -103,7 +112,10 @@ error) instead of fixing the cause? -> FAIL.
 
 ## Output contract
 
-Include the completed acceptance-criteria coverage matrix in your response, then
+Include the completed acceptance-criteria coverage matrix and the audited
+adversarial test matrix in your response. Every FAIL finding must start with a
+stable component key (`[component: <subsystem/symbol>]`) so the orchestrator can
+count repeated failures. Then
 end with EXACTLY one of these as the literal last lines:
 
 ```
@@ -114,7 +126,7 @@ or
 
 ```
 VERDICT: FAIL
-- <file:line> <what's wrong and why it blocks>
+- [component: <subsystem/symbol>] <file:line> <what's wrong and why it blocks>
 - ...
 ```
 

@@ -15,8 +15,9 @@ From inside the target repo, in a Claude Code session with the plugin installed:
 ```
 
 It detects the branch model and CI check names, scaffolds
-`.orchestration/config.yaml` for you to review, copies in `ORCHESTRATION.md`,
-confirms a `CLAUDE.md` exists, and gitignores the runtime marker directory. The
+`.orchestration/config.yaml` for you to review, confirms a `CLAUDE.md` exists,
+and gitignores the runtime marker directory. Reusable process docs, scripts, and
+conformance tests remain in the plugin. The
 rest of this doc is what that command sets up, for when you want to do it by hand
 or understand what it produced.
 
@@ -94,6 +95,11 @@ or understand what it produced.
    to end and confirm the guard actually blocks a bare `gh pr merge` before the
    gates record a marker.
 
+   Run the plugin-owned reusable safety suites without copying them into the repo:
+   ```
+   <plugin>/scripts/run-plugin-conformance.sh
+   ```
+
 ## What is repo-specific vs harness-generic
 
 | Repo-specific (you provide) | Harness-generic (the plugin provides) |
@@ -103,6 +109,11 @@ or understand what it produced.
 | The rules in `CLAUDE.md` / `AGENTS.md` | The agents that read and enforce those rules |
 | Which diffs need a security review | The security-review agent and its checklist |
 | Provider commands and ticket systems | Adapter seams and fail-closed adapter validation |
+| Project-specific acceptance tests | Reusable merge-guard and worktree-cleanup conformance tests |
+
+Do not vendor plugin scripts, process docs, or generic safety tests into the
+target repository. Its orchestration footprint is configuration plus the
+project rules/acceptance criteria and tests that are genuinely project-specific.
 
 ## Language-agnostic notes
 

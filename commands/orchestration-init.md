@@ -1,5 +1,5 @@
 ---
-description: Bootstrap the orchestration harness in the current repo (scaffold .orchestration/config.yaml, wire hooks, check rules docs).
+description: Bootstrap the orchestration harness in the current repo (scaffold configuration, wire hooks, check project acceptance criteria).
 ---
 
 Set up the orchestration harness in THIS repository. Be conservative: detect,
@@ -22,29 +22,28 @@ propose, confirm before writing.
    ${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py validate-config
    ```
 
-3. **Copy `templates/ORCHESTRATION.md`** to `.orchestration/ORCHESTRATION.md`
-   (the process doc this repo's agents reference).
-
-4. **Rules docs.** Confirm a `CLAUDE.md` (and ideally `AGENTS.md`) exists at the
+3. **Project contract.** Confirm a `CLAUDE.md` (and ideally `AGENTS.md`) exists at the
    repo root -- the gate agents read it for the actual rules. If missing, offer
    to generate a starter (project summary, stack, hard rules, git workflow) and
    tell the user this is where the repo's KNOWLEDGE accrues over time. The plugin
    provides discipline; CLAUDE.md provides knowledge.
 
-5. **Wire the hooks.** Add the plugin's hooks to `.claude/settings.json` (or
+4. **Wire the hooks.** Add the plugin's hooks to `.claude/settings.json` (or
    confirm the plugin's `hooks/hooks.json` is already active via the plugin):
    - PreToolUse on Bash -> the merge-guard.
    - Stop -> the worktree sweep.
    Gitignore `.orchestration/.gate-status/` and the worktree base.
 
-6. **Branch protection (optional, recommended).** Offer to apply protection via
+5. **Branch protection (optional, recommended).** Offer to apply protection via
    `gh api`: required status checks on both branches (strict), no direct pushes,
    admin enforcement on production. Show the payload first; only apply on
    confirmation.
 
-7. **Smoke test.** Confirm `${CLAUDE_PLUGIN_ROOT}/scripts/sweep-agent-worktrees.sh`
-   and `merge-guard.sh` run without error in this repo, and that the shared
-   engine validates the new config.
+6. **Smoke and conformance test.** Validate the target configuration and smoke
+   the hooks in this repo. Run
+   `${CLAUDE_PLUGIN_ROOT}/scripts/run-plugin-conformance.sh` for the reusable
+   merge-guard and worktree-cleanup suites. These tests remain in the plugin;
+   never copy them (or plugin scripts/process docs) into the target repository.
 
 Report what was created/changed and the one manual step left (usually: review
 the generated config + CLAUDE.md).

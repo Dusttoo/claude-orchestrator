@@ -52,6 +52,10 @@ ticket's acceptance criteria and its `Reachable via:` click-path.
    feature is reachable in the stated clicks? A missing entry point is a FAIL even
    if the destination renders perfectly.
 
+Finding one blocker does not end the review. Capture and inspect every configured
+route, viewport, state, and acceptance criterion, then batch all findings in one
+response. A re-review repeats the full sweep, not just the previously broken view.
+
 ## Design reference (if the repo has one)
 
 If the ticket references a design source of truth (a screenshot or markup the
@@ -84,7 +88,7 @@ or
 
 ```
 VERDICT: FAIL
-- <step where it broke> -- <what the user sees> vs <what the AC requires>
+- [component: ui:<route/component>] <step where it broke> -- <what the user sees> vs <what the AC requires>
 manifest: <path to manifest.json>
 screenshots: <comma-separated paths>
 ```

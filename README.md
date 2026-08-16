@@ -36,6 +36,7 @@ ways:
 4. **No gates.** Work merges on vibes rather than on a green pipeline.
 
 This harness addresses all four: isolated worktrees, fat per-ticket briefs,
+an adversarial test matrix and security-sensitive design gate before code,
 separate review/security agents run against the diff with fresh context, and a
 hard all-green gate before anything lands. Claude Code and Codex can enforce
 that with the bundled hook after trust review; the marker and merge scripts are
@@ -81,6 +82,13 @@ the shared mechanism.
 
 - **The author never reviews their own work.** Review and security agents run
   with fresh context against the diff only.
+- **Design before security-sensitive infrastructure.** A pre-code gate records
+  trust boundaries, impossible guarantees, failure recovery, rejected fragile
+  alternatives, and the adversarial tests that falsify its invariants.
+- **Reviews batch the whole sweep.** Finding one blocker never ends a review;
+  reviewers finish the diff, checklist, and matrix and report all findings once.
+- **Two component failures trigger redesign.** A stable component-key ledger
+  prevents an endless sequence of narrow patches to the same broken design.
 - **Enforcement is mechanical, not advisory.** The merge-guard is a hook that
   can veto the merge command; it does not rely on the agent choosing to comply.
   See [docs/merge-guard.md](docs/merge-guard.md).
@@ -101,13 +109,13 @@ the shared mechanism.
 
 | Layer | What it is |
 |---|---|
-| `agents/` | Role briefs: implementer, code-reviewer, security-reviewer, visual-qa |
+| `agents/` | Role briefs: design-reviewer, implementer, code-reviewer, security-reviewer, visual-qa |
 | `commands/` | Claude Code slash commands: `/orchestrate`, `/gate`, `/release`, `/orchestration-init` |
 | `hooks/` | Claude Code/Codex `PreToolUse` merge-guard + `Stop` worktree sweep |
 | `scripts/` | The mechanics: config reader, workflow engine, gate runner, merge-guard, safe-merge, worktree lifecycle, verification |
 | `skills/` | Codex/Claude natural-language procedures: orchestrate, gate, release, init, scope, recover |
-| `templates/` | The per-repo `config.yaml` and `ORCHESTRATION.md` to copy in |
-| `tests/` | Shell test suites for the scripts (`bash tests/run.sh`) |
+| `templates/` | Configuration template plus the plugin-owned process reference |
+| `tests/` | Plugin-owned conformance suites; never copied into target repos |
 | `.codex-plugin/` | Codex plugin manifest exposing the `skills/` directory |
 
 ## Configuration
@@ -160,7 +168,7 @@ worktree sweep). Then, from inside a target repo, scaffold the per-repo wiring:
 ```
 
 That detects the branch model and CI checks, writes `.orchestration/config.yaml`
-for you to review, copies in `ORCHESTRATION.md`, confirms a `CLAUDE.md` exists
+for you to review, confirms a `CLAUDE.md` exists
 (the harness provides discipline; `CLAUDE.md` provides the repo's knowledge),
 and gitignores the runtime marker directory.
 
@@ -191,11 +199,13 @@ marketplace layout and hook trust notes.
 /orchestrate <ticket-id or description>
 ```
 
-drives one unit of work through the whole pipeline: implement (worktree, TDD) ->
+drives one unit of work through the whole pipeline: scope/adversarial matrix ->
+design gate for security-sensitive infrastructure -> implement (worktree, TDD) ->
 code review (fresh agent) -> security review (when the diff warrants) -> optional
 verification -> record the all-green marker -> merge -> verify it landed. Any
-gate returning `VERDICT: FAIL` loops back to a fresh implementer with the
-findings; nothing merges red.
+gate returning `VERDICT: FAIL` loops back with a complete batch of findings;
+the second failure in one component forces redesign instead of another narrow
+patch. Nothing merges red.
 
 The slash command is the explicit, deterministic entry point. Natural language
 works too: asking to "orchestrate BL-90" or "run this ticket through the
@@ -229,6 +239,12 @@ paths, on real git worktrees).
 ```
 bash tests/run.sh
 ```
+
+The reusable merge-guard and worktree-cleanup suites are plugin conformance
+tests. Initialization can run them from any target repo with
+`<plugin>/scripts/run-plugin-conformance.sh`; it does not install test or script
+copies. Target repositories supply configuration, their rules and acceptance
+criteria, and only tests specific to their own behavior.
 
 ## Porting to a new repo
 
