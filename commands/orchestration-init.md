@@ -1,5 +1,5 @@
 ---
-description: Bootstrap the orchestration harness in the current repo (scaffold configuration, wire hooks, check project acceptance criteria).
+description: Bootstrap the orchestration harness in the current repo (scaffold configuration, expose optional plugin hooks, check project acceptance criteria).
 ---
 
 Set up the orchestration harness in THIS repository. Be conservative: detect,
@@ -16,7 +16,9 @@ propose, confirm before writing.
 
 2. **Scaffold `.orchestration/config.yaml`** from the plugin's
    `templates/config.yaml`, filled in with what you detected. Show the user the
-   filled config and let them correct it before writing.
+   filled config and let them correct it before writing. Keep
+   `worktree_cleanup: manual` unless the user explicitly opts into automatic
+   removal of clean, unlocked agent worktrees.
    After writing, validate it:
    ```bash
    ${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py validate-config
@@ -28,11 +30,11 @@ propose, confirm before writing.
    tell the user this is where the repo's KNOWLEDGE accrues over time. The plugin
    provides discipline; CLAUDE.md provides knowledge.
 
-4. **Wire the hooks.** Add the plugin's hooks to `.claude/settings.json` (or
-   confirm the plugin's `hooks/hooks.json` is already active via the plugin):
-   - PreToolUse on Bash -> the merge-guard.
-   - Stop -> the worktree sweep.
-   Gitignore `.orchestration/.gate-status/` and the worktree base.
+4. **Optional host hooks.** Do not copy hook commands into project settings.
+   If this host exposes plugin hooks, show the user how to review/trust the
+   bundled `hooks/hooks.json`. The scripted merge and configured cleanup paths
+   remain authoritative without hooks. Gitignore `.orchestration/.gate-status/`
+   and the worktree base.
 
 5. **Branch protection (optional, recommended).** Offer to apply protection via
    `gh api`: required status checks on both branches (strict), no direct pushes,

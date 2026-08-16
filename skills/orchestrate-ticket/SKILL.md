@@ -65,6 +65,7 @@ reading them:
 - `../../agents/orchestration-visual-qa.md`
 - `../../scripts/merge-guard.sh`
 - `../../scripts/merge-on-green.sh`
+- `../../scripts/cleanup-worktree.sh`
 - `../../scripts/orchestration-engine.py`
 - `../../scripts/run-verification.sh`
 - `../../scripts/run-visual-qa.sh`
@@ -125,13 +126,19 @@ working directory.
 6. **Merge on green.** Only after every gate PASSES, every required verification
    is GREEN, and the configured target CI checks are green: record the marker
    (`merge-guard.sh --record-green <pr> [result_file]`), then merge with
-   `merge-on-green.sh <pr> <branch> all-green <verify_path>`. Claude Code also
-   enforces this with the merge-guard hook; Codex relies on the scripted merge
-   path plus branch protection for out-of-band enforcement.
+   `merge-on-green.sh <pr> <branch> all-green <verify_path>`. That script
+   validates the marker, plugin version, PR head/branch, target base/sha, and
+   freshness itself, so correctness never depends on either host registering a
+   hook. A trusted Claude Code or Codex hook is defense in depth; branch
+   protection remains the out-of-band enforcement layer.
 
 7. **Close the loop.** Transition the ticket if there is a configured tracker or
    ticket adapter. Confirm the work landed on the configured target branch.
-   Report what merged and the click path.
+   Read `worktree_cleanup` (default `manual`). When it is `auto`, run
+   `cleanup-worktree.sh <WORKTREE>` explicitly after the verified merge; this is
+   the host-neutral cleanup path and still refuses dirty worktrees. When it is
+   `manual`, preserve the worktree and report its path. Report what merged and
+   the click path. Do not assume a lifecycle hook ran.
 
 Respect `concurrency_max`: at most that many heavy verification chains at once,
 on non-conflicting areas. Dual gates on ONE PR run sequentially. CI-green alone

@@ -68,13 +68,14 @@ or understand what it produced.
 
 4. **Gitignore the runtime dirs.** Add `.orchestration/.gate-status/` (the marker
    directory the merge-guard writes) and your worktree base if it is inside the
-   repo.
+   repo. Keep `worktree_cleanup: manual` unless you explicitly want the
+   orchestrator and trusted lifecycle hook to remove clean, unlocked worktrees.
 
-5. **Confirm the hooks are active.** The plugin registers the `PreToolUse`
-   merge-guard and the `Stop` worktree sweep. If your Claude Code version does
-   not auto-activate plugin hooks, add them to `.claude/settings.json` pointing at
-   `${CLAUDE_PLUGIN_ROOT}/scripts/merge-guard.sh` and
-   `${CLAUDE_PLUGIN_ROOT}/scripts/sweep-agent-worktrees.sh`.
+5. **Optionally confirm hooks are active.** Claude Code and current Codex hosts
+   can load the bundled `PreToolUse` merge guard and `Stop` worktree sweep after
+   trust review. Host support varies, so hooks are defense in depth. The
+   sanctioned merge script validates evidence directly, and configured cleanup
+   runs explicitly. Do not vendor plugin hook commands into project settings.
 
 6. **Branch protection (recommended).** The merge-guard governs the agent shell;
    branch protection closes the paths it cannot see (direct pushes, UI merges).

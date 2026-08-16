@@ -31,6 +31,10 @@ cd "$TMP/repo" && git init -q >/dev/null
 echo x > f; git add -A; git -c user.email=t@t.t -c user.name=t commit -qm init
 export GATE_STATUS_DIR="$TMP/markers"
 export MERGE_GUARD_STATUS_DIR="$TMP/markers"
+export MERGE_GUARD_PLUGIN_VERSION="test-version"
+export MERGE_GUARD_PR_HEAD_BRANCH="feat/verify"
+export MERGE_GUARD_PR_BASE_BRANCH="develop"
+export MERGE_GUARD_PR_BASE_SHA="base-sha"
 SHA="$(git rev-parse HEAD)"
 
 # 1. A GREEN verification exits 0 and writes a sha-stamped result file.

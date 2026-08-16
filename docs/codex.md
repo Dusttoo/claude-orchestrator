@@ -4,10 +4,10 @@ This repository is a Codex plugin folder. The Codex manifest lives at
 `.codex-plugin/plugin.json` and exposes the natural-language skills in `skills/`.
 
 Codex does not ingest the Claude Code slash-command files in `commands/`.
-Enabled Codex plugins can load lifecycle hooks from the default
-`hooks/hooks.json` file, so this plugin intentionally keeps its merge guard and
-worktree sweep there. Codex skips plugin-bundled hooks until you review and
-trust them with `/hooks`.
+Current Codex hosts can discover lifecycle hooks from `hooks/hooks.json` after
+the user reviews and trusts them, but that capability is host/version-dependent.
+The plugin never relies on it: natural-language skills call the same controller,
+merge, and cleanup scripts used by the Claude Code commands.
 
 ## What Codex gets
 
@@ -29,8 +29,9 @@ workflow policy is planned and enforced through `scripts/orchestration-engine.py
 
 ## Hook behavior
 
-When the plugin is enabled, Codex can discover `hooks/hooks.json` by default.
-Open `/hooks` to inspect, trust, disable, or re-enable the plugin-bundled hooks.
+When supported, Codex can discover `hooks/hooks.json`. Open `/hooks` to inspect,
+trust, disable, or re-enable plugin-bundled hooks. A host that does not expose
+them remains supported.
 
 The hook commands use `${CLAUDE_PLUGIN_ROOT}` because Claude Code sets that
 variable and Codex sets it for compatibility with existing plugin hooks. Codex
@@ -40,10 +41,14 @@ The `PreToolUse` merge guard is inert until the target repository opts into the
 harness with `.orchestration/config.yaml`. In uninitialized repositories it
 exits successfully without creating `.orchestration/` or blocking commands.
 After initialization, it blocks raw `gh pr merge` commands unless a fresh
-all-green marker exists for the PR head.
+all-green marker matches the active plugin version and exact PR head/base
+identity. `merge-on-green.sh` performs the same validation directly before the
+sanctioned merge, so disabling or lacking the hook cannot bypass the gate.
 
-The `Stop` worktree sweep only removes clean, unlocked `agent-*` worktrees under
-the configured `worktree_base`. Dirty worktrees are preserved for recovery.
+The `Stop` worktree sweep is disabled by the safe default
+`worktree_cleanup: manual`. With `auto`, both the skill's explicit post-merge
+cleanup and the optional hook remove only clean, unlocked `agent-*` worktrees
+under `worktree_base`; dirty and locked worktrees remain recoverable.
 
 ## Local install
 
@@ -142,6 +147,7 @@ scripts/merge-guard.sh --record-green <pr> [result_file]
 scripts/merge-on-green.sh <pr> <branch> all-green <verify_path>
 ```
 
-The hook is a local guardrail around agent tool calls. Branch protection remains
+The hook is an optional local guardrail around agent tool calls. The sanctioned
+scripted path enforces the same proof without it. Branch protection remains
 the required out-of-band backstop for direct pushes, GitHub UI merges, or any
 shell that does not run through trusted hooks.

@@ -9,10 +9,10 @@ It is packaged as a Claude Code plugin and as a Codex plugin source tree. One
 orchestrator session dispatches work; each ticket is implemented by one agent
 role in an isolated git worktree, then reviewed by a *separate* code-review role
 and a *separate* security-review role that never see the implementer's
-reasoning, and only merged when every gate is green. In Claude Code and Codex, a
-trusted `PreToolUse` hook can physically block a merge that has not passed the
-gates, so "never merge on red" is a mechanism rather than a request. Branch
-protection remains the out-of-band enforcement layer.
+reasoning, and only merged when every gate is green. The sanctioned merge script
+validates the marker, plugin version, and exact PR head/base identity itself on
+both Claude Code and Codex. A trusted `PreToolUse` hook can additionally block
+raw merge commands, while branch protection remains the out-of-band layer.
 
 The harness is **config-driven**: every repo-specific fact (branch model, state
 graph, gate commands, CI categories, approvals, adapter seams) lives in one
@@ -38,9 +38,9 @@ ways:
 This harness addresses all four: isolated worktrees, fat per-ticket briefs,
 an adversarial test matrix and security-sensitive design gate before code,
 separate review/security agents run against the diff with fresh context, and a
-hard all-green gate before anything lands. Claude Code and Codex can enforce
-that with the bundled hook after trust review; the marker and merge scripts are
-the shared mechanism.
+hard all-green gate before anything lands. Claude Code and Codex share the same
+marker and merge scripts; trusted hooks add local defense in depth when the host
+supports them.
 
 ## The model
 
@@ -89,16 +89,18 @@ the shared mechanism.
   reviewers finish the diff, checklist, and matrix and report all findings once.
 - **Two component failures trigger redesign.** A stable component-key ledger
   prevents an endless sequence of narrow patches to the same broken design.
-- **Enforcement is mechanical, not advisory.** The merge-guard is a hook that
-  can veto the merge command; it does not rely on the agent choosing to comply.
+- **Enforcement is mechanical, not advisory.** The sanctioned merge script
+  refuses stale or mismatched evidence even without hooks. A trusted merge-guard
+  hook can also veto raw merge commands.
   See [docs/merge-guard.md](docs/merge-guard.md).
 - **Config over fork.** Repo-specific facts live in a per-repo config file. The
   knowledge (conventions, gotchas) lives in the repo's own `CLAUDE.md` /
   `AGENTS.md`, which the gate agents read. Workflow policy is declared in
   schema-versioned config and enforced by shared scripts, not by Claude/Codex
   adapter text.
-- **Worktree isolation by default.** Parallel agents never share a checkout, and
-  a `Stop` hook sweeps finished ones while preserving any with unsaved work.
+- **Worktree isolation by default.** Parallel agents never share a checkout.
+  Cleanup defaults to manual; repositories may opt into explicit post-merge and
+  trusted-hook cleanup, which always preserves dirty or locked worktrees.
 - **The orchestrator relays grep targets, not stale facts.** Summarizing agent
   reports into briefs into docs drops the uncertainty marker at each hop, so the
   orchestrator never hands down a `file:line` or an unrun snippet (both drift),
@@ -142,6 +144,7 @@ Legacy key blocks:
 | `gates` | which review roles run (`code-review`, `security-review`) |
 | `security_required_when` | diff triggers that make the security gate mandatory |
 | `concurrency_max` | how many verification chains run at once |
+| `worktree_cleanup` | `manual` (safe default) or `auto` for clean, unlocked worktrees |
 | `rules_docs` | the docs every gate agent reads (`CLAUDE.md`, `AGENTS.md`) |
 
 The legacy scalar/list parser is pure bash. The schema v2 workflow is validated
@@ -160,8 +163,9 @@ Claude Code session:
 /plugin install claude-orchestrator@builtbydusty
 ```
 
-Installing it activates the agents, commands, and hooks (the merge-guard and the
-worktree sweep). Then, from inside a target repo, scaffold the per-repo wiring:
+Installing it activates the agents and commands. Hosts that support plugin hooks
+can additionally expose the merge guard and worktree sweep after trust review.
+Then, from inside a target repo, scaffold the per-repo wiring:
 
 ```
 /orchestration-init
@@ -172,9 +176,9 @@ for you to review, confirms a `CLAUDE.md` exists
 (the harness provides discipline; `CLAUDE.md` provides the repo's knowledge),
 and gitignores the runtime marker directory.
 
-Exact `/plugin` syntax can vary by Claude Code version; if your version wires
-plugins differently, `/orchestration-init` still scaffolds the config and can
-add the hooks to `.claude/settings.json` directly.
+Exact `/plugin` syntax can vary by Claude Code version. Regardless of hook
+support, `/orchestration-init` scaffolds the same configuration and the
+sanctioned scripts enforce merges and cleanup directly.
 
 ### Codex
 
@@ -240,8 +244,8 @@ paths, on real git worktrees).
 bash tests/run.sh
 ```
 
-The reusable merge-guard and worktree-cleanup suites are plugin conformance
-tests. Initialization can run them from any target repo with
+The reusable merge-guard, merge-on-green, worktree-cleanup, and host-parity
+suites are plugin conformance tests. Initialization can run them from any target repo with
 `<plugin>/scripts/run-plugin-conformance.sh`; it does not install test or script
 copies. Target repositories supply configuration, their rules and acceptance
 criteria, and only tests specific to their own behavior.

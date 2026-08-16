@@ -52,6 +52,12 @@ echo "wip" > ".claude/worktrees/agent-dirty/wip.txt"
 # A non-agent worktree must be ignored entirely.
 git worktree add -q ".claude/worktrees/session-keep" -b session-keep >/dev/null 2>&1
 
+# Missing policy (all pre-0.2.1 repos) means manual and must make the sweep a no-op.
+WT_QUIET=1 bash "$SCRIPTS/sweep-agent-worktrees.sh" >/dev/null 2>&1
+check "default-manual cleanup preserves clean agent worktree" test -d ".claude/worktrees/agent-clean"
+check "default-manual cleanup preserves new-worktree worktree" test -d ".claude/worktrees/agent-feat-new-script"
+
+printf 'worktree_cleanup: auto\n' >> .orchestration/config.yaml
 WT_QUIET=1 bash "$SCRIPTS/sweep-agent-worktrees.sh" >/dev/null 2>&1
 check "sweep removed the new-worktree worktree"      test ! -d ".claude/worktrees/agent-feat-new-script"
 check "sweep removed the clean agent worktree"      test ! -d ".claude/worktrees/agent-clean"

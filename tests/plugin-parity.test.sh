@@ -30,6 +30,38 @@ contains_engine skills/orchestrate-ticket/SKILL.md
 contains_engine commands/gate.md
 contains_engine skills/gate-pr/SKILL.md
 
+contains_contract() {
+  local label="$1" pattern="$2"; shift 2
+  local file
+  for file in "$@"; do
+    if ! rg -q "$pattern" "$ROOT/$file"; then
+      fail_case "$label missing from $file"
+      return
+    fi
+  done
+  ok "$label present in Claude and Codex adapters"
+}
+
+contains_contract "host-neutral merge evidence" 'plugin version' \
+  commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
+  commands/gate.md skills/gate-pr/SKILL.md
+contains_contract "explicit cleanup policy" 'worktree_cleanup' \
+  commands/orchestrate.md skills/orchestrate-ticket/SKILL.md
+contains_contract "hooks are optional" 'defense in depth' \
+  commands/orchestrate.md skills/orchestrate-ticket/SKILL.md
+
+if rg -q 'merge-guard\.sh" --assert-green "\$PR" "\$BRANCH"' "$ROOT/scripts/merge-on-green.sh"; then
+  ok "sanctioned merge enforces evidence independently of host hooks"
+else
+  fail_case "sanctioned merge does not enforce evidence independently of host hooks"
+fi
+
+if rg -n '(^|[ `])scripts/[A-Za-z0-9_-]+\.(sh|py)' "$ROOT/commands" -g '*.md' >/dev/null; then
+  fail_case "Claude commands contain target-relative plugin script paths"
+else
+  ok "Claude commands resolve every plugin script through CLAUDE_PLUGIN_ROOT"
+fi
+
 compare_plan() {
   local fixture="$1" transition="$2"; shift 2
   local claude codex
