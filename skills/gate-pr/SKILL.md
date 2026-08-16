@@ -16,6 +16,7 @@ target repository. Resolve these paths from this skill file before executing or
 reading them:
 
 - `../../agents/orchestration-code-reviewer.md`
+- `../../agents/orchestration-design-reviewer.md`
 - `../../agents/orchestration-implementer.md`
 - `../../agents/orchestration-security-reviewer.md`
 - `../../scripts/merge-guard.sh`
@@ -38,16 +39,24 @@ working directory.
 2. Run the code-review gate as a fresh review pass. If the host supports
    subagents, launch one with `orchestration-code-reviewer.md`; otherwise apply
    that brief yourself without using the implementer's reasoning as evidence.
-   The output must end in `VERDICT: PASS` or `VERDICT: FAIL`.
+   The reviewer must finish the full checklist, diff, and adversarial matrix even
+   after finding a blocker, batch all findings, and end in `VERDICT: PASS` or
+   `VERDICT: FAIL`. Each finding must carry a stable `[component: ...]` key.
 3. Inspect the PR diff against `security_required_when`. If any trigger matches,
    run a fresh security-review pass using `orchestration-security-reviewer.md`.
    If nothing matches, record that the security gate was skipped because the diff
    has no configured security surface.
-4. On any `VERDICT: FAIL`, do not merge. Relay the reviewer's exact wording of each
-   blocking finding to a fresh implementer to fix on the same branch, then re-run
+4. On any `VERDICT: FAIL`, do not merge. Maintain a failure ledger keyed by
+   `[component: ...]` across all gates and rounds. Relay the reviewer's exact
+   wording of each blocking finding to a fresh implementer to fix on the same branch, then re-run
    the failed gate. Relay by grep target or symbol, not by copying the reviewer's
    `file:line` (it drifts once the branch moves); label each finding as
    reviewer-reported so the implementer re-derives it rather than trusting it.
+   A first component failure may receive a narrow fix. A second failure in the
+   same component MUST run `orchestration-design-reviewer.md` against the root
+   design and a revised adversarial matrix; no further implementation starts
+   until that design returns `VERDICT: PASS`. Then re-run each complete gate,
+   not only the prior finding.
 5. For each configured `verification:` entry whose `when:` applies to the target,
    run `run-verification.sh <name>`. A GREEN result file is required; RED or a
    missing result file blocks the merge.

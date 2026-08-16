@@ -16,32 +16,39 @@ No stacked PRs unless the configured workflow explicitly allows them.
 ## The pipeline
 
 ```
-implement -> code-review -> security-review -> verify -> merge-on-green
-(worktree)  (fresh agent)   (fresh agent)      (opt.)   (CI green + marker)
+scope/matrix -> design* -> implement -> code-review -> security-review -> verify -> merge
+               (fresh)    (worktree)  (fresh agent)   (fresh agent)      (opt.)
 ```
 
-1. **Implement** (`orchestration-implementer`). Isolated worktree. TDD
+1. **Pre-implementation.** Before a branch is cut, produce an adversarial test
+   matrix with falsifying assertions for every relevant syntax form, boundary,
+   inspection failure, partial state, and cleanup/recovery path. Security-sensitive
+   infrastructure additionally requires a fresh `orchestration-design-reviewer`
+   PASS that defines trust boundaries and impossible guarantees and rejects
+   fragile designs before code exists.
+
+2. **Implement** (`orchestration-implementer`). Isolated worktree. TDD
    red-green. Runs the repo's pre-commit self-checks. Opens a PR to the
    configured target branch. Returns a structured report ending in a click-path.
 
-2. **Code review** (`orchestration-code-reviewer`). A FRESH agent with no
+3. **Code review** (`orchestration-code-reviewer`). A FRESH agent with no
    implementer context. Re-derives correctness from the ticket + diff, runs the
    repo's review skill, re-runs the self-checks itself, audits against the
    repo's standards. Ends with `VERDICT: PASS` or `VERDICT: FAIL`.
 
-3. **Security review** (`orchestration-security-reviewer`). Another fresh agent.
+4. **Security review** (`orchestration-security-reviewer`). Another fresh agent.
    Runs only when the change touches a `security_required_when` trigger (auth,
    data isolation, migrations, payments...). Hunts for leaks / privilege
    escalation / isolation breaks. Ends with `VERDICT: PASS` / `FAIL`.
 
-4. **Verify (optional).** For each `verification:` entry whose `when:` matches
+5. **Verify (optional).** For each `verification:` entry whose `when:` matches
    the target, `run-verification.sh <name>` runs the suite on the rebased branch
    and writes a sha-stamped result file (RED = no file = no merge). If the change
    has a user-visible surface, the `orchestration-visual-qa` agent captures the
    click-path headlessly and compares it against the acceptance criteria. Both
    end in a verdict the orchestrator branches on.
 
-5. **Merge on green.** Only after every gate PASSES, every required verification
+6. **Merge on green.** Only after every gate PASSES, every required verification
    is GREEN, **and** the configured target CI checks are green. The orchestrator
    records the marker (`merge-guard.sh --record-green`, validated against a
    result file when one exists), then merges via `merge-on-green.sh`. The
@@ -69,6 +76,13 @@ implement -> code-review -> security-review -> verify -> merge-on-green
 - **The VERDICT contract.** Every gate agent ends with a literal
   `VERDICT: PASS` / `VERDICT: FAIL` last line so the orchestrator can branch
   deterministically.
+- **One review, one batch.** A reviewer completes the whole diff, checklist, and
+  adversarial matrix after finding a blocker, then returns every finding at once.
+  Re-review repeats the whole sweep.
+- **Two strikes means redesign.** Findings carry stable component keys. The
+  orchestrator counts them across gates and rounds; the second failure in one
+  component goes back through the design gate with a revised matrix, never into
+  another narrow patch.
 - **Mechanical enforcement, not just discipline.** The merge-guard hook + branch
   protection make "never merge on red" a mechanism, not a good intention.
 - **Worktree isolation + auto-cleanup.** Each agent gets its own git worktree.

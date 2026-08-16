@@ -59,6 +59,7 @@ target repository. Resolve these paths from this skill file before executing or
 reading them:
 
 - `../../agents/orchestration-implementer.md`
+- `../../agents/orchestration-design-reviewer.md`
 - `../../agents/orchestration-code-reviewer.md`
 - `../../agents/orchestration-security-reviewer.md`
 - `../../agents/orchestration-visual-qa.md`
@@ -78,7 +79,21 @@ working directory.
    scope it (see the `scope-ticket` skill) or push back BEFORE cutting a branch.
    With no tracker, treat the request as the spec.
 
-2. **Implement.** Run the implementer role from
+2. **Pre-implementation gates.** Before cutting a branch or editing production
+   code, build an adversarial test matrix from the acceptance criteria and the
+   existing system. Each row names the attack/failure mode, setup/input, expected
+   invariant, test layer, and the assertion that would fail. Include relevant
+   parser/interpreter forms (shell wrappers, quoting, substitutions, heredocs,
+   redirections and pipelines), ignored/untracked files, failed Git or other
+   inspection commands, partial execution, cleanup/recovery, permissions,
+   concurrency, retries, and hostile inputs; mark a category N/A only with a
+   reason. If the planned change touches security-sensitive infrastructure, run
+   a fresh pre-code design review with `orchestration-design-reviewer.md`. It must
+   define the trust boundary and impossible guarantees, reject fragile designs,
+   audit the matrix, and end `VERDICT: PASS`. A FAIL returns to design. Pass the
+   approved artifacts to the implementer.
+
+3. **Implement.** Run the implementer role from
    `orchestration-implementer.md`, passing the ticket body and the click-path. If
    the host supports subagents, launch a fresh implementer with
    `isolation: "worktree"`; otherwise perform that role as a distinct pass in an
@@ -87,28 +102,34 @@ working directory.
    configured source branch, one PR to the legacy configured target branch. Wait for its structured report
    (PR number, branch, worktree, SELF_CHECK).
 
-3. **Gate.** Run the review gates on the PR: a fresh code-review role using
+4. **Gate.** Run the review gates on the PR: a fresh code-review role using
    `orchestration-code-reviewer.md` (no implementer context), then a fresh
    security-review role using `orchestration-security-reviewer.md` when the diff
    hits a `security_required_when` trigger. Both must end `VERDICT: PASS`. On
-   any `VERDICT: FAIL`, relay the exact blocking findings to a fresh implementer
-   to fix on the same branch, then re-gate. Never merge on a FAIL.
+   any `VERDICT: FAIL`, require the reviewer to finish its full checklist and
+   adversarial sweep and return all findings together. Maintain a failure ledger
+   keyed by each finding's `[component: ...]`. The first failure in a component
+   may return to a fresh implementer on the same branch. The second failure in
+   that component, across any gate or round, MUST return to the design gate for
+   a root-cause redesign and revised adversarial matrix before any more code is
+   changed; do not authorize another narrow patch. Re-run the complete gates
+   after every fix or redesign. Never merge on a FAIL.
 
-4. **Verify (when configured).** For each `verification:` entry whose `when:`
+5. **Verify (when configured).** For each `verification:` entry whose `when:`
    matches the configured target, run the resolved `run-verification.sh <name>`
    on the rebased branch (GREEN writes a sha-stamped result file; RED = no
    merge). If the change has a user-visible surface, run the visual-QA role from
    `orchestration-visual-qa.md` against the click-path; it must end
    `VERDICT: PASS`.
 
-5. **Merge on green.** Only after every gate PASSES, every required verification
+6. **Merge on green.** Only after every gate PASSES, every required verification
    is GREEN, and the configured target CI checks are green: record the marker
    (`merge-guard.sh --record-green <pr> [result_file]`), then merge with
    `merge-on-green.sh <pr> <branch> all-green <verify_path>`. Claude Code also
    enforces this with the merge-guard hook; Codex relies on the scripted merge
    path plus branch protection for out-of-band enforcement.
 
-6. **Close the loop.** Transition the ticket if there is a configured tracker or
+7. **Close the loop.** Transition the ticket if there is a configured tracker or
    ticket adapter. Confirm the work landed on the configured target branch.
    Report what merged and the click path.
 

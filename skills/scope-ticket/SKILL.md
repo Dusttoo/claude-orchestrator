@@ -39,6 +39,18 @@ the thing to resolve before implementing.
 5. **Out of Scope.** What this ticket explicitly does NOT do. This is what keeps
    the implementation from sprawling and what protects the next ticket's turf.
 
+## Required adversarial test matrix
+
+Before declaring Ready, derive a matrix whose rows contain: attack/failure mode,
+setup or input, invariant/expected result, test layer, and the assertion that
+would fail for a plausible bug. Select categories from the actual surface, but
+explicitly consider parser/interpreter variants (including shell wrappers,
+substitutions, heredocs, redirections, and pipelines), ignored/untracked state,
+failed inspection commands, partial execution, cleanup/recovery, permissions,
+concurrency, retries, boundary values, and hostile input. A category may be N/A
+only with a concrete reason. This matrix is part of Ready and must exist before
+a branch is cut or production code is edited.
+
 ## The readiness test
 
 After filling the sections, ask the one question that decides it:
@@ -53,7 +65,8 @@ After filling the sections, ask the one question that decides it:
 
 ## Output
 
-Produce the ticket rewritten into the five sections, then state the verdict
+Produce the ticket rewritten into the five sections and the adversarial test
+matrix, then state the verdict
 (Ready / Not Ready) and, if Not Ready, the exact gap that blocks it. If the
 repo's `rules_docs` define a ticket template or extra required fields (a
 surface-area label, a definition-of-done clause), honor that template too.

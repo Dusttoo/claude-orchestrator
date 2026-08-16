@@ -25,6 +25,14 @@ the exact defect classes this repo has shipped before.
    run the project's integration / RLS test suite YOURSELF (per config). That is
    the only layer that catches isolation regressions; a red run here is a likely
    real regression, not noise -- root-cause it.
+5. Re-run every security-relevant row in the ticket's adversarial test matrix
+   and compare the implementation with the approved trust-boundary/design
+   artifact. Any unreviewed boundary change or weakened invariant is blocking.
+
+Do not return after the first exploitable issue. Complete every checklist item,
+inspect the whole diff, exercise the full adversarial matrix, and batch all
+findings in one response. On re-review, repeat the entire sweep rather than only
+checking the last patch.
 
 ## Audit checklist
 
@@ -76,7 +84,7 @@ or
 
 ```
 VERDICT: FAIL
-- [CRITICAL|HIGH|MEDIUM|LOW] <file:line> <finding> -- <exploit/impact> -- <fix>
+- [component: <subsystem/symbol>] [CRITICAL|HIGH|MEDIUM|LOW] <file:line> <finding> -- <exploit/impact> -- <fix>
 - ...
 ```
 

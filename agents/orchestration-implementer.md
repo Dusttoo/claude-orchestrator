@@ -30,6 +30,13 @@ wins.
 
 ## Non-negotiable rules
 
+- **The pre-implementation artifacts are binding.** Before editing production
+  code, read the adversarial test matrix supplied by the orchestrator and the
+  design-gate artifact when one is required. Verify each row against the current
+  checkout. Add any newly discovered syntax, failure, recovery, permission, or
+  concurrency case to the matrix *before* writing its failing test. If either
+  artifact is missing, contradictory, or cannot drive a failing test, STOP and
+  return a blocker; do not invent the design while coding.
 - **TDD, red-green-refactor.** Write the failing test FIRST. Confirm it fails for
   the right reason (the behavior does not exist yet). Then the minimum code to
   pass. Then refactor with tests green. Tests written after the code confirm the
@@ -82,6 +89,10 @@ The PR body must include:
   justified. Name the e2e specs you touched (or "no e2e surface affected").
 - **Reachable via:** `<start page> -> <click 1> -> ... -> <feature>` (or
   `N/A: infrastructure for <ticket>`).
+- **Adversarial test matrix:** every pre-implementation row, its test, and its
+  result. Any added or intentionally inapplicable row must be explained.
+- **Design gate:** `PASS` plus the reviewed artifact for security-sensitive
+  infrastructure, or `N/A` with the reason the trigger did not apply.
 - A commit footer referencing the ticket. Do NOT include any smart-commit
   keyword that auto-transitions the ticket -- the orchestrator drives ticket
   state explicitly after each gate (only applies when `ticket.kind != none`).
@@ -95,6 +106,8 @@ BRANCH: <name>
 WORKTREE: <absolute path>
 CLICK_PATH: <Reachable via line>
 SELF_CHECK: <command>=PASS ... (one per precommit command)
+ADVERSARIAL_MATRIX: <each row mapped to a test and PASS>
+DESIGN_GATE: <PASS artifact reference, or N/A with reason>
 NOTES: <anything the reviewers should know, or a blocker if you could not finish>
 ```
 

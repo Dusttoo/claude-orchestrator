@@ -5,7 +5,9 @@ argument-hint: <ticket-id or description>
 
 Drive ONE unit of work through the full pipeline. Target: `$ARGUMENTS`.
 
-Read `.orchestration/config.yaml` and `.orchestration/ORCHESTRATION.md` first.
+Read `.orchestration/config.yaml` first. Workflow procedures and reusable safety
+tests are plugin-owned; the target repository supplies configuration, rules, and
+project-specific acceptance criteria/tests.
 Validate config before mutation:
 
 ```bash
@@ -42,34 +44,50 @@ Steps:
    or push back BEFORE cutting a branch. If `ticket.kind == none`, treat
    `$ARGUMENTS` as the spec.
 
-2. **Implement.** Launch the `orchestration-implementer` agent with
+2. **Pre-implementation gates.** Before cutting a branch or editing production
+   code, create an adversarial test matrix. Every row names the attack/failure
+   mode, setup/input, invariant, test layer, and falsifying assertion. Cover all
+   relevant parser/interpreter syntax (including shell wrappers, substitutions,
+   heredocs, redirections, and pipelines), ignored/untracked files, failed Git
+   or other inspection, partial execution, cleanup recovery, permissions,
+   concurrency, retries, and hostile input. N/A requires a reason. For planned
+   security-sensitive infrastructure, launch a fresh
+   `orchestration-design-reviewer`; it must define the trust boundary and
+   impossible guarantees, reject fragile designs, audit the matrix, and return
+   `VERDICT: PASS` before implementation.
+
+3. **Implement.** Launch the `orchestration-implementer` agent with
    `isolation: "worktree"`, passing the ticket body + the click-path. Use the
    configured source and target branch roles. In legacy configs, this is one
    agent, one ticket, one worktree, one branch, one PR to the legacy configured
    target branch. Wait for its structured report (PR number, branch,
    worktree, SELF_CHECK).
 
-3. **Gate.** Run the gate pipeline on the resulting PR -- invoke
+4. **Gate.** Run the gate pipeline on the resulting PR -- invoke
    `/orchestration:gate <pr>` (code-review, then security-review when the diff
    hits a `security_required_when` trigger). Both must end `VERDICT: PASS`.
-   - On any `VERDICT: FAIL`: relay the blocking findings back to a fresh
-     implementer agent to fix, then re-gate. Do NOT merge.
+   - Reviewers finish the entire checklist and adversarial sweep and batch all
+   findings, even after the first blocker. Maintain a failure ledger by each
+   finding's `[component: ...]` key across all gates and rounds. The first component
+     failure may return to a fresh implementer. A second failure in that same
+     component triggers the design reviewer and a revised adversarial matrix;
+     do not authorize another narrow patch. Re-run complete gates. Do NOT merge.
 
-4. **Verify (when configured).** For each entry in the config `verification:`
+5. **Verify (when configured).** For each entry in the config `verification:`
    block whose `when:` includes this configured target, run it on the rebased
    branch: `scripts/run-verification.sh <name>`. It writes a
    sha-stamped GREEN result file on success (RED = no file = do not merge). If
    the change has a user-visible surface, also run the `orchestration-visual-qa`
    agent against the `Reachable via:` click-path; it must end `VERDICT: PASS`.
 
-5. **Merge on green.** Only after every gate PASSES, every required verification
+6. **Merge on green.** Only after every gate PASSES, every required verification
    is GREEN, and the configured target CI checks are green:
    record the marker with `scripts/merge-guard.sh --record-green <pr>
    [result_file]` (pass the verification result file so the marker is validated
    against the PR head), then merge with `scripts/merge-on-green.sh <pr> <branch>
    all-green <verify_path>`. The merge-guard hook enforces this mechanically.
 
-6. **Close the loop.** If `ticket.kind != none`, transition the ticket. Confirm
+7. **Close the loop.** If `ticket.kind != none`, transition the ticket. Confirm
    the work actually landed on the configured target branch.
    Report what merged + the click path.
 
