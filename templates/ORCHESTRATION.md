@@ -52,9 +52,9 @@ scope/matrix -> design* -> implement -> code-review -> security-review -> verify
    is GREEN, **and** the configured target CI checks are green. The orchestrator
    records the marker (`merge-guard.sh --record-green`, validated against a
    result file when one exists), then merges via `merge-on-green.sh`. The
-   merge-guard hook mechanically blocks a direct `gh pr merge` that has no
-   recorded all-green marker, and blocks any merge target or strategy blocked by
-   configuration.
+   merge script mechanically validates the active plugin version, recorded
+   all-green marker, and exact PR head/base identity. A trusted merge-guard hook
+   additionally blocks raw `gh pr merge` commands when the host supports it.
 
 ## The non-negotiables (why this beats "just run CI")
 
@@ -83,12 +83,15 @@ scope/matrix -> design* -> implement -> code-review -> security-review -> verify
   orchestrator counts them across gates and rounds; the second failure in one
   component goes back through the design gate with a revised matrix, never into
   another narrow patch.
-- **Mechanical enforcement, not just discipline.** The merge-guard hook + branch
-  protection make "never merge on red" a mechanism, not a good intention.
-- **Worktree isolation + auto-cleanup.** Each agent gets its own git worktree.
-  The Stop hook sweeps finished (unlocked + clean) agent worktrees so the fleet
-  never bloats; it preserves dirty worktrees so a rate-limited / dead-mid-edit
-  agent's work survives for recovery.
+- **Mechanical enforcement, not just discipline.** The sanctioned merge script
+  validates evidence without hooks; an optional trusted hook and branch
+  protection add independent layers.
+- **Worktree isolation + safe cleanup policy.** Each agent gets its own git worktree.
+  Cleanup defaults to `manual`. With `worktree_cleanup: auto`, the orchestrator
+  explicitly removes the completed ticket worktree after merge and a trusted
+  Stop hook may sweep other finished (unlocked + clean) agent worktrees. Dirty
+  and locked worktrees are always preserved. Correctness never assumes a hook
+  was registered by the current host.
 
 ## Release And Candidate Workflows
 

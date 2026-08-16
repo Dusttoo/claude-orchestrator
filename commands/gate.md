@@ -7,7 +7,7 @@ Gate PR #$ARGUMENTS. Read `.orchestration/config.yaml` and validate it before
 mutation:
 
 ```bash
-scripts/orchestration-engine.py validate-config
+${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py validate-config
 ```
 
 For `schema_version: 2`, use the configured transition plan for the target gate
@@ -15,7 +15,7 @@ or merge transition. Branch roles, evidence, approvals, CI categories, and
 adapters come from:
 
 ```bash
-scripts/orchestration-engine.py adapter-plan --host claude <transition>
+${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py adapter-plan --host claude <transition>
 ```
 
 For legacy configs, use the existing review gates below.
@@ -45,9 +45,10 @@ For legacy configs, use the existing review gates below.
      gates after changes. Never merge on a FAIL.
    - All gates `PASS` AND every required `verification:` is GREEN AND the
      configured target CI checks green -> record the marker
-     (`scripts/merge-guard.sh --record-green <pr> [result_file]`) and merge via
-     `scripts/merge-on-green.sh`. The merge-guard hook blocks a direct merge with
-     no recorded all-green marker and any merge target blocked by configuration.
+     (`${CLAUDE_PLUGIN_ROOT}/scripts/merge-guard.sh --record-green <pr> [result_file]`) and merge via
+     `${CLAUDE_PLUGIN_ROOT}/scripts/merge-on-green.sh`. The script directly revalidates the active
+     plugin version, exact PR head branch/sha, exact target base branch/sha, and
+     marker freshness. The merge-guard hook is optional defense in depth.
 
 Report each gate's verdict, the blocking findings (if any), and the merge result.
 CI-green alone is NOT the gate -- the independent verdicts are mandatory.

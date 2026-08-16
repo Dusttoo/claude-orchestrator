@@ -6,14 +6,15 @@ description: Recover the uncommitted work of a background or subagent that died,
 # Recover a dead agent's work
 
 When a background agent dies (rate limit, crash, timeout, interruption), its work
-is not lost. It is sitting UNCOMMITTED in its git worktree. The `Stop`-hook sweep
-that cleans up finished worktrees deliberately skips any worktree with a dirty
-tree, precisely so a dead-mid-edit agent's changes survive for recovery. Do not
+is not lost. It is sitting UNCOMMITTED in its git worktree. Cleanup defaults to
+manual; even under `worktree_cleanup: auto`, the explicit cleanup and optional
+`Stop`-hook sweep skip dirty or locked worktrees, precisely so a dead-mid-edit
+agent's changes survive for recovery. Do not
 re-run the ticket from scratch; recover what is already there.
 
 ## The key facts
 
-- A finished, clean agent worktree is swept. A dirty one is preserved. So if the
+- A finished, clean agent worktree may be swept only under `auto`. A dirty one is preserved. So if the
   agent got far enough to write files, they are still on disk.
 - Branch refs live in the shared `.git`. If the agent committed but did not push,
   the commit is safe even if the worktree were removed.

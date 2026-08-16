@@ -125,6 +125,11 @@ concurrency_max: 2
 
 # --- Worktrees ------------------------------------------------------------ both
 worktree_base: .claude/worktrees   # where isolated agent worktrees are created
+# Cleanup is opt-in because hooks and lifecycle behavior vary by host. `manual`
+# preserves every worktree until a human/agent explicitly removes it; `auto`
+# allows the orchestrator and trusted Stop hook to remove clean, unlocked agent
+# worktrees. Dirty or locked worktrees are always preserved.
+worktree_cleanup: manual            # manual | auto
 
 # --- Canonical rules docs ------------------------------------------------- agent
 # The docs every gate agent must read before judging a diff. This is the seam

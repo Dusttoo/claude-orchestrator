@@ -11,12 +11,12 @@ project-specific acceptance criteria/tests.
 Validate config before mutation:
 
 ```bash
-scripts/orchestration-engine.py validate-config
+${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py validate-config
 ```
 
 For `schema_version: 2`, branch roles, transition guards, approvals, CI
 categories, ticket adapters, and target branches are policy from the configured
-workflow. Use `scripts/orchestration-engine.py adapter-plan --host claude
+workflow. Use `${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py adapter-plan --host claude
 <transition>` whenever the repo declares this ticket flow as explicit
 transitions. For legacy configs, keep the existing implement -> review ->
 security -> verify -> merge-on-green flow below.
@@ -75,21 +75,26 @@ Steps:
 
 5. **Verify (when configured).** For each entry in the config `verification:`
    block whose `when:` includes this configured target, run it on the rebased
-   branch: `scripts/run-verification.sh <name>`. It writes a
+   branch: `${CLAUDE_PLUGIN_ROOT}/scripts/run-verification.sh <name>`. It writes a
    sha-stamped GREEN result file on success (RED = no file = do not merge). If
    the change has a user-visible surface, also run the `orchestration-visual-qa`
    agent against the `Reachable via:` click-path; it must end `VERDICT: PASS`.
 
 6. **Merge on green.** Only after every gate PASSES, every required verification
    is GREEN, and the configured target CI checks are green:
-   record the marker with `scripts/merge-guard.sh --record-green <pr>
+   record the marker with `${CLAUDE_PLUGIN_ROOT}/scripts/merge-guard.sh --record-green <pr>
    [result_file]` (pass the verification result file so the marker is validated
-   against the PR head), then merge with `scripts/merge-on-green.sh <pr> <branch>
-   all-green <verify_path>`. The merge-guard hook enforces this mechanically.
+   against the PR head), then merge with `${CLAUDE_PLUGIN_ROOT}/scripts/merge-on-green.sh <pr> <branch>
+   all-green <verify_path>`. The script validates the marker, plugin version,
+   PR head/branch, target base/sha, and freshness directly. Host hooks are
+   defense in depth, never a correctness dependency.
 
 7. **Close the loop.** If `ticket.kind != none`, transition the ticket. Confirm
-   the work actually landed on the configured target branch.
-   Report what merged + the click path.
+   the work actually landed on the configured target branch. Read
+   `worktree_cleanup` (default `manual`). When it is `auto`, run
+   `${CLAUDE_PLUGIN_ROOT}/scripts/cleanup-worktree.sh <WORKTREE>` explicitly after the verified merge;
+   when it is `manual`, preserve and report the worktree. Do not assume a Stop
+   hook ran. Report what merged + the click path.
 
 Respect `concurrency_max`: at most that many heavy verification chains at once,
 on non-conflicting areas of the codebase. Dual gates on ONE PR run sequentially.

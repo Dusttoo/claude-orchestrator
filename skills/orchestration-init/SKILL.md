@@ -36,18 +36,19 @@ working directory.
      to `none` when unclear
 2. Scaffold `.orchestration/config.yaml` from `templates/config.yaml`, filled
    with the detected values. Show the filled config and let the user correct
-   branch names, checks, or ticket settings before writing. After writing, run
+   branch names, checks, ticket settings, and `worktree_cleanup` policy before
+   writing. Keep its safe `manual` default unless the user explicitly opts into
+   automatic removal of clean, unlocked worktrees. After writing, run
    `orchestration-engine.py validate-config`.
 3. Confirm a repo rules document exists. Prefer both `CLAUDE.md` and `AGENTS.md`
    in `rules_docs`; if missing, offer to create a starter so the project's real
    conventions have a place to live.
 4. Gitignore `.orchestration/.gate-status/` and the configured worktree base.
-5. Wire guardrails according to the host:
-   - Claude Code: add `hooks/hooks.json` entries to `.claude/settings.json` if
-     plugin hooks are not already active.
-   - Codex: Codex plugins expose the skills and scripts, but this manifest does
-     not auto-register Claude-style hooks. Keep using `merge-on-green.sh` for
-     merges and rely on branch protection for out-of-band enforcement.
+5. Do not copy hook commands into project settings. Claude Code and current
+   Codex hosts may discover `hooks/hooks.json` after user review/trust, but
+   support varies by host/version. Show the host's hook-review path when
+   available. Never require registration: `merge-on-green.sh` validates
+   all-green evidence directly and the skill performs configured cleanup.
 6. Optionally propose branch protection via `gh api`: strict required status
    checks, no direct pushes, and admin enforcement on production. Show the
    payload before applying it.

@@ -26,10 +26,20 @@ git config user.name t
 git add -A
 git commit -qm init
 MOG="$TMP/repo/merge-on-green.sh"
+export MERGE_GUARD_STATUS_DIR="$TMP/repo/.orchestration/.gate-status"
+export MERGE_GUARD_PLUGIN_VERSION="test-version"
+export MERGE_GUARD_PR_HEAD_BRANCH="feat/x"
+export MERGE_GUARD_PR_HEAD_SHA="test-head-sha"
+export MERGE_GUARD_PR_BASE_BRANCH="develop"
+export MERGE_GUARD_PR_BASE_SHA="test-base-sha"
 
 # 1. A non-"all-green" gate status is refused before anything else happens.
 bash "$MOG" 42 feat/x not-green >/dev/null 2>&1
 assert_exit "refuses when gate is not all-green" 2 "$?"
+
+# Remaining pre-network cases need valid host-neutral evidence; no hook is
+# involved. This proves merge-on-green performs the assertion directly.
+bash "$TMP/repo/merge-guard.sh" --record-green 42 >/dev/null 2>&1
 
 # 2. When the merge lock is already held, a second merge is refused with 75
 #    (EX_TEMPFAIL) and does not disturb the existing lock.
@@ -62,6 +72,9 @@ grep -Eq 'git push origin --delete "\$BRANCH".*\|\| true' "$SRC" \
   && grep -Eq 'git branch -D "\$BRANCH".*\|\| true' "$SRC" \
   && printf 'ok   branch deletion is best-effort (remote + local, tolerant)\n' \
   || { printf 'FAIL branch deletion is not best-effort\n'; fails=$((fails + 1)); }
+grep -Eq 'merge-guard\.sh" --assert-green "\$PR" "\$BRANCH"' "$SRC" \
+  && printf 'ok   sanctioned merge validates evidence without hooks\n' \
+  || { printf 'FAIL sanctioned merge still depends on host hooks\n'; fails=$((fails + 1)); }
 
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi

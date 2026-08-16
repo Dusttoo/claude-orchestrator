@@ -51,6 +51,15 @@ if [ "$GATE" != "all-green" ]; then
   exit 2
 fi
 
+# Host-neutral enforcement. Do not rely on Claude Code or Codex registering the
+# PreToolUse hook: the sanctioned merge path re-reads GitHub and validates the
+# marker's plugin version, exact head branch/sha, exact base branch/sha, and
+# freshness itself.
+if ! "$HERE/merge-guard.sh" --assert-green "$PR" "$BRANCH"; then
+  echo "REFUSED: all-green evidence does not match the current PR identity." >&2
+  exit 2
+fi
+
 # ---- merge lock: only one merge at a time across concurrent agents ----
 # Use Git's common directory rather than <worktree>/.git. In a linked worktree,
 # .git is a gitfile, while --git-common-dir points at the shared repository

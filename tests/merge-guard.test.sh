@@ -28,6 +28,10 @@ assert_true() { # <desc> <cond-cmd...>
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export MERGE_GUARD_STATUS_DIR="$TMP/markers"
+export MERGE_GUARD_PLUGIN_VERSION="test-version"
+export MERGE_GUARD_PR_HEAD_BRANCH="feat/test"
+export MERGE_GUARD_PR_BASE_BRANCH="develop"
+export MERGE_GUARD_PR_BASE_SHA="base-sha"
 mkdir -p "$MERGE_GUARD_STATUS_DIR"
 mkdir -p "$TMP/repo/.orchestration"
 cp "$HERE/../scripts/lib-config.sh" "$HERE/../scripts/merge-guard.sh" \
@@ -57,9 +61,13 @@ assert_exit "commit body mentioning gh pr merge allowed" 0 \
 
 # 3. A real merge with no marker is blocked.
 assert_exit "merge without marker blocked" 2 "$(run Bash 'gh pr merge 42 --merge')"
+assert_exit "record-green refuses wrong configured base" 2 \
+  "$(MERGE_GUARD_PR_HEAD_SHA="$HEAD" MERGE_GUARD_PR_BASE_BRANCH=main bash "$GUARD" --record-green 42 >/dev/null 2>&1; echo $?)"
 
 # 4. A merge with a valid, fresh marker whose sha matches HEAD is allowed.
 record_green 43 "$HEAD"
+assert_exit "host-neutral assertion accepts exact identity" 0 \
+  "$(MERGE_GUARD_PR_HEAD_SHA="$HEAD" bash "$GUARD" --assert-green 43 feat/test >/dev/null 2>&1; echo $?)"
 assert_exit "merge with valid fresh marker allowed" 0 \
   "$(export MERGE_GUARD_PR_HEAD_SHA="$HEAD"; run Bash 'gh pr merge 43 --merge')"
 
@@ -69,10 +77,19 @@ assert_exit "merge with moved sha blocked" 2 \
   "$(export MERGE_GUARD_PR_HEAD_SHA='999newsha000'; run Bash 'gh pr merge 44 --merge')"
 
 # 6. Marker sha matches but it is older than MAX_AGE -> blocked.
-printf 'all-green pr=45 sha=%s recorded_at=2020-01-01T00:00:00Z\n' "$HEAD" \
+printf 'all-green pr=45 plugin_version=test-version head_branch=feat/test head_sha=%s base_branch=develop base_sha=base-sha recorded_at=2020-01-01T00:00:00Z\n' "$HEAD" \
   > "$MERGE_GUARD_STATUS_DIR/pr-45.green"
 assert_exit "merge with expired marker blocked" 2 \
   "$(export MERGE_GUARD_PR_HEAD_SHA="$HEAD"; run Bash 'gh pr merge 45 --merge')"
+
+# Exact identity and plugin binding: any reader change invalidates the marker.
+record_green 47 "$HEAD"
+assert_exit "changed head branch blocked" 2 \
+  "$(export MERGE_GUARD_PR_HEAD_SHA="$HEAD" MERGE_GUARD_PR_HEAD_BRANCH='feat/other'; run Bash 'gh pr merge 47 --merge')"
+assert_exit "changed base sha blocked" 2 \
+  "$(export MERGE_GUARD_PR_HEAD_SHA="$HEAD" MERGE_GUARD_PR_BASE_SHA='new-base'; run Bash 'gh pr merge 47 --merge')"
+assert_exit "changed plugin version blocked" 2 \
+  "$(export MERGE_GUARD_PR_HEAD_SHA="$HEAD" MERGE_GUARD_PLUGIN_VERSION='next-version'; run Bash 'gh pr merge 47 --merge')"
 
 # 7. A direct merge to the production branch is always blocked, marker or not.
 record_green 46 "$HEAD"

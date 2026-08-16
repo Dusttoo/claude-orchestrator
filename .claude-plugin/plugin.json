@@ -1,6 +1,6 @@
 {
   "name": "claude-orchestrator",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Multi-agent orchestration harness for Claude Code: pre-code design and adversarial-test gates, isolated implementation, batched independent reviews, redesign escalation, and mechanical merge-on-green.",
   "author": {
     "name": "Dusty Mumphrey"

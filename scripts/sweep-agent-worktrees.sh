@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# sweep-agent-worktrees.sh -- Claude Code Stop hook. Removes FINISHED subagent
-# worktrees so the fleet never bloats and starves the machine.
+# sweep-agent-worktrees.sh -- optional Claude Code/Codex Stop hook and explicit
+# cleanup command. Removes FINISHED subagent worktrees only when the repository
+# has opted in with `worktree_cleanup: auto`.
 #
 # SAFE BY CONSTRUCTION. It removes a worktree only when ALL of these hold:
 #   * path is under <worktree_base>/agent-*  (an ephemeral subagent worktree --
@@ -27,6 +28,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib-config.sh
 . "$HERE/lib-config.sh" 2>/dev/null || true
 WTB="$(orch_get worktree_base .claude/worktrees 2>/dev/null || printf '%s' .claude/worktrees)"
+CLEANUP_POLICY="$(orch_get worktree_cleanup manual 2>/dev/null || printf '%s' manual)"
+
+if [ "$CLEANUP_POLICY" != "auto" ]; then
+  if [ -z "${WT_QUIET:-}" ]; then
+    echo "sweep-agent-worktrees: cleanup policy is '${CLEANUP_POLICY:-manual}'; nothing removed"
+  fi
+  exit 0
+fi
 
 removed=0
 swept_list=""

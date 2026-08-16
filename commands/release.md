@@ -10,7 +10,7 @@ from `.orchestration/config.yaml` and are enforced by the shared engine.
 
 1. **Validate configuration first.**
    ```bash
-   scripts/orchestration-engine.py validate-config
+   ${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py validate-config
    ```
    Unsupported schema versions, missing branch roles, undefined transitions,
    missing adapters, or incomplete guards must stop the run before mutation.
@@ -18,7 +18,7 @@ from `.orchestration/config.yaml` and are enforced by the shared engine.
 2. **Plan the requested transition.** Use the transition name from `$ARGUMENTS`
    and any candidate/template variables the repository requires:
    ```bash
-   scripts/orchestration-engine.py adapter-plan --host claude <transition> \
+   ${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py adapter-plan --host claude <transition> \
      --var candidate_id=<id>
    ```
    Treat this plan as authoritative. If the configured workflow has no such
@@ -32,7 +32,7 @@ from `.orchestration/config.yaml` and are enforced by the shared engine.
 
 4. **Execute through the engine.**
    ```bash
-   scripts/orchestration-engine.py transition <candidate-id> <transition> \
+   ${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py transition <candidate-id> <transition> \
      --evidence <name>=<path> \
      --ci <category>=green \
      --candidate-sha <sha> \

@@ -63,7 +63,9 @@ working directory.
 6. Confirm every required configured target CI check is green.
 7. Record the all-green marker with `merge-guard.sh --record-green <pr>
    [result_file]`, then merge with `merge-on-green.sh <pr> <branch> all-green
-   <verify_path>`.
+   <verify_path>`. The merge script itself revalidates the active plugin version,
+   exact PR head branch/sha, exact target base branch/sha, and marker freshness;
+   never treat host hook registration as required evidence.
 
 Report each gate verdict, any blocking findings, verification result paths, CI
 status, and the merge result. CI-green alone is not the gate; the independent
