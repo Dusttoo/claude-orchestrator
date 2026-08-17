@@ -28,6 +28,12 @@ check "template leaves production branch for repo detection" \
   grep -Eq '^production_branch:[[:space:]]*""' "$ROOT/templates/config.yaml"
 check "template defaults worktree cleanup to manual" \
   grep -Eq '^worktree_cleanup:[[:space:]]*manual([[:space:]]|$)' "$ROOT/templates/config.yaml"
+check "template configures an active Jira sprint by default" \
+  grep -Eq '^sprint_id:[[:space:]]*active([[:space:]]|$)' "$ROOT/templates/config.yaml"
+check "template keeps sprint checkpoints under orchestration runtime state" \
+  grep -Eq '^sprint_checkpoint_dir:[[:space:]]*\.orchestration/\.sprint-state([[:space:]]|$)' "$ROOT/templates/config.yaml"
+check "template declares directional Jira dependency mapping" \
+  rg -q '^sprint_dependency_links:' "$ROOT/templates/config.yaml"
 check "Claude init command validates through shared engine" \
   rg -q 'orchestration-engine\.py validate-config' "$ROOT/commands/orchestration-init.md"
 check "Codex init skill validates through shared engine" \
@@ -36,6 +42,10 @@ check "Claude init runs plugin-owned conformance tests" \
   rg -q 'run-plugin-conformance\.sh' "$ROOT/commands/orchestration-init.md"
 check "Codex init runs plugin-owned conformance tests" \
   rg -q 'run-plugin-conformance\.sh' "$ROOT/skills/orchestration-init/SKILL.md"
+check "Claude init gitignores sprint checkpoints" \
+  rg -q '\.orchestration/\.sprint-state/' "$ROOT/commands/orchestration-init.md"
+check "Codex init gitignores sprint checkpoints" \
+  rg -q '\.orchestration/\.sprint-state/' "$ROOT/skills/orchestration-init/SKILL.md"
 check_not "Claude init does not copy process docs into target repos" \
   rg -q 'Copy `templates/ORCHESTRATION\.md`' "$ROOT/commands/orchestration-init.md"
 check_not "Codex init does not copy process docs into target repos" \

@@ -118,9 +118,31 @@ ticket:
   kind: none                  # jira | github | none
   project: ""                 # optional tracker project/key; unused when kind=none
 
+# --- Sprint orchestration ------------------------------------------------- agent
+# Used by orchestrate-sprint when ticket.kind is jira. `active` is resolved to an
+# exact Jira sprint id before checkpointing. For each dependency link type,
+# blocked_side identifies the Jira API side occupied by the blocked ticket; the
+# issue on the opposite side is its prerequisite. Adjust for your Jira scheme.
+sprint_id: active
+sprint_dependency_links:
+  - type: Blocks
+    blocked_side: inward       # inward | outward; Jira default "is blocked by"
+sprint_ready_statuses:
+  - Ready
+  - To Do
+  - Open
+  - Selected for Development
+sprint_done_statuses:
+  - Done
+  - Closed
+  - Resolved
+sprint_blocked_statuses:
+  - Blocked
+sprint_checkpoint_dir: .orchestration/.sprint-state
+
 # --- Concurrency ---------------------------------------------------------- both
-# Max heavy verification chains running at once. Drop to 1 under CI contention or
-# when agents would collide on a shared test branch.
+# Max concurrent per-ticket sprint workflows and heavy verification chains. Drop
+# to 1 under CI contention or when agents would collide on a shared test branch.
 concurrency_max: 2
 
 # --- Worktrees ------------------------------------------------------------ both

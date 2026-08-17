@@ -1,9 +1,9 @@
 # claude-orchestrator
 
 A reusable harness for running a small team of coding agents against real
-tickets, with **independent review and security gates** and a **mechanical
-merge-guard**, so that parallel agent work does not degrade what lands on the
-configured target branch.
+tickets or a dependency-linked Jira sprint, with **independent review and
+security gates** and a **mechanical merge-guard**, so that parallel agent work
+does not degrade what lands on the configured target branch.
 
 It is packaged as a Claude Code plugin and as a Codex plugin source tree. One
 orchestrator session dispatches work; each ticket is implemented by one agent
@@ -112,10 +112,10 @@ supports them.
 | Layer | What it is |
 |---|---|
 | `agents/` | Role briefs: design-reviewer, implementer, code-reviewer, security-reviewer, visual-qa |
-| `commands/` | Claude Code slash commands: `/orchestrate`, `/gate`, `/release`, `/orchestration-init` |
+| `commands/` | Claude Code slash commands: `/orchestrate`, `/orchestrate-sprint`, `/gate`, `/release`, `/orchestration-init` |
 | `hooks/` | Claude Code/Codex `PreToolUse` merge-guard + `Stop` worktree sweep |
-| `scripts/` | The mechanics: config reader, workflow engine, gate runner, merge-guard, safe-merge, worktree lifecycle, verification |
-| `skills/` | Codex/Claude natural-language procedures: orchestrate, gate, release, init, scope, recover |
+| `scripts/` | The mechanics: config reader, sprint controller, workflow engine, gate runner, merge-guard, safe-merge, worktree lifecycle, verification |
+| `skills/` | Codex/Claude natural-language procedures: orchestrate ticket/sprint, gate, release, init, scope, recover |
 | `templates/` | Configuration template plus the plugin-owned process reference |
 | `tests/` | Plugin-owned conformance suites; never copied into target repos |
 | `.codex-plugin/` | Codex plugin manifest exposing the `skills/` directory |
@@ -143,7 +143,8 @@ Legacy key blocks:
 | `verification` | opt-in heavy suites (e.g. e2e), each gated to a target via `when:` |
 | `gates` | which review roles run (`code-review`, `security-review`) |
 | `security_required_when` | diff triggers that make the security gate mandatory |
-| `concurrency_max` | how many verification chains run at once |
+| `sprint_id` / `sprint_*` | configured Jira sprint, dependency/status mapping, and checkpoint location |
+| `concurrency_max` | how many ticket workflows or verification chains run at once |
 | `worktree_cleanup` | `manual` (safe default) or `auto` for clean, unlocked worktrees |
 | `rules_docs` | the docs every gate agent reads (`CLAUDE.md`, `AGENTS.md`) |
 
@@ -193,9 +194,10 @@ codex plugin add claude-orchestrator@personal
 ```
 
 Codex users invoke the same flows in natural language: "orchestrate BL-90 end to
-end", "gate PR 123", "advance the configured release transition", or "bootstrap
-orchestration in this repo". See [docs/codex.md](docs/codex.md) for the full
-marketplace layout and hook trust notes.
+end", "orchestrate the active sprint", "gate PR 123", "advance the configured
+release transition", or "bootstrap orchestration in this repo". See
+[docs/codex.md](docs/codex.md) for the full marketplace layout and hook trust
+notes.
 
 ## Running a ticket
 
@@ -220,6 +222,20 @@ want to remember the syntax.
 `/gate <pr>` runs just the review gates on an existing PR. `/release` advances a
 configured release or candidate transition through the shared workflow engine.
 Schema v1 repositories keep their legacy process until they migrate.
+
+## Running a sprint
+
+`/orchestrate-sprint [sprint]` in Claude Code, or “orchestrate the configured
+sprint” in Codex, queries the configured Jira project/sprint and launches the
+same one-ticket pipeline for every unblocked ticket. A plugin-owned controller
+normalizes dependencies, atomically enforces `concurrency_max`, and checkpoints
+running and terminal work under `.orchestration/.sprint-state/`. Restarts
+reconcile existing worker references before dispatch, blocked tickets do not
+stop independent lanes, and the final report separates completed, blocked, and
+user-action items. Repositories provide configuration and project-specific
+acceptance criteria; they do not vendor the controller or its tests.
+See [docs/sprint-controller.md](docs/sprint-controller.md) for the trust boundary,
+impossible guarantees, restart invariant, and rejected fragile designs.
 
 ## The merge-guard
 

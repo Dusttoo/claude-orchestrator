@@ -33,8 +33,8 @@ propose, confirm before writing.
 4. **Optional host hooks.** Do not copy hook commands into project settings.
    If this host exposes plugin hooks, show the user how to review/trust the
    bundled `hooks/hooks.json`. The scripted merge and configured cleanup paths
-   remain authoritative without hooks. Gitignore `.orchestration/.gate-status/`
-   and the worktree base.
+   remain authoritative without hooks. Gitignore `.orchestration/.gate-status/`,
+   `.orchestration/.sprint-state/`, and the worktree base.
 
 5. **Branch protection (optional, recommended).** Offer to apply protection via
    `gh api`: required status checks on both branches (strict), no direct pushes,

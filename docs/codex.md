@@ -16,6 +16,7 @@ After install, Codex can invoke these skills by natural language:
 | Skill | Purpose |
 |---|---|
 | `orchestrate-ticket` | Run one ticket end to end: implement, review, security, verify, merge |
+| `orchestrate-sprint` | Run or resume a configured Jira sprint with dependency-aware bounded concurrency |
 | `gate-pr` | Gate an existing PR and merge only after all green proof exists |
 | `release-integration` | Advance a configured release/candidate transition through the shared engine |
 | `orchestration-init` | Bootstrap `.orchestration/` config in a target repo |
@@ -26,6 +27,11 @@ The skills reference role briefs in `agents/` and scripts in `scripts/`. A Codex
 agent should resolve those plugin-relative paths to absolute paths, then run the
 scripts with the target repository as the working directory. Configured
 workflow policy is planned and enforced through `scripts/orchestration-engine.py`.
+Sprint scheduling and recovery are enforced through
+`scripts/sprint-controller.py`, the same state machine used by Claude Code's
+`/orchestrate-sprint` command. Codex reserves each lane before launching a fresh
+per-ticket task, reconciles uncertain running references after a restart, and
+continues independent tickets past blockers.
 
 ## Hook behavior
 
