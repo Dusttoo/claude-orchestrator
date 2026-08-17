@@ -41,9 +41,17 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    and run `reserve --sprint <id> --ticket <key> --run-ref <provisional>`. Reserve
    is the authoritative `concurrency_max` check. Then launch a fresh isolated
    worker that runs `/orchestration:orchestrate <key>` with the freshly fetched
-   ticket body and acceptance criteria. After launch, run `attach --sprint <id>
-   --ticket <key> --run-ref <actual-agent-ref>`. If launch fails, checkpoint a
-   `blocked` finish instead of losing the reservation.
+   ticket body and acceptance criteria. On Codex SSH/CLI hosts, if native
+   multi-agent tools are unavailable, launch a detached `codex exec
+   --ephemeral --json --sandbox danger-full-access` worker in the repository
+   and record its PID plus output file as the actual run reference. Pass ticket
+   text through stdin or a temporary file; never interpolate Jira text into a
+   shell command. A reservation is not a launch: verify a real worker process or
+   task reference before calling `attach`. Do not mark a ticket blocked merely
+   because native subagents are unavailable when the Codex CLI fallback can run.
+   If neither launch mechanism exists, record `user_action` and preserve the
+   reservation for reconciliation. After a real launch, run `attach --sprint <id>
+   --ticket <key> --run-ref <actual-agent-ref>`.
 
 6. On every worker result, immediately run `finish --sprint <id> --ticket <key>
    --outcome completed|blocked|user_action --summary <text> --pr <pr> --branch
