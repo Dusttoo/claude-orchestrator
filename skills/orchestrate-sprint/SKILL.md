@@ -121,6 +121,7 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    ```
 
    Pass the ticket body through a temporary file or stdin; never interpolate
+Use this exact background form: (codex exec --ephemeral --json --sandbox danger-full-access --cd <repository> <prompt> > <output> 2>&1 < /dev/null) & pid=$!; echo $pid. Do not call disown and do not place pid=$! inside the subshell.
    Jira text into a shell command. Use the detached process id plus output path
    as the actual run reference, monitor it to terminal outcome, and call
    `finish` immediately. Do not mark a reserved ticket blocked merely because
