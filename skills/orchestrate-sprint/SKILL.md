@@ -116,12 +116,12 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    host's Codex binary, for example:
 
    ```text
-   codex exec --ephemeral --json --sandbox danger-full-access      --model <configured-model> --cd <repository>      "Use the orchestrate-ticket skill for <ticket>; report outcome, PR,
+   <codex-bin> exec --ephemeral --json --sandbox danger-full-access      --model <configured-model> --cd <repository>      "Use the orchestrate-ticket skill for <ticket>; report outcome, PR,
       branch, and user action." > <checkpoint-dir>/<run-ref>.jsonl 2>&1 < /dev/null &
    ```
 
    Pass the ticket body through a temporary file or stdin; never interpolate
-Use this exact background form: (codex exec --ephemeral --json --sandbox danger-full-access --cd <repository> <prompt> > <output> 2>&1 < /dev/null) & pid=$!; echo $pid. Do not call disown and do not place pid=$! inside the subshell.
+Before launching, resolve the executable because non-interactive SSH shells may not load the npm-global PATH: `CODEX_BIN="$(command -v codex || printf '%s' /home/orchestrator/.npm-global/bin/codex)"`; verify it is executable. Use this exact background form: ("$CODEX_BIN" exec --ephemeral --json --sandbox danger-full-access --cd <repository> <prompt> > <output> 2>&1 < /dev/null) & pid=$!; echo $pid. Do not call disown and do not place pid=$! inside the subshell.
    Jira text into a shell command. Use the detached process id plus output path
    as the actual run reference, monitor it to terminal outcome, and call
    `finish` immediately. Do not mark a reserved ticket blocked merely because
