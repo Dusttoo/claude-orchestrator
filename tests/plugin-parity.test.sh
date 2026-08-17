@@ -42,6 +42,17 @@ contains_contract() {
   ok "$label present in Claude and Codex adapters"
 }
 
+contains_contract "shared sprint controller" 'sprint-controller\.py' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "sprint restart reconciliation" 'needs_reconcile' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "atomic sprint reservation" 'reserve' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "per-ticket workflow dispatch" 'orchestrate' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "three-way sprint summary" 'user-action' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+
 contains_contract "host-neutral merge evidence" 'plugin version' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
   commands/gate.md skills/gate-pr/SKILL.md

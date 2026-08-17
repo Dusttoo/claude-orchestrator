@@ -1,0 +1,4 @@
+interface:
+  display_name: "Orchestrate Sprint"
+  short_description: "Run a resumable multi-ticket sprint safely"
+  default_prompt: "Use $orchestrate-sprint to run the configured Jira sprint with bounded concurrency and resumable checkpoints."
