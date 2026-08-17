@@ -5,6 +5,7 @@ argument-hint: [sprint id/name or active]
 
 Coordinate the configured Jira sprint; do not implement its tickets in this
 controller context. Jira access and agent launch are Claude Code operations. Use
+On Linux hosts invoke Python scripts with python3; the python alias may be absent.
 `${CLAUDE_PLUGIN_ROOT}/scripts/sprint-controller.py` for dependency
 normalization, atomic lane reservation, checkpoints, recovery, and summaries.
 

@@ -14,6 +14,7 @@ and Claude Code follow the same state machine.
 
 Resolve `../../scripts/sprint-controller.py` from this skill file and execute it
 by absolute path with the target repository as the working directory. Never copy
+Use the explicit python3 executable on Linux hosts; do not assume a python alias exists.
 the controller or its tests into the repository.
 
 The controller atomically writes under `sprint_checkpoint_dir` (default
