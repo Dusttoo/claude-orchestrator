@@ -108,6 +108,25 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    sprint-controller.py attach --sprint <id> --ticket <key> --run-ref <actual-task-or-agent-ref>
    ```
 
+   **Codex host launch contract.** A reservation is not a worker launch. First
+   use the native multi-agent worker tool when it is available and record its
+   actual task/agent reference. On SSH or `codex exec` hosts where that tool is
+   unavailable, launch one detached worker process per reservation with the
+   host's Codex binary, for example:
+
+   ```text
+   codex exec --ephemeral --json --sandbox danger-full-access      --model <configured-model> --cd <repository>      "Use the orchestrate-ticket skill for <ticket>; report outcome, PR,
+      branch, and user action." > <checkpoint-dir>/<run-ref>.jsonl 2>&1 &
+   ```
+
+   Pass the ticket body through a temporary file or stdin; never interpolate
+   Jira text into a shell command. Use the detached process id plus output path
+   as the actual run reference, monitor it to terminal outcome, and call
+   `finish` immediately. Do not mark a reserved ticket blocked merely because
+   native subagents are unavailable when this CLI fallback can run. If neither
+   native workers nor a Codex executable is available, stop with a clear
+   `user_action` and preserve the reservation for reconciliation.
+
    A launch failure is a `blocked` outcome; checkpoint it instead of abandoning
    the reservation. Sprint lanes count whole per-ticket orchestrations. Their
    internal reviewers still follow the single-ticket workflow's rules.
