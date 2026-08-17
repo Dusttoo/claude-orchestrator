@@ -117,7 +117,7 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
 
    ```text
    codex exec --ephemeral --json --sandbox danger-full-access      --model <configured-model> --cd <repository>      "Use the orchestrate-ticket skill for <ticket>; report outcome, PR,
-      branch, and user action." > <checkpoint-dir>/<run-ref>.jsonl 2>&1 &
+      branch, and user action." > <checkpoint-dir>/<run-ref>.jsonl 2>&1 < /dev/null &
    ```
 
    Pass the ticket body through a temporary file or stdin; never interpolate
