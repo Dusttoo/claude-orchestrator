@@ -34,6 +34,24 @@ running reservations as `needs_reconcile`. The host must inspect external state;
 it may requeue only after proving the old worker is gone. This deliberately
 prefers a paused lane over duplicate ticket execution.
 
+## Ready ordering
+
+Inventory tickets may carry an optional integer `priority`, lower being more
+urgent. `plan` orders actionable tickets on `(priority, key)` and fills lanes
+from the front, so a ranked sprint spends its next lane on its most urgent
+unblocked ticket and an unranked sprint behaves exactly as before.
+
+Priority ranks; it does not release. Prerequisites, external dependency status,
+`concurrency_max`, and Jira-derived blocked states are all evaluated first, so a
+high-priority ticket waits behind an unfinished dependency instead of preempting
+it. Priority is refreshed Jira metadata: a resync re-ranks pending tickets and
+never disturbs a running or terminal record, because a reservation is durable
+and a rank change must not move work that already launched.
+
+The controller orders, and the host obeys. `reserve` still admits any unblocked
+pending ticket so a host can reconcile out of order after a restart; it is not
+an ordering authority. Hosts must launch the keys `plan.launch` returns.
+
 ## Rejected fragile designs
 
 - Host-specific queues were rejected because Claude and Codex would drift.
@@ -46,6 +64,12 @@ prefers a paused lane over duplicate ticket execution.
   outside the controller's trust boundary.
 - Stopping the sprint on one blocker was rejected because independent tickets
   remain safely actionable.
+- Treating an absent priority as most urgent was rejected because a partial Jira
+  read would then outrank an explicit ranking decision.
+- Letting priority preempt a running lane was rejected because reservations are
+  durable and re-ranking cannot prove a worker is gone.
+- Requiring a priority on every ticket was rejected because most projects rank
+  only part of a sprint and a forced default is an invented fact.
 
 ## Recovery invariant
 

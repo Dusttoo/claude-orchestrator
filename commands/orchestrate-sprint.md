@@ -20,14 +20,22 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    the statuses of dependencies outside the sprint. With
    `sprint_dependency_links`, a link is a dependency only when the current
    ticket occupies the configured `blocked_side`; the opposite issue is its
-   prerequisite. Never guess link direction or missing status.
+   prerequisite. Fetch each ticket's priority when the project ranks its work.
+   Never guess link direction, missing status, or an absent priority.
 
 3. Write the fetched data beneath `sprint_checkpoint_dir` (default
    `.orchestration/.sprint-state`) as JSON:
 
    ```json
-   {"project":"PROJ","sprint":{"id":"123","name":"Sprint 12"},"source_query":"exact Jira query","tickets":[{"key":"PROJ-2","summary":"Summary","status":"Ready","url":"https://jira/browse/PROJ-2","dependencies":["PROJ-1"]}],"dependency_status":{"OTHER-9":"Done"}}
+   {"project":"PROJ","sprint":{"id":"123","name":"Sprint 12"},"source_query":"exact Jira query","tickets":[{"key":"PROJ-2","summary":"Summary","status":"Ready","priority":2,"url":"https://jira/browse/PROJ-2","dependencies":["PROJ-1"]}],"dependency_status":{"OTHER-9":"Done"}}
    ```
+
+   `priority` is optional per ticket: an integer where lower is more urgent, as
+   Jira itself ranks (Highest = 1). The controller orders ready tickets by
+   `(priority, key)`, placing unranked tickets after every ranked one; omit it
+   and scheduling is unchanged. Priority decides which actionable ticket takes
+   the next lane, never whether one is actionable: prerequisites,
+   `concurrency_max`, and blocked states still apply first.
 
 4. Run `sprint-controller.py sync --inventory <file>`, then
    `sprint-controller.py plan --sprint <exact-id>`. Sync preserves completed,
@@ -38,9 +46,11 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    A resolved blocked or user-action ticket may also be explicitly requeued with
    the evidence in `--reason`; completed tickets cannot be requeued.
 
-5. For each key in `plan.launch`, first create a unique provisional reference
-   and run `reserve --sprint <id> --ticket <key> --run-ref <provisional>`. Reserve
-   is the authoritative `concurrency_max` check. Then launch a fresh isolated
+5. For each key in `plan.launch` — already ordered by `(priority, key)`, so
+   launch in that order and never reprioritize locally — first create a unique
+   provisional reference and run `reserve --sprint <id> --ticket <key>
+   --run-ref <provisional>`. Reserve is the authoritative `concurrency_max`
+   check. Then launch a fresh isolated
    worker that runs `/orchestration:orchestrate <key>` with the freshly fetched
    ticket body and acceptance criteria. On Codex SSH/CLI hosts, if native
    multi-agent tools are unavailable, launch a detached `codex exec

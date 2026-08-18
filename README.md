@@ -228,7 +228,8 @@ Schema v1 repositories keep their legacy process until they migrate.
 `/orchestrate-sprint [sprint]` in Claude Code, or “orchestrate the configured
 sprint” in Codex, queries the configured Jira project/sprint and launches the
 same one-ticket pipeline for every unblocked ticket. A plugin-owned controller
-normalizes dependencies, atomically enforces `concurrency_max`, and checkpoints
+normalizes dependencies, orders ready tickets by optional per-ticket priority
+then key, atomically enforces `concurrency_max`, and checkpoints
 running and terminal work under `.orchestration/.sprint-state/`. Restarts
 reconcile existing worker references before dispatch, blocked tickets do not
 stop independent lanes, and the final report separates completed, blocked, and

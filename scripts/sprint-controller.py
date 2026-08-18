@@ -2,8 +2,9 @@
 """Host-neutral, resumable state machine for sprint orchestration.
 
 Claude and Codex adapters query Jira and launch ticket workflows. This script
-owns the shared safety-critical parts: dependency normalization, bounded lane
-reservation, atomic checkpoints, restart reconciliation, and exact summaries.
+owns the shared safety-critical parts: dependency normalization, priority-ordered
+readiness, bounded lane reservation, atomic checkpoints, restart reconciliation,
+and exact summaries.
 """
 
 from __future__ import annotations
@@ -125,6 +126,38 @@ def normalize_key(value: Any) -> str:
     return key
 
 
+def normalize_priority(value: Any, key: str) -> int | None:
+    """Return an explicit integer rank, or None when the ticket carries none.
+
+    Lower sorts first, matching Jira's own convention that priority 1 is the most
+    urgent. Priority is optional per ticket: an inventory that omits it entirely
+    schedules exactly as before.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise SprintError(f"ticket {key} priority must be an integer or omitted")
+    try:
+        return int(str(value).strip())
+    except ValueError as exc:
+        raise SprintError(f"ticket {key} priority must be an integer or omitted") from exc
+
+
+def order_key(ticket: dict[str, Any]) -> tuple[int, int, str]:
+    """Sort tickets on (priority, key), unprioritized last.
+
+    Unranked tickets cannot be compared against integers, and treating them as
+    most urgent would let missing Jira data outrank an explicit decision, so they
+    sort after every explicitly prioritized ticket and then by key.
+    """
+    priority = ticket.get("priority")
+    if priority is None:
+        return (1, 0, ticket["key"])
+    return (0, priority, ticket["key"])
+
+
 def sprint_identity(inventory: dict[str, Any]) -> tuple[str, str]:
     sprint = inventory.get("sprint")
     if not isinstance(sprint, dict):
@@ -232,6 +265,7 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             "summary": str(item.get("summary", "")).strip(),
             "url": str(item.get("url", "")).strip(),
             "raw_status": raw_status,
+            "priority": normalize_priority(item.get("priority"), key),
             "dependencies": sorted(dependencies),
             "state": state,
             "reason": reason,
@@ -357,15 +391,20 @@ def get_state(args: argparse.Namespace, cfg: dict[str, Any]) -> tuple[Path, dict
 
 def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     running = sorted(key for key, ticket in state["tickets"].items() if ticket["state"] == "running")
-    ready = sorted(
-        key for key, ticket in state["tickets"].items()
-        if ticket["state"] == "pending" and not blockers(state, key, cfg)
-    )
+    ordered = sorted(state["tickets"].values(), key=order_key)
+    ready = [
+        ticket["key"] for ticket in ordered
+        if ticket["state"] == "pending" and not blockers(state, ticket["key"], cfg)
+    ]
     available = max(0, cfg["concurrency_max"] - len(running))
     waiting = [
-        {"key": key, "reasons": blockers(state, key, cfg)}
-        for key, ticket in sorted(state["tickets"].items())
-        if ticket["state"] == "pending" and blockers(state, key, cfg)
+        {
+            "key": ticket["key"],
+            "priority": ticket.get("priority"),
+            "reasons": blockers(state, ticket["key"], cfg),
+        }
+        for ticket in ordered
+        if ticket["state"] == "pending" and blockers(state, ticket["key"], cfg)
     ]
     launch = ready[:available]
     return {
@@ -483,6 +522,7 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     for key, ticket in sorted(state["tickets"].items()):
         item = {
             "key": key,
+            "priority": ticket.get("priority"),
             "summary": ticket["summary"],
             "reason": ticket["reason"],
             "pr": ticket["pr"],
