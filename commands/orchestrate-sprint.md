@@ -41,8 +41,10 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
 5. For each key in `plan.launch`, first create a unique provisional reference
    and run `reserve --sprint <id> --ticket <key> --run-ref <provisional>`. Reserve
    is the authoritative `concurrency_max` check. Then launch a fresh isolated
-   worker that runs `/orchestration:orchestrate <key>` with the freshly fetched
-   ticket body and acceptance criteria. On Codex SSH/CLI hosts, if native
+   worker that invokes the Codex `orchestrate-ticket` skill for `<key>` in
+   natural language. Do not use the Claude-only `/orchestration:orchestrate`
+   slash command. Pass the freshly fetched ticket body and acceptance criteria.
+   On Codex SSH/CLI hosts, if native
    multi-agent tools are unavailable, launch a detached `codex exec
    --ephemeral --json --sandbox danger-full-access` worker in the repository
    and record its PID plus output file as the actual run reference. Pass ticket
