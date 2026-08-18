@@ -84,6 +84,56 @@ run_ok "recovered ticket completes" "$CONTROLLER" finish --sprint 42 --ticket PR
 json_check "summary separates completed, blocked, and user action" "$TMP/summary.json" '([x["key"] for x in data["completed"]] == ["PROJ-1", "PROJ-2"] and [x["key"] for x in data["user_action"]] == ["PROJ-8"] and set(x["key"] for x in data["blocked"]) == {"PROJ-3", "PROJ-4", "PROJ-5", "PROJ-6", "PROJ-7"})'
 json_check "summary finishes after autonomous work is exhausted" "$TMP/summary.json" 'data["finished"] is True and data["running"] == []'
 
+cat > "$TMP/repo/priority.json" <<'JSON'
+{
+  "project": "PROJ",
+  "sprint": {"id": "43", "name": "Sprint 43"},
+  "source_query": "project = PROJ AND sprint = 43",
+  "tickets": [
+    {"key": "PROJ-20", "summary": "medium", "status": "Ready", "priority": 3, "dependencies": []},
+    {"key": "PROJ-21", "summary": "unranked", "status": "Ready", "dependencies": []},
+    {"key": "PROJ-22", "summary": "urgent late key", "status": "Ready", "priority": 1, "dependencies": []},
+    {"key": "PROJ-23", "summary": "urgent tie", "status": "Ready", "priority": "1", "dependencies": []},
+    {"key": "PROJ-24", "summary": "urgent but dependent", "status": "Ready", "priority": 1, "dependencies": ["PROJ-20"]},
+    {"key": "PROJ-25", "summary": "low and dependent", "status": "Ready", "priority": 5, "dependencies": ["PROJ-20"]}
+  ]
+}
+JSON
+
+run_ok "sync accepts optional per-ticket priority" "$CONTROLLER" sync --inventory priority.json
+"$CONTROLLER" plan --sprint 43 > "$TMP/priority-plan.json"
+json_check "highest priority fills lanes first, ties broken by key" "$TMP/priority-plan.json" 'data["launch"] == ["PROJ-22", "PROJ-23"]'
+json_check "unprioritized tickets sort after every ranked ticket" "$TMP/priority-plan.json" '[x["key"] for x in data["waiting"]] == ["PROJ-24", "PROJ-25"]'
+
+run_ok "priority lane one reserves" "$CONTROLLER" reserve --sprint 43 --ticket PROJ-22 --run-ref p-one
+run_ok "priority lane two reserves" "$CONTROLLER" reserve --sprint 43 --ticket PROJ-23 --run-ref p-two
+run_fail "priority board still refuses a third lane" "$CONTROLLER" reserve --sprint 43 --ticket PROJ-21 --run-ref p-jump
+run_ok "priority lane one finishes" "$CONTROLLER" finish --sprint 43 --ticket PROJ-22 --outcome completed --summary merged --pr 201 --branch feature/p-one
+"$CONTROLLER" plan --sprint 43 > "$TMP/priority-plan2.json"
+json_check "next lane goes to the ranked ticket, not the unranked one" "$TMP/priority-plan2.json" 'data["launch"] == ["PROJ-20"]'
+
+run_ok "priority survives inventory resync" "$CONTROLLER" sync --inventory priority.json
+"$CONTROLLER" summary --sprint 43 > "$TMP/priority-summary.json"
+json_check "summary reports each ticket priority" "$TMP/priority-summary.json" '{x["key"]: x["priority"] for x in data["completed"] + data["blocked"] + data["user_action"] + data["running"]} == {"PROJ-20": 3, "PROJ-21": None, "PROJ-22": 1, "PROJ-23": 1, "PROJ-24": 1, "PROJ-25": 5}'
+
+# A checkpoint written before priority existed must keep planning, not crash.
+python3 - "$TMP/repo/.orchestration/.sprint-state" <<'PY'
+import json, sys
+from pathlib import Path
+for path in Path(sys.argv[1]).glob("*.json"):
+    state = json.loads(path.read_text())
+    for ticket in state["tickets"].values():
+        ticket.pop("priority", None)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+PY
+run_ok "pre-priority checkpoints still plan" "$CONTROLLER" plan --sprint 43
+run_ok "pre-priority checkpoints still summarize" "$CONTROLLER" summary --sprint 42
+
+cat > "$TMP/repo/bad-priority.json" <<'JSON'
+{"project":"PROJ","sprint":{"id":"44","name":"bad"},"source_query":"q","tickets":[{"key":"PROJ-30","status":"Ready","priority":"urgent"}]}
+JSON
+run_fail "non-integer priority fails closed" "$CONTROLLER" sync --inventory bad-priority.json
+
 cat > "$TMP/repo/duplicate.json" <<'JSON'
 {"project":"PROJ","sprint":{"id":"99","name":"bad"},"tickets":[{"key":"PROJ-1","status":"Ready"},{"key":"proj-1","status":"Ready"}]}
 JSON

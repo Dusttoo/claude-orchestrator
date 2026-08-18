@@ -52,6 +52,8 @@ contains_contract "per-ticket workflow dispatch" 'orchestrate' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "three-way sprint summary" 'user-action' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "optional sprint ticket priority ordering" 'priority' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 
 contains_contract "host-neutral merge evidence" 'plugin version' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \

@@ -42,9 +42,10 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    sprint, paginate until every issue is fetched, and retrieve the configured
    dependency link types. A link is a dependency only when the current ticket
    occupies its configured `blocked_side`; the issue on the opposite side is the
-   prerequisite. Resolve `active` to one exact Jira sprint id. Fetch the current
-   status of every dependency outside the sprint. Do not infer a missing page,
-   link direction, or dependency status.
+   prerequisite. Fetch each ticket's priority when the project ranks its work.
+   Resolve `active` to one exact Jira sprint id. Fetch the current status of
+   every dependency outside the sprint. Do not infer a missing page, link
+   direction, or dependency status.
 
 3. **Create an inventory.** Write a temporary JSON file inside the configured
    checkpoint directory with this exact shape:
@@ -59,6 +60,7 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
          "key": "PROJ-2",
          "summary": "Ticket summary",
          "status": "Ready",
+         "priority": 2,
          "url": "https://jira.example/browse/PROJ-2",
          "dependencies": ["PROJ-1"]
        }
@@ -68,10 +70,17 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    ```
 
    `dependencies` means prerequisites of that ticket, never tickets it blocks.
-   Preserve the exact query for auditability. The controller rejects duplicate
-   or malformed keys, deduplicates dependencies, identifies self-links, cycles,
-   incomplete external status data, and initially completed/blocked/not-ready
-   Jira states.
+   `priority` is optional per ticket: map the Jira priority to an integer where
+   lower is more urgent (Jira's own ranking already does this, Highest = 1).
+   The controller fills lanes in `(priority, key)` order, so ties break on key
+   and unranked tickets follow every ranked one. Omit it and scheduling is
+   unchanged. Priority ranks only which actionable ticket launches next; it
+   never overrides prerequisites, `concurrency_max`, or a blocked state, so a
+   high-priority ticket still waits behind its unfinished dependency. Do not
+   invent a rank for a ticket Jira leaves unprioritized. Preserve the exact
+   query for auditability. The controller rejects duplicate or malformed keys,
+   dedupes dependencies, identifies self-links, cycles, incomplete external
+   status data, and initially completed/blocked/not-ready Jira states.
 
 4. **Sync and resume.** Run:
 
@@ -91,9 +100,11 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    it explicitly with the evidence in `--reason`; completed tickets cannot be
    requeued. A running ticket additionally requires proof that no worker remains.
 
-5. **Reserve, then launch.** Launch only keys returned in `plan.launch`. Before
-   each launch, generate a unique provisional run reference and call `reserve`.
-   This atomic operation enforces `concurrency_max` and prerequisite completion:
+5. **Reserve, then launch.** Launch only keys returned in `plan.launch`, which
+   is already ordered by `(priority, key)`; never reorder or reprioritize it
+   locally. Before each launch, generate a unique provisional run reference and
+   call `reserve`. This atomic operation enforces `concurrency_max` and
+   prerequisite completion:
 
    ```text
    sprint-controller.py reserve --sprint <id> --ticket <key> --run-ref <provisional-ref>
