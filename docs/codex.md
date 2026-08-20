@@ -46,10 +46,14 @@ also provides `${PLUGIN_ROOT}` for Codex-specific hooks.
 The `PreToolUse` merge guard is inert until the target repository opts into the
 harness with `.orchestration/config.yaml`. In uninitialized repositories it
 exits successfully without creating `.orchestration/` or blocking commands.
-After initialization, it blocks raw `gh pr merge` commands unless a fresh
-all-green marker matches the active plugin version and exact PR head/base
-identity. `merge-on-green.sh` performs the same validation directly before the
-sanctioned merge, so disabling or lacking the hook cannot bypass the gate.
+After initialization, it always blocks raw `gh pr merge` commands. A fresh
+all-green marker authorizes only `merge-on-green.sh`, which validates the
+authoritative current repository, active plugin version, and exact PR head/base
+identity directly before the sanctioned merge. It holds the common merge lock
+through verification, removes caller host/repository overrides, binds both
+final GitHub calls to the authoritative repository, rechecks the head/base, and
+pins GitHub to the verified head SHA. Disabling or lacking the hook cannot
+bypass the wrapper's gate.
 
 The `Stop` worktree sweep is disabled by the safe default
 `worktree_cleanup: manual`. With `auto`, both the skill's explicit post-merge
@@ -149,11 +153,14 @@ Use the `name` field from `.agents/plugins/marketplace.json` as
 For Codex and Claude workflows, keep merges on the scripted path:
 
 ```bash
-scripts/merge-guard.sh --record-green <pr> [result_file]
+scripts/run-verification.sh <name>
+scripts/merge-guard.sh --record-green <pr> <result_file>
 scripts/merge-on-green.sh <pr> <branch> all-green <verify_path>
 ```
 
-The hook is an optional local guardrail around agent tool calls. The sanctioned
-scripted path enforces the same proof without it. Branch protection remains
-the required out-of-band backstop for direct pushes, GitHub UI merges, or any
+The hook is an optional local guardrail around agent tool calls. Raw hook merges
+must carry one `--match-head-commit` equal to the live verified head. The
+sanctioned scripted path enforces the same proof without hooks. GitHub has no atomic
+expected-base option, so branch protection or a merge queue remains the
+out-of-band backstop for direct pushes, GitHub UI merges, or any
 shell that does not run through trusted hooks.

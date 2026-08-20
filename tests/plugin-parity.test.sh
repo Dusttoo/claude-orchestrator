@@ -58,15 +58,36 @@ contains_contract "optional sprint ticket priority ordering" 'priority' \
 contains_contract "host-neutral merge evidence" 'plugin version' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
   commands/gate.md skills/gate-pr/SKILL.md
+contains_contract "repository-bound merge evidence" 'authoritative repository' \
+  commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
+  commands/gate.md skills/gate-pr/SKILL.md
 contains_contract "explicit cleanup policy" 'worktree_cleanup' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md
 contains_contract "hooks are optional" 'defense in depth' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md
+contains_contract "mandatory verification result argument" \
+  'record-green <pr> <result_file>' \
+  commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
+  commands/gate.md skills/gate-pr/SKILL.md
+contains_contract "dedicated merge classifier dependency" \
+  'merge-command-classifier\.py' \
+  skills/gate-pr/SKILL.md skills/orchestrate-ticket/SKILL.md \
+  skills/orchestration-init/SKILL.md skills/release-integration/SKILL.md
 
-if rg -q 'merge-guard\.sh" --assert-green "\$PR" "\$BRANCH"' "$ROOT/scripts/merge-on-green.sh"; then
+CLAUDE_VERSION="$(sed -n 's/.*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "$ROOT/.claude-plugin/plugin.json" | head -1)"
+CODEX_VERSION="$(sed -n 's/.*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "$ROOT/.codex-plugin/plugin.json" | head -1)"
+eq "plugin manifests stay in version lockstep" "$CLAUDE_VERSION" "$CODEX_VERSION"
+eq "breaking verification contract is version 1.0.0" "1.0.0" "$CODEX_VERSION"
+
+if rg -q 'merge-guard\.sh" --assert-green "\$PR" "\$BRANCH" "\$SNAPSHOT"' "$ROOT/scripts/merge-on-green.sh"; then
   ok "sanctioned merge enforces evidence independently of host hooks"
 else
   fail_case "sanctioned merge does not enforce evidence independently of host hooks"
+fi
+if rg -q 'env -u GH_REPO -u GH_HOST gh pr merge "\$PR" --repo "\$REPOSITORY" "\$MERGE_FLAG" --match-head-commit "\$HEAD_SHA"' "$ROOT/scripts/merge-on-green.sh"; then
+  ok "sanctioned merge binds the repository and pins the verified exact head"
+else
+  fail_case "sanctioned merge does not bind the repository and pin the verified exact head"
 fi
 
 if rg -n '(^|[ `])scripts/[A-Za-z0-9_-]+\.(sh|py)' "$ROOT/commands" -g '*.md' >/dev/null; then

@@ -20,6 +20,7 @@ executing them:
 - `../../scripts/orchestration-engine.py`
 - `../../scripts/preflight.sh`
 - `../../scripts/merge-guard.sh`
+- `../../scripts/merge-command-classifier.py`
 - `../../scripts/sweep-agent-worktrees.sh`
 - `../../scripts/run-plugin-conformance.sh`
 

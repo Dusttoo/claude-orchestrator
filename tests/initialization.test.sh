@@ -56,6 +56,10 @@ check_not "Codex init does not vendor hooks into project settings" \
   rg -q 'add `hooks/hooks\.json` entries to `\.claude/settings\.json`' "$ROOT/skills/orchestration-init/SKILL.md"
 check "plugin conformance runner owns merge-guard suite" \
   rg -q 'merge-guard\.test\.sh' "$ROOT/scripts/run-plugin-conformance.sh"
+check "plugin conformance runner owns classifier suite" \
+  rg -q 'merge-command-classifier\.test\.sh' "$ROOT/scripts/run-plugin-conformance.sh"
+check "plugin conformance runner owns verification contract suite" \
+  rg -q 'run-verification\.test\.sh' "$ROOT/scripts/run-plugin-conformance.sh"
 check "plugin conformance runner owns worktree-cleanup suite" \
   rg -q 'worktree\.test\.sh' "$ROOT/scripts/run-plugin-conformance.sh"
 check "plugin conformance runner owns host-parity suite" \

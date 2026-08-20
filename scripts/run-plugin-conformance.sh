@@ -5,7 +5,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 rc=0
-for suite in merge-guard.test.sh merge-on-green.test.sh worktree.test.sh plugin-parity.test.sh; do
+for suite in merge-command-classifier.test.sh merge-guard.test.sh run-verification.test.sh merge-on-green.test.sh worktree.test.sh plugin-parity.test.sh; do
   echo "########## plugin conformance: $suite ##########"
   bash "$ROOT/tests/$suite" || rc=1
   echo

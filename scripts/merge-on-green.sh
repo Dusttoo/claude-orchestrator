@@ -32,6 +32,11 @@ BRANCH="${2:?branch required}"
 GATE="${3:?gate_status required (must be 'all-green')}"
 VERIFY_PATH="${4:-}"
 
+if ! [[ "$PR" =~ ^[1-9][0-9]*$ ]]; then
+  echo "REFUSED: PR must be a positive decimal identifier." >&2
+  exit 2
+fi
+
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
@@ -51,15 +56,6 @@ if [ "$GATE" != "all-green" ]; then
   exit 2
 fi
 
-# Host-neutral enforcement. Do not rely on Claude Code or Codex registering the
-# PreToolUse hook: the sanctioned merge path re-reads GitHub and validates the
-# marker's plugin version, exact head branch/sha, exact base branch/sha, and
-# freshness itself.
-if ! "$HERE/merge-guard.sh" --assert-green "$PR" "$BRANCH"; then
-  echo "REFUSED: all-green evidence does not match the current PR identity." >&2
-  exit 2
-fi
-
 # ---- merge lock: only one merge at a time across concurrent agents ----
 # Use Git's common directory rather than <worktree>/.git. In a linked worktree,
 # .git is a gitfile, while --git-common-dir points at the shared repository
@@ -75,16 +71,55 @@ if ! ( set -o noclobber; echo "pid=$$ pr=$PR $(date -u +%FT%TZ)" > "$LOCK" ) 2>/
   echo "Queue PR #$PR and retry after the current merge completes." >&2
   exit 75
 fi
-trap 'rm -f "$LOCK"' EXIT
+SNAPSHOT="$(mktemp "$GIT_COMMON_DIR/orchestrator-merge-snapshot.XXXXXX")" || {
+  rm -f "$LOCK"
+  echo "REFUSED: could not prepare an authoritative identity snapshot." >&2
+  exit 2
+}
+trap 'rm -f "$LOCK" "$SNAPSHOT"' EXIT
+
+# Capture one coherent authoritative identity under the common-dir lock. The
+# guard validates this exact snapshot against the marker; it does not rediscover
+# or substitute another approved SHA for the merge wrapper.
+if ! "$HERE/merge-guard.sh" --assert-green "$PR" "$BRANCH" "$SNAPSHOT"; then
+  echo "REFUSED: all-green evidence does not match the current PR identity." >&2
+  exit 2
+fi
+if [ "$(wc -l < "$SNAPSHOT" | tr -d ' ')" != 5 ]; then
+  echo "REFUSED: authoritative identity snapshot is malformed." >&2
+  exit 2
+fi
+REPOSITORY="$(sed -n '1p' "$SNAPSHOT")"
+HEAD_BRANCH="$(sed -n '2p' "$SNAPSHOT")"
+HEAD_SHA="$(sed -n '3p' "$SNAPSHOT")"
+BASE_BRANCH="$(sed -n '4p' "$SNAPSHOT")"
+BASE_SHA="$(sed -n '5p' "$SNAPSHOT")"
+if ! [[ "$REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]] \
+   || [ "$HEAD_BRANCH" != "$BRANCH" ] || [ "$BASE_BRANCH" != "$TARGET_BRANCH" ] \
+   || ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || ! [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "REFUSED: authoritative identity snapshot is invalid or inconsistent." >&2
+  exit 2
+fi
 
 echo "== Merging PR #$PR ($BRANCH) -> ${TARGET_BRANCH} (${MERGE_FLAG}) =="
 
-# ---- note the base sha; a moved target branch invalidates earlier gates ----
+# ---- synchronize the local target before the final authoritative read ----
 git fetch origin "$TARGET_BRANCH" --quiet
 PRE="$(git rev-parse "origin/${TARGET_BRANCH}")"
 echo "${TARGET_BRANCH} is at ${PRE:0:12}"
-echo "Reminder: gates must have been run against ${TARGET_BRANCH} @ ${PRE:0:12}."
-echo "If ${TARGET_BRANCH} moved since the gate run, abort, rebase, re-run the gate, then retry."
+
+# Last authoritative read immediately before the irreversible operation. Both
+# head and base must still equal the validated snapshot. GitHub provides an
+# atomic expected-head primitive but no corresponding expected-base primitive;
+# branch protection or a merge queue must cover target movement after this read.
+FINAL_IDENTITY="$(env -u GH_REPO -u GH_HOST gh pr view "$PR" --repo "$REPOSITORY" --json headRefName,headRefOid,baseRefName,baseRefOid \
+  --jq '[.headRefName,.headRefOid,.baseRefName,.baseRefOid] | @tsv' 2>/dev/null)"
+IFS=$'\t' read -r FINAL_HEAD_BRANCH FINAL_HEAD_SHA FINAL_BASE_BRANCH FINAL_BASE_SHA <<<"$FINAL_IDENTITY"
+if [ "$FINAL_HEAD_BRANCH" != "$HEAD_BRANCH" ] || [ "$FINAL_HEAD_SHA" != "$HEAD_SHA" ] \
+   || [ "$FINAL_BASE_BRANCH" != "$BASE_BRANCH" ] || [ "$FINAL_BASE_SHA" != "$BASE_SHA" ]; then
+  echo "REFUSED: PR head or base moved after authoritative assertion; re-gate." >&2
+  exit 2
+fi
 
 # ---- the merge ----
 # Deliberately WITHOUT --delete-branch: gh's branch deletion also removes the
@@ -92,7 +127,7 @@ echo "If ${TARGET_BRANCH} moved since the gate run, abort, rebase, re-run the ga
 # the verify step) when a leftover agent worktree still holds that branch. The
 # merge is the irreversible act; branch cleanup is not, so we separate them and
 # do cleanup best-effort AFTER verification.
-gh pr merge "$PR" "$MERGE_FLAG"
+env -u GH_REPO -u GH_HOST gh pr merge "$PR" --repo "$REPOSITORY" "$MERGE_FLAG" --match-head-commit "$HEAD_SHA"
 
 # ---- verify the merge propagated ----
 git fetch origin "$TARGET_BRANCH" --quiet

@@ -50,11 +50,15 @@ scope/matrix -> design* -> implement -> code-review -> security-review -> verify
 
 6. **Merge on green.** Only after every gate PASSES, every required verification
    is GREEN, **and** the configured target CI checks are green. The orchestrator
-   records the marker (`merge-guard.sh --record-green`, validated against a
-   result file when one exists), then merges via `merge-on-green.sh`. The
-   merge script mechanically validates the active plugin version, recorded
-   all-green marker, and exact PR head/base identity. A trusted merge-guard hook
-   additionally blocks raw `gh pr merge` commands when the host supports it.
+   records the marker (`merge-guard.sh --record-green <pr> <result_file>`, with
+   a mandatory canonical verification result), then merges via
+   `merge-on-green.sh`. The
+   merge script acquires the shared merge lock, mechanically validates the active
+   authoritative repository, plugin version, and one coherent exact PR head/base
+   snapshot, rechecks both immediately pre-merge, and pins GitHub to the verified head SHA. GitHub has no
+   atomic expected-base option, so branch protection or a merge queue covers that
+   residual race. A trusted merge-guard hook additionally blocks every raw
+   `gh pr merge`; the marker authorizes only `merge-on-green.sh`.
 
 ## The non-negotiables (why this beats "just run CI")
 

@@ -15,6 +15,7 @@ Resolve these paths from this skill file before executing them:
 
 - `../../scripts/orchestration-engine.py`
 - `../../scripts/merge-guard.sh`
+- `../../scripts/merge-command-classifier.py`
 - `../../scripts/merge-on-green.sh`
 - `../../scripts/run-verification.sh`
 

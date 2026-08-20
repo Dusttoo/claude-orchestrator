@@ -64,6 +64,7 @@ reading them:
 - `../../agents/orchestration-security-reviewer.md`
 - `../../agents/orchestration-visual-qa.md`
 - `../../scripts/merge-guard.sh`
+- `../../scripts/merge-command-classifier.py`
 - `../../scripts/merge-on-green.sh`
 - `../../scripts/cleanup-worktree.sh`
 - `../../scripts/orchestration-engine.py`
@@ -125,11 +126,17 @@ working directory.
 
 6. **Merge on green.** Only after every gate PASSES, every required verification
    is GREEN, and the configured target CI checks are green: record the marker
-   (`merge-guard.sh --record-green <pr> [result_file]`), then merge with
+   (`merge-guard.sh --record-green <pr> <result_file>`), then merge with
    `merge-on-green.sh <pr> <branch> all-green <verify_path>`. That script
-   validates the marker, plugin version, PR head/branch, target base/sha, and
-   freshness itself, so correctness never depends on either host registering a
-   hook. A trusted Claude Code or Codex hook is defense in depth; branch
+   holds the common merge lock while validating one coherent marker,
+   authoritative repository identity, plugin version, and head/base snapshot;
+   rechecks both immediately pre-merge and pins GitHub
+   to
+   the verified exact head. GitHub has no atomic expected-base option; branch
+   protection or a merge queue covers that residual race. Correctness never
+   depends on either host registering a hook. A trusted Claude Code or Codex
+   hook blocks every raw `gh pr merge`; a marker authorizes only the sanctioned
+   wrapper. The hook is defense in depth; branch
    protection remains the out-of-band enforcement layer.
 
 7. **Close the loop.** Transition the ticket if there is a configured tracker or
