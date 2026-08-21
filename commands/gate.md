@@ -45,10 +45,15 @@ For legacy configs, use the existing review gates below.
      gates after changes. Never merge on a FAIL.
    - All gates `PASS` AND every required `verification:` is GREEN AND the
      configured target CI checks green -> record the marker
-     (`${CLAUDE_PLUGIN_ROOT}/scripts/merge-guard.sh --record-green <pr> [result_file]`) and merge via
+     (`${CLAUDE_PLUGIN_ROOT}/scripts/merge-guard.sh --record-green <pr> <result_file>`) and merge via
      `${CLAUDE_PLUGIN_ROOT}/scripts/merge-on-green.sh`. The script directly revalidates the active
-     plugin version, exact PR head branch/sha, exact target base branch/sha, and
-     marker freshness. The merge-guard hook is optional defense in depth.
+     authoritative repository identity, plugin version, and one coherent exact
+     PR head/base snapshot under the
+     common merge lock, rechecks both immediately pre-merge, and pins GitHub to
+     the verified head SHA. GitHub has no atomic expected-base option; branch
+     protection or a merge queue covers that residual race. The merge-guard
+     hook is optional defense in depth: it blocks every raw `gh pr merge`, and
+     a marker authorizes only the sanctioned wrapper.
 
 Report each gate's verdict, the blocking findings (if any), and the merge result.
 CI-green alone is NOT the gate -- the independent verdicts are mandatory.

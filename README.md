@@ -240,21 +240,31 @@ impossible guarantees, restart invariant, and rejected fragile designs.
 
 ## The merge-guard
 
-The enforcement centerpiece. A raw `gh pr merge` is blocked unless a recorded
-all-green marker exists whose SHA matches the PR head and is within a freshness
-window. Configured guard policy can also block selected target branch roles or
-direct squash merges. It fails closed: if it cannot precisely parse the command
-or resolve policy, it blocks anything resembling a merge rather than disabling
-itself.
+The enforcement centerpiece. Recording all-green requires the canonical, fresh
+GREEN artifact from a configured `run-verification.sh` invocation; bare
+`--record-green <pr>` calls are rejected. The marker snapshots that proof, the
+authoritative current repository, and a live PR head/base identity. Raw
+`gh pr merge` is always blocked, even when a valid marker exists; the marker
+authorizes only `merge-on-green.sh`. The sanctioned path holds the common merge lock
+across authoritative assertion and final identity recheck, then passes that
+same verified repository and head to explicit `--repo` and GitHub's atomic
+expected-head option. It fails closed: if its dedicated safe-subset classifier
+or fixed output cannot be trusted, it blocks the initialized-repository payload
+rather than grep-parsing it.
+
+This is strict local proof binding, not cryptographic attestation: the artifact
+is canonical, fresh, configured, and tied to two authoritative GitHub identity
+reads, but resisting a malicious process under the same account requires a
+signed CI or equivalent external trust root.
 
 Full threat model, hook contract, and the marker lifecycle:
 [docs/merge-guard.md](docs/merge-guard.md).
 
 ## Testing
 
-The scripts have shell test suites covering the config parser, the merge-guard
-(every gate path, including the fail-closed fallback), the safe-merge guard
-rails, the verification handshake, and the worktree lifecycle (the destructive
+The scripts have shell test suites covering the config parser, the dedicated
+merge-command classifier, the merge-guard (including deny fallback), the safe-merge
+guard rails, the verification handshake, and the worktree lifecycle (the destructive
 paths, on real git worktrees).
 
 ```

@@ -82,11 +82,15 @@ Steps:
 
 6. **Merge on green.** Only after every gate PASSES, every required verification
    is GREEN, and the configured target CI checks are green:
-   record the marker with `${CLAUDE_PLUGIN_ROOT}/scripts/merge-guard.sh --record-green <pr>
-   [result_file]` (pass the verification result file so the marker is validated
+   record the marker with `${CLAUDE_PLUGIN_ROOT}/scripts/merge-guard.sh --record-green <pr> <result_file>`
+   (the verification result file is mandatory and is validated
    against the PR head), then merge with `${CLAUDE_PLUGIN_ROOT}/scripts/merge-on-green.sh <pr> <branch>
-   all-green <verify_path>`. The script validates the marker, plugin version,
-   PR head/branch, target base/sha, and freshness directly. Host hooks are
+   all-green <verify_path>`. Under the common merge lock, the script validates
+   one coherent marker, authoritative repository identity, plugin version, and
+   head/base snapshot; rechecks it
+   immediately pre-merge, and supplies GitHub the verified exact-head pin. GitHub has no
+   atomic expected-base option, so branch protection or a merge queue covers
+   that residual race. Host hooks are
    defense in depth, never a correctness dependency.
 
 7. **Close the loop.** If `ticket.kind != none`, transition the ticket. Confirm
