@@ -55,6 +55,13 @@ contains_contract "three-way sprint summary" 'user-action' \
 contains_contract "optional sprint ticket priority ordering" 'priority' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 
+contains_contract "durable review ledger" 'review-ledger\.py' \
+  commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
+  commands/gate.md skills/gate-pr/SKILL.md
+contains_contract "bounded review loop" 'escalate-human' \
+  commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
+  commands/gate.md skills/gate-pr/SKILL.md
+
 contains_contract "host-neutral merge evidence" 'plugin version' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
   commands/gate.md skills/gate-pr/SKILL.md

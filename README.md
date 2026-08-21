@@ -87,8 +87,15 @@ supports them.
   alternatives, and the adversarial tests that falsify its invariants.
 - **Reviews batch the whole sweep.** Finding one blocker never ends a review;
   reviewers finish the diff, checklist, and matrix and report all findings once.
-- **Two component failures trigger redesign.** A stable component-key ledger
-  prevents an endless sequence of narrow patches to the same broken design.
+- **Two component failures trigger redesign.** A stable component-key ledger,
+  persisted by `scripts/review-ledger.py`, prevents an endless sequence of narrow
+  patches to the same broken design.
+- **The review loop is bounded and converges.** Round 1 sweeps the whole diff
+  with full blocking authority. From round 2 the sweep stays full-diff but only
+  open ledger findings, regressions, and security issues may block, so the
+  blocking set shrinks. Findings split into blocking and advisory, and
+  `max_review_rounds` (default 3) ends the loop at a human rather than a
+  merge. See [docs/review-loop.md](docs/review-loop.md).
 - **Enforcement is mechanical, not advisory.** The sanctioned merge script
   refuses stale or mismatched evidence even without hooks. A trusted merge-guard
   hook can also veto raw merge commands.

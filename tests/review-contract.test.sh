@@ -31,6 +31,34 @@ for file in skills/orchestrate-ticket/SKILL.md skills/gate-pr/SKILL.md commands/
   require_text "$file" "second failure" "second component failure triggers redesign"
 done
 
+# --- review-loop convergence contracts ----------------------------------------
+# The loop must terminate. Each of these is one of the mechanisms that makes it.
+
+require_text agents/orchestration-code-reviewer.md "Round 1 -- full authority" \
+  "round 1 sweeps with full blocking authority"
+require_text agents/orchestration-code-reviewer.md "Round 2+ -- scope freeze" \
+  "later rounds freeze what may block"
+require_text agents/orchestration-code-reviewer.md "Severity: BLOCKING vs ADVISORY" \
+  "reviewer splits blocking from advisory findings"
+require_text agents/orchestration-code-reviewer.md "[component: <path>:<symbol>]" \
+  "component keys are path plus symbol, not free text"
+require_text agents/orchestration-code-reviewer.md "Round 3 or later" \
+  "reviewer doubt rule is round-aware"
+require_text agents/orchestration-code-reviewer.md "ADVISORY -- report it, do not block" \
+  "dead weight is advisory, not a merge blocker"
+require_text agents/orchestration-security-reviewer.md "exempt from the review loop's scope freeze" \
+  "security findings keep blocking authority in every round"
+require_text agents/orchestration-design-reviewer.md "Second strike on one component" \
+  "second-strike redesign is scoped to the failing component"
+require_text templates/config.yaml "max_review_rounds" "the round cap is configurable"
+require_text templates/ORCHESTRATION.md "max_review_rounds" "the round cap is documented"
+
+for file in skills/orchestrate-ticket/SKILL.md skills/gate-pr/SKILL.md commands/orchestrate.md commands/gate.md; do
+  require_text "$file" "review-ledger.py" "orchestrator drives the durable review ledger"
+  require_text "$file" "escalate-human" "orchestrator stops the loop at the round cap"
+  require_text "$file" "brief" "orchestrator hands each reviewer its round brief"
+done
+
 claude_version="$(sed -n 's/.*"version": "\([^"]*\)".*/\1/p' "$ROOT/.claude-plugin/plugin.json" | head -1)"
 codex_version="$(sed -n 's/.*"version": "\([^"]*\)".*/\1/p' "$ROOT/.codex-plugin/plugin.json" | head -1)"
 if [ "$claude_version" != "$codex_version" ]; then

@@ -34,7 +34,8 @@ propose, confirm before writing.
    If this host exposes plugin hooks, show the user how to review/trust the
    bundled `hooks/hooks.json`. The scripted merge and configured cleanup paths
    remain authoritative without hooks. Gitignore `.orchestration/.gate-status/`,
-   `.orchestration/.sprint-state/`, and the worktree base.
+   `.orchestration/.sprint-state/`, `.orchestration/.review-ledger/`, and the
+   worktree base.
 
 5. **Branch protection (optional, recommended).** Offer to apply protection via
    `gh api`: required status checks on both branches (strict), no direct pushes,

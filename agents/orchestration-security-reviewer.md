@@ -84,11 +84,20 @@ or
 
 ```
 VERDICT: FAIL
-- [component: <subsystem/symbol>] [CRITICAL|HIGH|MEDIUM|LOW] <file:line> <finding> -- <exploit/impact> -- <fix>
+- [component: <path>:<symbol>] [CRITICAL|HIGH|MEDIUM|LOW] <finding> -- <exploit/impact> -- <fix>
 - ...
 ```
 
+Key every finding `[component: <path>:<symbol>]` -- the repo-relative file path
+plus the enclosing symbol, never a line number (it drifts on rebase) and never a
+free-text subsystem name. If the orchestrator's round brief lists an open
+component that is this same defect, reuse its key verbatim.
+
 Rules:
+- **The security gate is exempt from the review loop's scope freeze.** Later
+  rounds narrow what the code reviewer may block on so the loop converges; that
+  narrowing does not apply to you. A leak found in round 4 blocks exactly as hard
+  as one found in round 1. Never downgrade a finding because the PR is "late".
 - Any CRITICAL or HIGH -> FAIL, no exceptions, no "out of scope follow-up".
 - MEDIUM/LOW: FAIL by default for a release-critical change; if a LOW is genuinely
   deferrable, say so explicitly and let the orchestrator escalate to the human.
