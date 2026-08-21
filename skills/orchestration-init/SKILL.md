@@ -43,7 +43,8 @@ working directory.
 3. Confirm a repo rules document exists. Prefer both `CLAUDE.md` and `AGENTS.md`
    in `rules_docs`; if missing, offer to create a starter so the project's real
    conventions have a place to live.
-4. Gitignore `.orchestration/.gate-status/`, `.orchestration/.sprint-state/`, and
+4. Gitignore `.orchestration/.gate-status/`, `.orchestration/.sprint-state/`,
+   `.orchestration/.review-ledger/`, and
    the configured worktree base.
 5. Do not copy hook commands into project settings. Claude Code and current
    Codex hosts may discover `hooks/hooks.json` after user review/trust, but

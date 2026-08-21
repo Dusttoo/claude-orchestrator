@@ -67,11 +67,19 @@ Steps:
    `/orchestration:gate <pr>` (code-review, then security-review when the diff
    hits a `security_required_when` trigger). Both must end `VERDICT: PASS`.
    - Reviewers finish the entire checklist and adversarial sweep and batch all
-   findings, even after the first blocker. Maintain a failure ledger by each
-   finding's `[component: ...]` key across all gates and rounds. The first component
-     failure may return to a fresh implementer. A second failure in that same
-     component triggers the design reviewer and a revised adversarial matrix;
-     do not authorize another narrow patch. Re-run complete gates. Do NOT merge.
+     findings, even after the first blocker.
+   - The durable failure ledger owns the loop. Open it once
+     (`${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py open <pr>`), paste
+     `review-ledger.py brief <pr>` into every reviewer brief, and record every
+     completed gate with `review-ledger.py record`. It normalizes each finding's
+     `[component: <path>:<symbol>]` key, counts strikes across all gates and
+     rounds, freezes blocking scope after round 1, and returns `next_action`.
+   - `review` returns blocking findings to a fresh implementer; advisory findings
+     go to the PR body instead. The second failure in one component returns
+     `redesign` -- run the design reviewer scoped to that component with a revised
+     adversarial matrix, never another narrow patch. `escalate-human` means the
+     round cap is spent: STOP, hand the user `review-ledger.py handoff <pr>`, and
+     do not run another round. Re-run complete gates. Do NOT merge on a FAIL.
 
 5. **Verify (when configured).** For each entry in the config `verification:`
    block whose `when:` includes this configured target, run it on the rebased

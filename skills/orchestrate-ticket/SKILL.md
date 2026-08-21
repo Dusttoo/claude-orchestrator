@@ -67,6 +67,7 @@ reading them:
 - `../../scripts/merge-on-green.sh`
 - `../../scripts/cleanup-worktree.sh`
 - `../../scripts/orchestration-engine.py`
+- `../../scripts/review-ledger.py`
 - `../../scripts/run-verification.sh`
 - `../../scripts/run-visual-qa.sh`
 
@@ -108,13 +109,30 @@ working directory.
    security-review role using `orchestration-security-reviewer.md` when the diff
    hits a `security_required_when` trigger. Both must end `VERDICT: PASS`. On
    any `VERDICT: FAIL`, require the reviewer to finish its full checklist and
-   adversarial sweep and return all findings together. Maintain a failure ledger
-   keyed by each finding's `[component: ...]`. The first failure in a component
-   may return to a fresh implementer on the same branch. The second failure in
-   that component, across any gate or round, MUST return to the design gate for
-   a root-cause redesign and revised adversarial matrix before any more code is
-   changed; do not authorize another narrow patch. Re-run the complete gates
-   after every fix or redesign. Never merge on a FAIL.
+   adversarial sweep and return all findings together.
+
+   The durable failure ledger owns this loop; do not track it in your own
+   context, which compacts. Open it once (`review-ledger.py open <pr>`), paste
+   `review-ledger.py brief <pr>` into every reviewer brief, and record every
+   completed gate with `review-ledger.py record <pr> --gate <gate> --verdict
+   <PASS|FAIL> --blocking <key> --advisory <key>`. It normalizes each finding's
+   `[component: <path>:<symbol>]` key so a repeated defect actually accumulates
+   strikes, freezes blocking scope after round 1, and returns `next_action`:
+
+   - `review` -- return the blocking findings to a fresh implementer on the same
+     branch. Advisory findings go to the PR body, never the implementer's brief.
+   - `redesign` -- the second failure in that component, across any gate or
+     round. Return to the design gate for a root-cause redesign scoped to that
+     component with a revised adversarial matrix before any more code is changed;
+     do not authorize another narrow patch. Record its PASS with
+     `review-ledger.py redesign <pr> --key <key> --verdict PASS`.
+   - `escalate-human` -- the configured round cap is spent with blocking findings
+     still open. STOP: do not merge and do not run another round. Hand the user
+     `review-ledger.py handoff <pr>` with the PR link.
+   - `gates-clear` -- necessary, not sufficient; confirm the security gate ran if
+     the diff triggers it.
+
+   Re-run the complete gates after every fix or redesign. Never merge on a FAIL.
 
 5. **Verify (when configured).** For each `verification:` entry whose `when:`
    matches the configured target, run the resolved `run-verification.sh <name>`

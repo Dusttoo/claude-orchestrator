@@ -79,10 +79,28 @@ scope/matrix -> design* -> implement -> code-review -> security-review -> verify
 - **One review, one batch.** A reviewer completes the whole diff, checklist, and
   adversarial matrix after finding a blocker, then returns every finding at once.
   Re-review repeats the whole sweep.
-- **Two strikes means redesign.** Findings carry stable component keys. The
-  orchestrator counts them across gates and rounds; the second failure in one
-  component goes back through the design gate with a revised matrix, never into
-  another narrow patch.
+- **Two strikes means redesign.** Findings carry stable `<path>:<symbol>`
+  component keys, normalized by `scripts/review-ledger.py` so the same defect
+  named two different ways still counts as one. The ledger counts strikes across
+  gates and rounds; the second failure in one component goes back through the
+  design gate with a revised matrix, never into another narrow patch.
+- **The ledger is on disk, not in the orchestrator's head.** A failure ledger
+  held in conversation is lost to compaction on exactly the long tickets that
+  need it, which is why two-strikes silently stopped firing. `review-ledger.py`
+  owns strike counts, the blocking/advisory split, and the loop's next action.
+- **The blocking set only shrinks.** Round 1 sweeps the whole diff with full
+  blocking authority. From round 2 the sweep is still full-diff -- a fix can break
+  something elsewhere -- but only open ledger components, regressions in the
+  delta, and security findings may block. Without that, a fresh reviewer each
+  round finds a fresh nit forever and the PR never lands.
+- **Not everything true is blocking.** Correctness, security, uncovered
+  acceptance criteria, disabled tests, and cross-surface disagreement block.
+  Dead weight, naming, and "while I was in here" are advisory: recorded on the
+  ledger, carried into the PR body, never a FAIL.
+- **The loop has an end.** `max_review_rounds` (default 3) bounds it. Hitting the
+  cap with blocking findings open stops the loop and hands the human
+  `review-ledger.py handoff <pr>` -- it never merges a blocked PR, and it never
+  runs round eleven.
 - **Mechanical enforcement, not just discipline.** The sanctioned merge script
   validates evidence without hooks; an optional trusted hook and branch
   protection add independent layers.

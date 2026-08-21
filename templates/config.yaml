@@ -100,6 +100,25 @@ gates:
   - code-review
   - security-review
 
+# --- Review loop bounds -------------------------------------------------- agent
+# A review loop with no termination condition runs until something external stops
+# it. These two keys bound it.
+#
+# `max_review_rounds` is how many FIX CYCLES one PR may spend -- rounds that sent
+# it back for changes -- before the loop STOPS and hands the PR to a human. A
+# passing gate costs nothing, so a PR running both the code and security gates is
+# not penalized for it. Hitting the cap is not a merge: blocking findings still
+# block. It ends the loop instead of letting it run indefinitely.
+# Round 1 sweeps the whole diff with full blocking authority; from round 2 the
+# scope freezes, and only open ledger components, regressions in the delta, and
+# security findings can block. That is what makes the blocking set shrink.
+#
+# Raise it for large or exploratory changes; 2 makes a strict, fast-failing loop.
+# A ticket that repeatedly hits the cap is usually underspecified, not badly
+# implemented -- scope it harder rather than raising this.
+max_review_rounds: 3
+review_ledger_dir: .orchestration/.review-ledger
+
 # --- Security-gate trigger ------------------------------------------------ agent
 # When the security gate is mandatory. Either the literal `always`, or a list of
 # path fragments / keywords matched against the PR diff. Any match -> required.

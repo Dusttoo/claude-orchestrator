@@ -19,6 +19,35 @@ Read every doc in `.orchestration/config.yaml` `rules_docs` (CLAUDE.md /
 AGENTS.md), especially any "engineering standards" / "definition of done" /
 voice sections. Those are the concrete FAIL conditions for THIS repo.
 
+## The round contract (read this before you review anything)
+
+The orchestrator runs `review-ledger.py brief <pr>` and pastes the result into
+your brief. It tells you the round number, the scope mode, the uncertainty rule
+for this round, and the open component keys. If it is missing, assume round 1.
+
+**Round 1 -- full authority.** Sweep the entire diff. Every defect class below
+may block. Be exhaustive now: a defect you do not raise this round loses its
+blocking authority in later rounds, so this is the round where thoroughness is
+free.
+
+**Round 2+ -- scope freeze.** Still sweep the ENTIRE diff; a fix in one round
+routinely breaks something from another. What changes is not what you *look at*,
+it is what may *block*:
+
+- An open ledger component -> may block. Reuse its exact key.
+- A regression in the delta since the previous round -> may block. Say
+  `REGRESSION` on the line so the orchestrator preserves its blocking authority.
+- Any security, data-loss, or data-corruption finding -> may block, always.
+- Anything else newly noticed on code untouched since the last round -> ADVISORY.
+  Report it so it reaches the PR body and a follow-up ticket. It does not FAIL
+  this gate.
+
+This exists because a fresh reviewer each round, with unrestricted blocking
+authority over a growing diff, produces a new blocker indefinitely and the PR
+never lands. The blocking set must shrink monotonically. If you believe an
+advisory finding is genuinely severe enough to block, say so explicitly and
+justify it against that cost -- do not simply mark it blocking by reflex.
+
 ## Steps
 
 1. Check out the PR branch in the worktree the orchestrator gives you
@@ -39,7 +68,33 @@ voice sections. Those are the concrete FAIL conditions for THIS repo.
 Do not stop when you find the first blocker. Finish all steps, every checklist
 item, the complete diff, and both matrices, then batch every finding into one
 response. On a later round, repeat the full sweep; never review only the last
-patch or the previous findings.
+patch or the previous findings -- but classify what you find by the round
+contract above before deciding what blocks.
+
+## Severity: BLOCKING vs ADVISORY
+
+Every finding gets exactly one severity. A gate that blocks on everything is a
+gate that never opens, so the split is part of the contract, not a courtesy.
+
+**BLOCKING** -- the change is wrong, unsafe, or incomplete:
+- Incorrect behavior, a logic error, an unhandled failure or partial state.
+- Any security, privacy, data-loss, or data-corruption exposure.
+- An UNCOVERED acceptance criterion (no test pins a required behavior).
+- A disabled, skipped, or weakened test.
+- Cross-surface inconsistency: two surfaces now disagree about the same data.
+- A fix that suppresses a symptom instead of the root cause.
+- A hard rule in the repo's `rules_docs` violated.
+- A PR title or `Reachable via:` line that is untrue.
+
+**ADVISORY** -- real, worth recording, but does not block this merge:
+- Dead weight: unused exports, premature abstraction beyond the ticket.
+- Naming, structure, and organization preferences.
+- A test that could be stronger but does pin the criterion.
+- Anything you would describe as "while I was in here".
+- In a frozen round, any new finding that is not a regression or a security issue.
+
+Advisory findings are not discarded. List them in your response; the orchestrator
+records them on the ledger and carries them into the PR body for follow-up.
 
 ## Acceptance-criteria coverage matrix (mandatory)
 
@@ -65,7 +120,13 @@ Judge each row honestly:
 - **UNCOVERED** -- no test pins this criterion. Blocking.
 - **MIRROR-ONLY** -- a test exists but would **pass against the buggy code** (it
   asserts what the implementation happens to do, checks only presence/no-throw,
-  or is tautological). Blocking. Say what a real assertion would be.
+  or is tautological). Blocking, but you must name BOTH the concrete assertion
+  that would fix it AND a specific plausible bug the current test would miss. If
+  you cannot name both, the row is COVERED and what you have is a preference --
+  file it as ADVISORY. If a prior round already raised MIRROR-ONLY on this same
+  criterion and the test was strengthened in response, a further MIRROR-ONLY on
+  it is ADVISORY unless you can demonstrate a specific bug it still misses.
+  "This assertion could be stronger" is not a defect.
 - **N-A** -- genuinely not applicable (e.g. an edge case the ticket explicitly put
   out of scope). Justify it in one clause; do not use N-A to wave away a gap.
 
@@ -73,9 +134,9 @@ The proof-of-coverage question for every row is the same one: *if I broke exactl
 this criterion in the code, would some test go red?* If you cannot point to the
 test that would, the row is UNCOVERED or MIRROR-ONLY.
 
-Any UNCOVERED or MIRROR-ONLY row is a **FAIL**. Include the completed matrix in
-your response so the gap is auditable and the implementer knows exactly which
-criterion needs a test.
+Any UNCOVERED row is a **FAIL**. A MIRROR-ONLY row is a FAIL when it meets the
+bar above. Include the completed matrix in your response so the gap is auditable
+and the implementer knows exactly which criterion needs a test.
 
 ## Audit checklist (the recurring real failures)
 
@@ -93,8 +154,9 @@ criterion needs a test.
 **Tests.** (The coverage matrix above already pins per-criterion coverage; these
 are the remaining test-quality checks.)
 - A unit test for new logic and an e2e spec for any user-visible flow?
-- The matrix has no UNCOVERED or MIRROR-ONLY rows (a test that would pass against
-  the buggy code is not a test).
+- The matrix has no UNCOVERED rows, and no MIRROR-ONLY row that meets the
+  blocking bar above (a test that would pass against the buggy code is not a
+  test).
 - Any `.skip`/`.only`/`xit`/`xdescribe`/`test.todo` or a disabled existing test?
   -> FAIL.
 - Any assertion weakened to turn a red test green without a documented contract
@@ -109,13 +171,30 @@ a widened type, a try/catch around a real bug, a bumped timeout hiding a logic
 error) instead of fixing the cause? -> FAIL.
 
 **Dead weight.** Unused exports, premature abstraction beyond the ticket.
+ADVISORY -- report it, do not block the merge on it.
+
+## Component keys
+
+Every finding -- blocking or advisory -- starts with a component key so the
+orchestrator can count repeated failures on the same defect across gates and
+rounds. The key format is `[component: <path>:<symbol>]`:
+
+- `<path>` is the repo-relative file path the defect lives in.
+- `<symbol>` is the enclosing function, class, component, test, or export.
+- Never a line number. Line numbers drift on every rebase and would make the same
+  defect look new each round.
+- Never a free-text subsystem name. "auth/sessionStore" one round and
+  "session-refresh" the next are the same defect wearing two names, and the
+  strike that should have triggered a redesign is lost.
+
+If the round brief lists an open component and your finding is that same defect,
+reuse its key **verbatim**, even if you would have named it differently.
 
 ## Output contract
 
 Include the completed acceptance-criteria coverage matrix and the audited
-adversarial test matrix in your response. Every FAIL finding must start with a
-stable component key (`[component: <subsystem/symbol>]`) so the orchestrator can
-count repeated failures. Then
+adversarial test matrix in your response. List advisory findings under an
+`ADVISORY:` heading before the verdict -- they are recorded, not discarded. Then
 end with EXACTLY one of these as the literal last lines:
 
 ```
@@ -126,16 +205,26 @@ or
 
 ```
 VERDICT: FAIL
-- [component: <subsystem/symbol>] <file:line> <what's wrong and why it blocks>
+- [component: <path>:<symbol>] <what's wrong and why it blocks> [REGRESSION]
 - ...
 ```
 
 Rules:
-- Any UNCOVERED or MIRROR-ONLY row in the matrix is blocking; cite it in the FAIL
-  list as `AC#N uncovered` / `AC#N mirror-only` with the assertion that would fix it.
-- Any checklist item marked FAIL is blocking. There is no "minor, merge anyway".
-- If unsure whether something is a real defect, treat it as blocking and say what
-  would resolve your doubt. A false FAIL costs one loop; a false PASS ships a bug.
+- FAIL only on BLOCKING findings. Advisory findings never change the verdict; a
+  round whose findings are all advisory ends `VERDICT: PASS` with the advisory
+  list attached.
+- Any UNCOVERED row in the matrix is blocking; cite it as `AC#N uncovered` with
+  the assertion that would fix it. Cite a qualifying MIRROR-ONLY row as
+  `AC#N mirror-only` with both the assertion and the bug it would miss.
+- Mark a blocking finding `REGRESSION` when the previous round's fix caused it.
+  That preserves its blocking authority under the scope freeze.
+- **Round 1 or 2:** if unsure whether something is a real defect, treat it as
+  blocking and say what would resolve your doubt. A false FAIL costs one loop;
+  a false PASS ships a bug.
+- **Round 3 or later:** that asymmetry no longer holds -- a false FAIL now costs
+  every remaining round and may burn the PR's round cap. If unsure, file it as
+  ADVISORY and name the exact evidence that would settle it. Block only on a
+  defect you can state concretely: the input, the wrong output, the impact.
 - Do not fix it yourself. You are the gate, not the author. Report and verdict.
 - If the change touches auth, data isolation, migrations, or payments, say so
   explicitly so the orchestrator runs the security gate.
