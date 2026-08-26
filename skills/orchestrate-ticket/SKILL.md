@@ -18,6 +18,19 @@ come from the configured workflow; use `orchestration-engine.py adapter-plan
 transitions. For legacy configs, keep the existing implement -> review ->
 security -> verify -> merge-on-green flow below.
 
+Before every `design-reviewer`, `implementer`, `code-reviewer`,
+`security-reviewer`, or `visual-qa` launch, resolve the role with
+`scripts/context_pipeline.py route --config .orchestration/config.yaml --role
+<role>`. A `desktop` route uses the existing native agent. An `api` route builds
+its provider request with `context_pipeline.py payload --config ... --role
+<role>` and pipes it to `scripts/api_agent.py run --request - --config
+.orchestration/config.yaml --role <role>`, including ticket, sprint, and stable
+run identifiers when available. The runner enforces role tools and USD/token
+ceilings. Use desktop fallback
+only after proving the API request failed before any provider/run id existed.
+Submitted, timed-out, or uncertain API work remains reserved for reconciliation
+and must never be duplicated.
+
 ## Relaying information (do not hand down stale facts)
 
 You are a lossy relay. Every hop -- an agent's report into your brief, a brief
@@ -66,6 +79,8 @@ reading them:
 - `../../scripts/merge-guard.sh`
 - `../../scripts/merge-on-green.sh`
 - `../../scripts/cleanup-worktree.sh`
+- `../../scripts/context_pipeline.py`
+- `../../scripts/api_agent.py`
 - `../../scripts/orchestration-engine.py`
 - `../../scripts/review-ledger.py`
 - `../../scripts/run-verification.sh`
@@ -107,15 +122,19 @@ working directory.
 4. **Gate.** Run the review gates on the PR: a fresh code-review role using
    `orchestration-code-reviewer.md` (no implementer context), then a fresh
    security-review role using `orchestration-security-reviewer.md` when the diff
-   hits a `security_required_when` trigger. Both must end `VERDICT: PASS`. On
-   any `VERDICT: FAIL`, require the reviewer to finish its full checklist and
+   hits a `security_required_when` trigger. Both must return validated structured
+   PASS results with no blocking findings. On
+   each pass, supply the raw unified base-to-head git diff as the default code
+   input, never a full-codebase index; expand only for a named verification or
+   regression check. On any structured FAIL result, require the reviewer to finish its
+   full checklist and
    adversarial sweep and return all findings together.
 
    The durable failure ledger owns this loop; do not track it in your own
    context, which compacts. Open it once (`review-ledger.py open <pr>`), paste
    `review-ledger.py brief <pr>` into every reviewer brief, and record every
-   completed gate with `review-ledger.py record <pr> --gate <gate> --verdict
-   <PASS|FAIL> --blocking <key> --advisory <key>`. It normalizes each finding's
+   completed gate with `review-ledger.py record <pr> --gate <gate> --result
+   .orchestration/.review-results/<gate>.json`. It normalizes each finding's
    `[component: <path>:<symbol>]` key so a repeated defect actually accumulates
    strikes, freezes blocking scope after round 1, and returns `next_action`:
 

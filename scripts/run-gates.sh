@@ -30,14 +30,29 @@ fi
 
 pass=0; fail=0
 declare -a RESULTS
+LOG_LINES="$(orch_get gate_log_lines 80)"
+if ! [[ "$LOG_LINES" =~ ^[1-9][0-9]*$ ]]; then
+  echo "run-gates: gate_log_lines must be a positive integer." >&2
+  exit 2
+fi
+LOG_DIR="$(orch_project_root)/.orchestration/.gate-logs"
+mkdir -p "$LOG_DIR"
 
 for i in "${!names[@]}"; do
   name="${names[$i]}"; run="${runs[$i]}"
+  safe_name="$(printf '%s' "$name" | tr -cs 'A-Za-z0-9._-' '-')"
+  log_file="${LOG_DIR}/${safe_name}-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
   echo "--- ${name} ---"
   echo "\$ ${run}"
-  if bash -c "$run"; then
+  if bash -c "$run" >"$log_file" 2>&1; then
+    rm -f "$log_file"
     RESULTS+=("PASS  ${name}"); pass=$((pass + 1))
   else
+    code=$?
+    chmod 600 "$log_file" 2>/dev/null || true
+    echo "FAILED (exit ${code}); last ${LOG_LINES} log lines:" >&2
+    tail -n "$LOG_LINES" "$log_file" >&2
+    echo "Full failure log: ${log_file}" >&2
     RESULTS+=("FAIL  ${name}"); fail=$((fail + 1))
   fi
   echo

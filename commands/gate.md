@@ -20,6 +20,16 @@ ${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py adapter-plan --host claude
 
 For legacy configs, use the existing review gates below.
 
+Before each `code-reviewer` or `security-reviewer` launch, resolve its route with
+`${CLAUDE_PLUGIN_ROOT}/scripts/context_pipeline.py route --config
+.orchestration/config.yaml --role <role>`. Desktop routes use fresh native
+agents; API routes use `context_pipeline.py payload --config ... --role <role>`
+and pipe it to `${CLAUDE_PLUGIN_ROOT}/scripts/api_agent.py run --request -
+--config .orchestration/config.yaml --role <role> --ticket <ticket> --run-id
+<stable-run-id>`. Desktop fallback is permitted only before provider
+acknowledgement; a provider id, timeout after submission, or uncertain state
+must be reconciled and never duplicated.
+
 0. **Open the ledger and build the round brief.** The failure ledger lives on
    disk, not in this conversation -- it survives compaction, normalizes component
    keys so a repeated defect actually accumulates strikes, and decides when the
@@ -36,15 +46,20 @@ For legacy configs, use the existing review gates below.
    assumes round 1 and reviews with full blocking authority.
 
 1. **Code review.** Launch the `orchestration-code-reviewer` agent (a FRESH
-   agent, no implementer context) on the PR. It must re-derive correctness, run
+   agent, no implementer context) on the PR. Generate and pass the raw unified
+   base-to-head git diff as its default and authoritative code input. Also pass
+   only the ticket, configured rules docs, stable repository map, and round
+   brief; do not pass a full-codebase index. Additional source is allowed only for a
+   named verification or regression check. It must re-derive correctness, run
    the repo's review skill + self-checks, finish the full checklist/diff/adversarial
-   matrix even after finding a blocker, batch all findings with stable
-   `[component: ...]` keys, and end with `VERDICT: PASS` / `FAIL`.
+   matrix even after finding a blocker, then return only the concise structured
+   review JSON. Explanations belong only to findings.
 
 2. **Security review.** Inspect the PR diff. If it touches any
    `security_required_when` trigger (auth, data isolation, migrations, payments,
    webhooks...), launch the `orchestration-security-reviewer` agent (another
-   fresh agent). It must end with `VERDICT: PASS` / `FAIL`. If the diff has no
+   fresh agent) with that same raw unified diff and diff-isolated context. It
+   must return the same concise structured review JSON. If the diff has no
    security surface, note that and skip.
 
 3. **Record the round.** Record every completed gate through the ledger, blocking
@@ -52,12 +67,11 @@ For legacy configs, use the existing review gates below.
 
    ```bash
    ${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py record <pr> --gate code-review \
-     --verdict FAIL --blocking "src/auth/session.ts:refreshToken" \
-     --advisory "src/ui/Badge.tsx:Badge"
+     --result .orchestration/.review-results/code-review.json
    ```
 
-   Pass `--regression <key>` for any blocking finding the reviewer marked
-   `REGRESSION`. The ledger increments strikes, auto-resolves components this gate
+   The validated result carries blocking, advisory, severity, regression, and
+   finding explanations. The ledger increments strikes, auto-resolves components this gate
    no longer reports, demotes out-of-scope new findings in a frozen round, and
    returns `next_action`. Its `effective_verdict` governs, not the reviewer's
    claimed one.

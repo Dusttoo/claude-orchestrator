@@ -12,10 +12,12 @@ and Claude Code follow the same state machine.
 
 ## Shared controller
 
-Resolve `../../scripts/sprint-controller.py` from this skill file and execute it
-by absolute path with the target repository as the working directory. Never copy
-Use the explicit python3 executable on Linux hosts; do not assume a python alias exists.
-the controller or its tests into the repository.
+Resolve `../../scripts/sprint-controller.py` and
+`../../scripts/context_pipeline.py` plus `../../scripts/api_agent.py` from this
+skill file and execute them by
+absolute path with the target repository as the working directory. Never copy
+the controller or its tests into the repository. Use the explicit `python3`
+executable on Linux hosts; do not assume a `python` alias exists.
 
 The controller atomically writes under `sprint_checkpoint_dir` (default
 `.orchestration/.sprint-state`) and reads these top-level config keys:
@@ -37,7 +39,21 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    `active`), and `concurrency_max >= 1`. If Jira access is unavailable, stop
    before launches and report the missing connection as user action.
 
-2. **Query the complete sprint.** Use the connected Jira capability or the
+   Before each lane launch, resolve `sprint-worker` with
+   `scripts/context_pipeline.py route --config .orchestration/config.yaml --role
+   sprint-worker`. Desktop routes keep the native/CLI path. API routes use the
+   resolved provider/model/effort; foreground jobs run with `api_agent.py run`
+   and internal ticket roles resolve their own overrides. Desktop fallback may
+   reuse the provisional reservation only when
+   no provider/run id was created; uncertain API work remains reserved.
+
+2. **Query the complete sprint.** Resolve `ticket.jira_fields` with
+   `scripts/context_pipeline.py jira-fields`; when absent it defaults to
+   `key,summary,description,status,priority,components,subtasks,issuelinks`.
+   Pass its `fields` value explicitly on every Jira issue/search request and run
+   responses through `context_pipeline.py sanitize-jira` before model injection,
+   dropping rendered fields, edit-meta, changelogs, render schemas, and avatar
+   links. Use the connected Jira capability or the
    repository's configured ticket adapter. Query the configured project and
    sprint, paginate until every issue is fetched, and retrieve the configured
    dependency link types. A link is a dependency only when the current ticket
@@ -143,6 +159,20 @@ Before launching, resolve the executable because non-interactive SSH shells may 
    A launch failure is a `blocked` outcome; checkpoint it instead of abandoning
    the reservation. Sprint lanes count whole per-ticket orchestrations. Their
    internal reviewers still follow the single-ticket workflow's rules.
+
+   **API batch lane.** When work is explicitly `background: true` and
+   `interactive: false`, use the resolved API route and assemble its request with
+   `context_pipeline.py payload --config .orchestration/config.yaml --role
+   sprint-worker` so role briefs,
+   rules docs, and the stable repository map form the
+   cacheable prefix ahead of dynamic ticket/diff data. Serialize eligible jobs
+   with `sprint-controller.py prepare-batch --sprint <id> --jobs <file>` instead
+   of launching interactive workers. The controller rejects interactive jobs,
+   atomically reserves the lanes, and writes a provider-native request and
+   marker under `.orchestration/.sprint-state/`.
+   Submit Anthropic JSON to `POST /v1/messages/batches`; upload OpenAI JSONL and
+   create `POST /v1/batches`. Reconcile asynchronous results by `custom_id` and
+   call `finish` for each ticket. Preparation alone is not completion.
 
 6. **Checkpoint every outcome.** As workers finish, immediately call:
 

@@ -72,9 +72,8 @@ the Claude commands and the Codex skills drive the same script.
 ```bash
 review-ledger.py open <pr>                    # once per PR
 review-ledger.py brief <pr>                   # paste into every reviewer brief
-review-ledger.py record <pr> --gate code-review --verdict FAIL \
-  --blocking "src/auth/session.ts:refreshToken" \
-  --advisory "src/ui/Badge.tsx:Badge"
+review-ledger.py record <pr> --gate code-review \
+  --result .orchestration/.review-results/code-review.json
 review-ledger.py status <pr>                  # strikes, open set, next action
 review-ledger.py redesign <pr> --key <key> --verdict PASS
 review-ledger.py handoff <pr>                 # the human escalation report

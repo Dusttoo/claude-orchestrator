@@ -26,6 +26,24 @@ for file in agents/orchestration-code-reviewer.md agents/orchestration-security-
   require_text "$file" "[component:" "review findings identify a stable component"
 done
 
+for file in agents/orchestration-code-reviewer.md agents/orchestration-security-reviewer.md; do
+  require_text "$file" "raw unified git diff" "reviewers default to the raw unified diff"
+  require_text "$file" "Do not index" "reviewers do not re-index the full codebase"
+  require_text "$file" "Return JSON only" "reviewers emit machine-readable output"
+  require_text "$file" "explanation" "reviewers explain findings only"
+  require_text "$file" '"findings":[]' "clean reviews avoid narrative output"
+done
+
+require_text scripts/context_pipeline.py '"type": "json_schema"' "API providers receive a reviewer schema"
+require_text scripts/context_pipeline.py 'validate_review_output' "review output is validated mechanically"
+require_text docs/reviewer-output.md "Explanations are generated only for actual findings" \
+  "reviewer output efficiency is documented"
+
+for file in skills/orchestrate-ticket/SKILL.md skills/gate-pr/SKILL.md commands/orchestrate.md commands/gate.md; do
+  require_text "$file" "raw unified" "gate handoffs provide raw unified diffs"
+  require_text "$file" "full-codebase index" "gate handoffs omit full repository indexes"
+done
+
 for file in skills/orchestrate-ticket/SKILL.md skills/gate-pr/SKILL.md commands/orchestrate.md commands/gate.md; do
   require_text "$file" "failure ledger" "orchestrator tracks repeated component failures"
   require_text "$file" "second failure" "second component failure triggers redesign"

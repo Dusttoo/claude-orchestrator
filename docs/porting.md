@@ -66,9 +66,19 @@ or understand what it produced.
    supplies the discipline; these files supply the knowledge, and they are what
    make the harness get smarter about *your* repo over time.
 
-4. **Gitignore the runtime dirs.** Add `.orchestration/.gate-status/` (the marker
-   directory the merge-guard writes) and your worktree base if it is inside the
-   repo. Keep `worktree_cleanup: manual` unless you explicitly want the
+   Choose the global `llm.execution` route independently. Leave `desktop` for
+   native Claude Code/Codex agents, or select `api` with an explicit provider
+   and model. Add only the `llm.roles` overrides that differ from that global
+   route. Configure a hard per-run budget and an explicit pricing entry for
+   every API model; an unknown price fails closed. See `docs/llm-routing.md` and
+   `docs/api-agent.md` in the plugin.
+
+4. **Gitignore the runtime dirs.** Add `.orchestration/.gate-status/` (merge
+   evidence), `.orchestration/.gate-logs/` (full failure output),
+   `.orchestration/.sprint-state/`, `.orchestration/.review-ledger/`,
+   `.orchestration/.llm-runs/`, `.orchestration/.llm-usage/`, and your
+   worktree base if it is inside the repo. Keep `worktree_cleanup: manual` unless
+   you explicitly want the
    orchestrator and trusted lifecycle hook to remove clean, unlocked worktrees.
 
 5. **Optionally confirm hooks are active.** Claude Code and current Codex hosts
