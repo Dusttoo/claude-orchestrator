@@ -3,7 +3,8 @@
 
 The runner is intentionally SDK-free. It owns provider submission, client tool
 loops, durable request markers, worst-case budget reservations, and actual usage
-accounting. Credentials are read only from provider environment variables.
+accounting. Credentials come from the process environment or the configured
+repository's gitignored `.orchestration/.env` file.
 """
 
 from __future__ import annotations
@@ -51,6 +52,12 @@ DEFAULT_BUDGETS = {
     "max_pre_ack_retries": 2,
     "retry_backoff_seconds": 1,
 }
+CREDENTIAL_ENV_KEYS = {
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+}
 
 
 class AgentError(RuntimeError):
@@ -66,6 +73,53 @@ class ProviderHTTPError(AgentError):
         super().__init__(f"provider returned HTTP {status}: {body[:500]}")
         self.status = status
         self.body = body
+
+
+def load_orchestration_env(config_path: Path) -> list[str]:
+    """Load provider credentials beside config without evaluating shell syntax.
+
+    Container- or host-supplied variables always win. Only the provider keys the
+    runner consumes are accepted, keeping a repository file from changing PATH
+    or unrelated process behavior.
+    """
+    env_path = config_path.resolve().parent / ".env"
+    if not env_path.is_file():
+        return []
+    parsed: dict[str, str] = {}
+    for line_no, raw in enumerate(env_path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)", line)
+        if not match:
+            raise AgentError(f"invalid {env_path} line {line_no}; expected KEY=value")
+        key, value = match.groups()
+        if key not in CREDENTIAL_ENV_KEYS:
+            continue
+        if value.startswith('"'):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise AgentError(f"invalid quoted value in {env_path} line {line_no}") from exc
+            if not isinstance(value, str):
+                raise AgentError(f"invalid quoted value in {env_path} line {line_no}")
+        elif value.startswith("'"):
+            if len(value) < 2 or not value.endswith("'"):
+                raise AgentError(f"unterminated quoted value in {env_path} line {line_no}")
+            value = value[1:-1]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+        if "\x00" in value or "\n" in value or "\r" in value:
+            raise AgentError(f"invalid control character in {env_path} line {line_no}")
+        parsed[key] = value
+    loaded = []
+    for key, value in parsed.items():
+        if key not in os.environ:
+            os.environ[key] = value
+            loaded.append(key)
+    return loaded
 
 
 class ProviderAmbiguous(AgentError):
@@ -781,6 +835,7 @@ class ApiAgent:
     ):
         self.root = root.resolve()
         self.config_path = config_path.resolve()
+        load_orchestration_env(self.config_path)
         self.config = load_yaml(self.config_path)
         self.route = context_pipeline.llm_route_from_config(self.config_path, role)
         if self.route["execution"] != "api":

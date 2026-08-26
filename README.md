@@ -235,6 +235,10 @@ Code and security gates use concise structured results: passing checks carry no
 explanation, while actual findings carry the actionable detail. See
 [reviewer output](docs/reviewer-output.md).
 
+For API execution, place repository-specific provider keys in the gitignored
+`.orchestration/.env` beside `config.yaml`. Cloud/container environment variables
+with the same names take precedence. See [API agent runner](docs/api-agent.md).
+
 `/gate <pr>` runs just the review gates on an existing PR. `/release` advances a
 configured release or candidate transition through the shared workflow engine.
 Schema v1 repositories keep their legacy process until they migrate.

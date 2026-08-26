@@ -40,12 +40,16 @@ working directory.
    writing. Keep its safe `manual` default unless the user explicitly opts into
    automatic removal of clean, unlocked worktrees. After writing, run
    `orchestration-engine.py validate-config`.
+   If any role uses API execution, instruct the user to put the relevant
+   `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY` in `.orchestration/.env` beside
+   the config. Container environment values take precedence. Never display or
+   copy secret values.
 3. Confirm a repo rules document exists. Prefer both `CLAUDE.md` and `AGENTS.md`
    in `rules_docs`; if missing, offer to create a starter so the project's real
    conventions have a place to live.
 4. Gitignore `.orchestration/.gate-status/`, `.orchestration/.gate-logs/`,
    `.orchestration/.sprint-state/`,
-   `.orchestration/.review-ledger/`, `.orchestration/.review-results/`, `.orchestration/.llm-runs/`,
+   `.orchestration/.review-ledger/`, `.orchestration/.review-results/`, `.orchestration/.env`, `.orchestration/.llm-runs/`,
    `.orchestration/.llm-usage/`, and the configured worktree base.
 5. Do not copy hook commands into project settings. Claude Code and current
    Codex hosts may discover `hooks/hooks.json` after user review/trust, but

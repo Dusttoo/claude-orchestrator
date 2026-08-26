@@ -4,6 +4,10 @@ The orchestration policy chooses where each agent runs independently of its
 workflow role. Existing repositories default to desktop execution. API use is
 opt-in and requires an explicit provider and model.
 
+Repository-specific API credentials belong in the gitignored
+`.orchestration/.env` file next to `config.yaml`. Container environment variables
+override values from that file.
+
 ```yaml
 llm:
   execution: desktop

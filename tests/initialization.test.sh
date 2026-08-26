@@ -60,6 +60,12 @@ check "Claude init gitignores API run state" \
   rg -q '\.orchestration/\.review-results/' "$ROOT/skills/orchestration-init/SKILL.md"
 check "Codex init gitignores API usage state" \
   rg -q '\.orchestration/\.llm-usage/' "$ROOT/skills/orchestration-init/SKILL.md"
+check "Claude init gitignores repository API credentials" \
+  rg -q '\.orchestration/\.env' "$ROOT/commands/orchestration-init.md"
+check "Codex init gitignores repository API credentials" \
+  rg -q '\.orchestration/\.env' "$ROOT/skills/orchestration-init/SKILL.md"
+check "API docs preserve container secret precedence" \
+  rg -q 'take precedence, making platform secret injection' "$ROOT/docs/api-agent.md"
 check_not "Claude init does not copy process docs into target repos" \
   rg -q 'Copy `templates/ORCHESTRATION\.md`' "$ROOT/commands/orchestration-init.md"
 check_not "Codex init does not copy process docs into target repos" \

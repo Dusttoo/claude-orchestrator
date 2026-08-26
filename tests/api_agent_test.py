@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -102,6 +104,32 @@ self_check:
             run_id=run_id,
             transport=transport,
         )
+
+    def test_repository_env_loads_provider_credentials_without_overriding_container(self):
+        config = self.config()
+        (config.parent / ".env").write_text(
+            "# local orchestration secrets\n"
+            "export ANTHROPIC_API_KEY='repo-key'\n"
+            "ANTHROPIC_BASE_URL=https://proxy.example/v1 # optional proxy\n"
+            "OPENAI_API_KEY=repo-openai\n"
+            "PATH=/untrusted/path\n",
+            encoding="utf-8",
+        )
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "container-key"}, clear=False):
+            os.environ.pop("ANTHROPIC_BASE_URL", None)
+            os.environ.pop("OPENAI_API_KEY", None)
+            loaded = api_agent.load_orchestration_env(config)
+            self.assertEqual(os.environ["ANTHROPIC_API_KEY"], "container-key")
+            self.assertEqual(os.environ["ANTHROPIC_BASE_URL"], "https://proxy.example/v1")
+            self.assertEqual(os.environ["OPENAI_API_KEY"], "repo-openai")
+            self.assertNotEqual(os.environ.get("PATH"), "/untrusted/path")
+            self.assertEqual(loaded, ["ANTHROPIC_BASE_URL", "OPENAI_API_KEY"])
+
+    def test_repository_env_rejects_shell_syntax(self):
+        config = self.config()
+        (config.parent / ".env").write_text("source ../secrets\n", encoding="utf-8")
+        with self.assertRaisesRegex(api_agent.AgentError, "expected KEY=value"):
+            api_agent.load_orchestration_env(config)
 
     def test_anthropic_tool_loop_and_usage(self):
         transport = FakeTransport(

@@ -23,6 +23,10 @@ propose, confirm before writing.
    ```bash
    ${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py validate-config
    ```
+   If any role uses `execution: api`, instruct the user to create the gitignored
+   `.orchestration/.env` beside the config and add only the needed
+   `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY`. Container environment variables
+   may provide the same names and take precedence. Never print or copy key values.
 
 3. **Project contract.** Confirm a `CLAUDE.md` (and ideally `AGENTS.md`) exists at the
    repo root -- the gate agents read it for the actual rules. If missing, offer
@@ -36,7 +40,7 @@ propose, confirm before writing.
    remain authoritative without hooks. Gitignore `.orchestration/.gate-status/`,
    `.orchestration/.gate-logs/`,
    `.orchestration/.sprint-state/`, `.orchestration/.review-ledger/`,
-   `.orchestration/.review-results/`,
+   `.orchestration/.review-results/`, `.orchestration/.env`,
    `.orchestration/.llm-runs/`, `.orchestration/.llm-usage/`, and the worktree
    base.
 

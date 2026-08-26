@@ -23,9 +23,22 @@ scripts/context_pipeline.py payload \
     --ticket PROJ-123 --run-id PROJ-123-code-review-1
 ```
 
-The runner reads `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` from the environment.
-Keys are never read from or written to repository configuration, run state, or
-the usage ledger.
+Put repository-specific provider credentials in `.orchestration/.env`, beside
+`config.yaml`:
+
+```dotenv
+ANTHROPIC_API_KEY=your-anthropic-key
+OPENAI_API_KEY=your-openai-key
+```
+
+Only define the provider the repository uses. Optional custom endpoints are
+`ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`. The runner parses this file as data;
+it does not execute shell syntax or expand variables. Only those four names are
+loaded. Variables already supplied by a cloud container or host environment
+take precedence, making platform secret injection the highest-priority source.
+
+Always gitignore `.orchestration/.env`. Keys are never copied into
+`config.yaml`, run state, logs, or the usage ledger.
 
 The runner retries token-count calls and explicit provider rate-limit/overload
 rejections up to `max_pre_ack_retries`, with bounded backoff. It never retries a
