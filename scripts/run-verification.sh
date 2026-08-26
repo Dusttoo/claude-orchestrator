@@ -37,11 +37,21 @@ SHA_SHORT="${SHA_FULL:0:12}"
 STATUS_DIR="${GATE_STATUS_DIR:-$(orch_project_root)/.orchestration/.gate-status}"
 mkdir -p "$STATUS_DIR"
 RESULT_FILE="${STATUS_DIR}/verify-${NAME}-${SHA_FULL}.green"
+LOG_LINES="$(orch_get gate_log_lines 80)"
+if ! [[ "$LOG_LINES" =~ ^[1-9][0-9]*$ ]]; then
+  echo "run-verification: gate_log_lines must be a positive integer." >&2
+  exit 2
+fi
+LOG_DIR="$(orch_project_root)/.orchestration/.gate-logs"
+mkdir -p "$LOG_DIR"
+SAFE_NAME="$(printf '%s' "$NAME" | tr -cs 'A-Za-z0-9._-' '-')"
+LOG_FILE="${LOG_DIR}/verification-${SAFE_NAME}-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
 
 echo "== verification '${NAME}' on ${BRANCH} @ ${SHA_SHORT} =="
 echo "\$ ${RUN}"
 
-if bash -c "$RUN"; then
+if bash -c "$RUN" >"$LOG_FILE" 2>&1; then
+  rm -f "$LOG_FILE"
   printf 'result=GREEN\nname=%s\nbranch=%s\nsha=%s\nat=%s\n' \
     "$NAME" "$BRANCH" "$SHA_FULL" "$(date -u +%FT%TZ)" > "$RESULT_FILE"
   echo
@@ -51,9 +61,13 @@ if bash -c "$RUN"; then
   exit 0
 else
   code=$?
+  chmod 600 "$LOG_FILE" 2>/dev/null || true
   # Never write a .green file on failure: RED must not be confusable with GREEN.
   echo
   echo "VERIFICATION '${NAME}': RED (exit ${code}). Do NOT merge; loop back to the implementer." >&2
+  echo "Last ${LOG_LINES} log lines:" >&2
+  tail -n "$LOG_LINES" "$LOG_FILE" >&2
+  echo "Full failure log: ${LOG_FILE}" >&2
   echo "A timeout/abort that stops the run early is also RED, not a pass." >&2
   exit 1
 fi

@@ -34,6 +34,36 @@ running reservations as `needs_reconcile`. The host must inspect external state;
 it may requeue only after proving the old worker is gone. This deliberately
 prefers a paused lane over duplicate ticket execution.
 
+## Context and provider efficiency
+
+Before querying Jira, adapters resolve `ticket.jira_fields` through
+`scripts/context_pipeline.py jira-fields` and pass the emitted comma-separated
+value as Jira's `fields` request parameter. Jira responses pass through
+`sanitize-jira`, which allowlists those issue fields and removes rendered/edit
+metadata, changelogs, schemas, and avatar links before ticket data reaches an
+LLM.
+
+Before launching, adapters resolve `llm` plus the requested `llm.roles` override
+with `context_pipeline.py route`. Desktop routes use the native host agent; API
+routes build requests with `context_pipeline.py payload --config ... --role
+...` and foreground jobs execute through `api_agent.py run`, which enforces role
+tools and run/ticket/sprint budgets. Anthropic Messages and OpenAI Responses
+payloads share the same stable order:
+role brief, repository rules, then the baseline repository map. Gate and
+on-demand payloads place the provider-native explicit cache breakpoint at the
+selected stable boundary; ticket data and the raw active-branch diff remain in
+the uncached user message. Optional `--effort` maps to OpenAI reasoning effort
+or Anthropic adaptive-thinking effort; fixed `budget_tokens` is intentionally
+not assumed because support differs across model generations.
+
+Non-interactive background lanes can be prepared with `prepare-batch`. The
+controller accepts only current `plan.launch` tickets explicitly marked as
+background and non-interactive, reserves them under the sprint lock, and writes
+an Anthropic Message Batches JSON request or OpenAI Batch JSONL plus a durable
+marker beneath the configured checkpoint directory. The host submits and
+monitors the batch; results are reconciled by `custom_id` before normal
+per-ticket `finish` calls.
+
 ## Ready ordering
 
 Inventory tickets may carry an optional integer `priority`, lower being more

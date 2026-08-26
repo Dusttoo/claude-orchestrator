@@ -144,6 +144,7 @@ Legacy key blocks:
 | Key | Purpose |
 |---|---|
 | `integration_branch` / `production_branch` | the branch model |
+| `llm` / `llm.roles` | global desktop/API route, per-role provider/model/tool overrides, hard budgets, and explicit model pricing |
 | `merge_to_integration` / `merge_to_production` | `merge` or `squash` per target |
 | `ci_checks_integration` / `ci_checks_production` | exact GitHub check-run names that define "CI green" |
 | `self_check` | named shell checks run before review (typecheck, build, test, plus any repo convention) |
@@ -158,6 +159,10 @@ Legacy key blocks:
 The legacy scalar/list parser is pure bash. The schema v2 workflow is validated
 by `scripts/orchestration-engine.py`, a shared engine used by both Claude and
 Codex adapters. See [docs/workflow-configuration.md](docs/workflow-configuration.md).
+Desktop/API selection and inherited per-role overrides are documented in
+[docs/llm-routing.md](docs/llm-routing.md). The constrained provider runner,
+usage ledger, and recovery procedure are documented in
+[docs/api-agent.md](docs/api-agent.md).
 
 ## Installation
 
@@ -216,7 +221,7 @@ drives one unit of work through the whole pipeline: scope/adversarial matrix ->
 design gate for security-sensitive infrastructure -> implement (worktree, TDD) ->
 code review (fresh agent) -> security review (when the diff warrants) -> optional
 verification -> record the all-green marker -> merge -> verify it landed. Any
-gate returning `VERDICT: FAIL` loops back with a complete batch of findings;
+gate returning a structured FAIL result loops back with a complete batch of findings;
 the second failure in one component forces redesign instead of another narrow
 patch. Nothing merges red.
 
@@ -225,6 +230,14 @@ works too: asking to "orchestrate BL-90" or "run this ticket through the
 pipeline" triggers the `orchestrate-ticket` skill, which runs the same flow. Use
 the slash command when you want to be explicit; use plain English when you don't
 want to remember the syntax.
+
+Code and security gates use concise structured results: passing checks carry no
+explanation, while actual findings carry the actionable detail. See
+[reviewer output](docs/reviewer-output.md).
+
+For API execution, place repository-specific provider keys in the gitignored
+`.orchestration/.env` beside `config.yaml`. Cloud/container environment variables
+with the same names take precedence. See [API agent runner](docs/api-agent.md).
 
 `/gate <pr>` runs just the review gates on an existing PR. `/release` advances a
 configured release or candidate transition through the shared workflow engine.

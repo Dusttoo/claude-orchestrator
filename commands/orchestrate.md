@@ -21,6 +21,19 @@ workflow. Use `${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py adapter-pla
 transitions. For legacy configs, keep the existing implement -> review ->
 security -> verify -> merge-on-green flow below.
 
+Before every `design-reviewer`, `implementer`, `code-reviewer`,
+`security-reviewer`, or `visual-qa` launch, resolve that role through
+`${CLAUDE_PLUGIN_ROOT}/scripts/context_pipeline.py route --config
+.orchestration/config.yaml --role <role>`. A `desktop` route uses the existing
+native agent launch. An `api` route builds the request with
+`context_pipeline.py payload --config ... --role <role>` and pipes it to
+`${CLAUDE_PLUGIN_ROOT}/scripts/api_agent.py run --request - --config
+.orchestration/config.yaml --role <role>`, including the ticket/sprint/run id
+when available. The runner owns provider submission, limited tools, durable
+usage, and budget enforcement. Desktop fallback is legal only when the runner
+proves the API request failed before any provider/run id existed; submitted or
+uncertain work stays reserved for reconciliation and is never duplicated.
+
 **You are a lossy relay -- do not hand down stale facts.** Every hop from an
 agent's report into a brief into a durable doc can drop the uncertainty marker.
 Before you write anything into a brief or a durable artifact:
@@ -65,13 +78,18 @@ Steps:
 
 4. **Gate.** Run the gate pipeline on the resulting PR -- invoke
    `/orchestration:gate <pr>` (code-review, then security-review when the diff
-   hits a `security_required_when` trigger). Both must end `VERDICT: PASS`.
+   hits a `security_required_when` trigger). Both must return validated structured
+   PASS results with no blocking findings.
+   Give each reviewer the raw unified base-to-head git diff by default, not a
+   full-codebase index; only a named verification or regression may expand scope.
    - Reviewers finish the entire checklist and adversarial sweep and batch all
      findings, even after the first blocker.
    - The durable failure ledger owns the loop. Open it once
      (`${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py open <pr>`), paste
-     `review-ledger.py brief <pr>` into every reviewer brief, and record every
-     completed gate with `review-ledger.py record`. It normalizes each finding's
+     `review-ledger.py brief <pr>` into every reviewer brief, save the JSON under
+     `.orchestration/.review-results/`, and record every completed gate with
+     `review-ledger.py record <pr> --gate <gate> --result
+     .orchestration/.review-results/<gate>.json`. It normalizes each finding's
      `[component: <path>:<symbol>]` key, counts strikes across all gates and
      rounds, freezes blocking scope after round 1, and returns `next_action`.
    - `review` returns blocking findings to a fresh implementer; advisory findings

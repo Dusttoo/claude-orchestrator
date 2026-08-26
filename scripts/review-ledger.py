@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+import context_pipeline
+
 
 SCHEMA_VERSION = 1
 DEFAULT_MAX_ROUNDS = 3
@@ -312,6 +314,32 @@ def _component(state: dict[str, Any], key: str, raw: str, round_no: int) -> dict
 
 
 def cmd_record(args: argparse.Namespace) -> None:
+    finding_details: dict[str, dict[str, Any]] = {}
+    if args.result:
+        if args.verdict or args.blocking or args.advisory or args.regression:
+            raise LedgerError("--result cannot be combined with manual verdict or finding flags")
+        try:
+            structured = json.loads(Path(args.result).read_text(encoding="utf-8"))
+            context_pipeline.validate_review_output(structured, args.gate)
+        except (OSError, json.JSONDecodeError, context_pipeline.ContextError) as exc:
+            raise LedgerError(f"invalid structured review result: {exc}") from exc
+        args.verdict = structured["verdict"]
+        args.blocking = [
+            item["component"] for item in structured["findings"]
+            if item["disposition"] == "blocking"
+        ]
+        args.advisory = [
+            item["component"] for item in structured["findings"]
+            if item["disposition"] == "advisory"
+        ]
+        args.regression = [
+            item["component"] for item in structured["findings"] if item["regression"]
+        ]
+        finding_details = {
+            normalize_key(item["component"]): item for item in structured["findings"]
+        }
+    elif not args.verdict:
+        raise LedgerError("record requires either --result or --verdict")
     path = ledger_path(args)
     with locked(path):
         state = load(path)
@@ -353,6 +381,8 @@ def cmd_record(args: argparse.Namespace) -> None:
             component["display"] = raw.strip()
             component["last_round"] = round_no
             component["rounds"].append(round_no)
+            if key in finding_details:
+                component["finding"] = finding_details[key]
             if args.gate not in component["gates"]:
                 component["gates"].append(args.gate)
 
@@ -372,10 +402,18 @@ def cmd_record(args: argparse.Namespace) -> None:
                 resolved.append(key)
 
         advisories = [
-            {"key": normalize_key(raw), "display": raw.strip(), "reason": "reported-advisory"}
+            {
+                "key": normalize_key(raw), "display": raw.strip(),
+                "reason": "reported-advisory",
+                **({"finding": finding_details[normalize_key(raw)]} if normalize_key(raw) in finding_details else {}),
+            }
             for raw in args.advisory
         ] + [
-            {"key": key, "display": raw.strip(), "reason": "out-of-scope-in-frozen-round"}
+            {
+                "key": key, "display": raw.strip(),
+                "reason": "out-of-scope-in-frozen-round",
+                **({"finding": finding_details[key]} if key in finding_details else {}),
+            }
             for key, raw in demoted
         ]
         state.setdefault("advisories", []).extend(
@@ -514,6 +552,9 @@ def cmd_handoff(args: argparse.Namespace) -> None:
                 f"- `{component['key']}` -- {component['strikes']} strike(s), "
                 f"rounds {component['rounds']}, gates {', '.join(component['gates'])}"
             )
+            if component.get("finding"):
+                finding = component["finding"]
+                lines.append(f"  {finding['title']}: {finding['explanation']}")
     else:
         lines.append("- none")
     lines += ["", "## Round history"]
@@ -526,8 +567,11 @@ def cmd_handoff(args: argparse.Namespace) -> None:
     advisories = state.get("advisories", [])
     if advisories:
         lines += ["", "## Advisory (non-blocking, for follow-up)"]
-        for item in sorted({(a["key"], a["reason"]) for a in advisories}):
-            lines.append(f"- `{item[0]}` ({item[1]})")
+        for item in advisories:
+            lines.append(f"- `{item['key']}` ({item['reason']})")
+            if item.get("finding"):
+                finding = item["finding"]
+                lines.append(f"  {finding['title']}: {finding['explanation']}")
     lines += [
         "",
         "## Options",
@@ -622,7 +666,8 @@ def parser() -> argparse.ArgumentParser:
     record_parser = commands.add_parser("record", help="record one completed gate round")
     record_parser.add_argument("pr")
     record_parser.add_argument("--gate", required=True)
-    record_parser.add_argument("--verdict", required=True, choices=("PASS", "FAIL"))
+    record_parser.add_argument("--result", help="validated structured reviewer JSON file")
+    record_parser.add_argument("--verdict", choices=("PASS", "FAIL"))
     record_parser.add_argument(
         "--blocking", action="append", default=[], metavar="COMPONENT",
         help="a blocking finding's component key (repeatable)",
@@ -676,7 +721,7 @@ def main() -> int:
     try:
         args.func(args)
         return 0
-    except LedgerError as exc:
+    except (LedgerError, context_pipeline.ContextError) as exc:
         print(f"review-ledger: {exc}", file=sys.stderr)
         return 2
 

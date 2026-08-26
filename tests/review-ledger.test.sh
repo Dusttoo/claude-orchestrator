@@ -86,6 +86,18 @@ eq "a clean gate clears the loop" "gates-clear" "$(led record 6 --gate code-revi
 eq "advisory-only findings do not fail a gate" \
   "PASS" "$(led record 6 --gate code-review --verdict PASS --advisory 'src/x.ts:nit' | field effective_verdict)"
 
+# --- structured reviewer results ---------------------------------------------
+led open 10 >/dev/null
+cat > "$TMP/review.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"FAIL","checks":[{"name":"tests","status":"fail"}],"findings":[{"component":"src/a.ts:parse","disposition":"blocking","severity":"high","title":"Missing rejection","explanation":"Invalid input reaches parse and is accepted; reject it and add the regression assertion.","regression":true}]}
+JSON
+eq "structured results populate the durable ledger" \
+  "src/a.ts:parse" "$(led record 10 --gate code-review --result "$TMP/review.json" | field accepted_blocking)"
+led handoff 10 | grep -q "Invalid input reaches parse" && ok "finding-only explanation survives handoff" || bad "finding-only explanation survives handoff"
+if led record 10 --gate code-review --result "$TMP/review.json" --verdict FAIL >/dev/null 2>&1; then
+  bad "structured and manual review inputs must not be mixed"
+else ok "structured and manual review inputs cannot be mixed"; fi
+
 # --- contradictions are rejected ----------------------------------------------
 if led record 6 --gate code-review --verdict PASS --blocking 'src/a.ts:foo' >/dev/null 2>&1; then
   bad "a PASS listing blocking findings must be rejected"

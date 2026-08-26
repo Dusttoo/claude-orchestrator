@@ -15,7 +15,24 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    `$ARGUMENTS` when supplied), and `concurrency_max >= 1`. Missing Jira access is
    a user action and no worker may launch.
 
-2. Query Jira for the entire configured project/sprint, paginating to completion.
+   Before each lane launch, resolve `sprint-worker` with
+   `${CLAUDE_PLUGIN_ROOT}/scripts/context_pipeline.py route --config
+   .orchestration/config.yaml --role sprint-worker`. Desktop routes keep the
+   native/CLI worker path. API routes use the resolved provider, model, effort,
+   and batch behavior; foreground API workers run through `api_agent.py run`
+   with `--ticket`, `--sprint`, and a stable run id, while internal ticket roles
+   resolve their own overrides. A
+   desktop fallback may reuse the provisional reservation only when no
+   provider/run id was created. Uncertain API work remains reserved.
+
+2. Resolve `ticket.jira_fields` with
+   `${CLAUDE_PLUGIN_ROOT}/scripts/context_pipeline.py jira-fields`; when absent it
+   defaults to `key,summary,description,status,priority,components,subtasks,issuelinks`.
+   Pass its `fields` value explicitly on every Jira issue/search request. Query
+   Jira for the entire configured project/sprint, paginating to completion, then
+   run every issue response through `context_pipeline.py sanitize-jira` before
+   any ticket data enters model context. Never inject rendered fields, edit-meta,
+   changelogs, render schemas, or avatar links.
    Resolve `active` to an exact sprint id. Fetch configured dependency links and
    the statuses of dependencies outside the sprint. With
    `sprint_dependency_links`, a link is a dependency only when the current
@@ -63,6 +80,21 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    If neither launch mechanism exists, record `user_action` and preserve the
    reservation for reconciliation. After a real launch, run `attach --sprint <id>
    --ticket <key> --run-ref <actual-agent-ref>`.
+
+   For a lane explicitly marked `background: true` and `interactive: false`, do
+   not start an interactive worker. Use the resolved API route and assemble each
+   request with `context_pipeline.py payload --config
+   .orchestration/config.yaml --role sprint-worker`, preserving
+   role briefs -> rules docs -> stable
+   repository map -> dynamic ticket/diff order and its ephemeral cache boundary.
+   Put the jobs in one JSON `jobs` array and run `sprint-controller.py
+   prepare-batch --sprint <id> --jobs <file>`. The controller detects and rejects
+   interactive jobs, atomically reserves eligible lanes, and writes a
+   provider-native request plus a durable state marker under
+   `.orchestration/.sprint-state/`. Anthropic emits a Message Batches JSON body
+   for `POST /v1/messages/batches`; OpenAI emits Batch JSONL for upload and
+   `POST /v1/batches`. Reconcile results by `custom_id` and finish each ticket
+   normally. A prepared batch marker is not a completed ticket.
 
 6. On every worker result, immediately run `finish --sprint <id> --ticket <key>
    --outcome completed|blocked|user_action --summary <text> --pr <pr> --branch

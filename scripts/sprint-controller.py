@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -200,11 +201,16 @@ def load(path: Path) -> dict[str, Any]:
 
 def save(path: Path, state: dict[str, Any]) -> None:
     state["updated_at"] = now()
+    write_json(path, state)
+
+
+def write_json(path: Path, value: Any) -> None:
+    """Atomically persist JSON without changing the serialized API payload."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(state, handle, indent=2, sort_keys=True)
+            json.dump(value, handle, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -214,6 +220,22 @@ def save(path: Path, state: dict[str, Any]) -> None:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def write_jsonl(path: Path, values: list[dict[str, Any]]) -> None:
+    """Atomically persist an OpenAI Batch input file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            for value in values:
+                handle.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
     finally:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
@@ -426,6 +448,119 @@ def plan(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         emit(plan_value(state, cfg))
 
 
+def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    """Reserve background lanes and serialize an Anthropic Message Batch.
+
+    Submission remains a host operation so this controller never handles API
+    credentials. The request and marker make the asynchronous handoff durable.
+    """
+    path = state_path(cfg["state_dir"], str(args.sprint))
+    try:
+        source = json.loads(Path(args.jobs).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SprintError(f"cannot read batch jobs {args.jobs}: {exc}") from exc
+    raw_jobs = source.get("jobs") if isinstance(source, dict) else None
+    if not isinstance(raw_jobs, list) or not raw_jobs:
+        raise SprintError("batch jobs must be a non-empty object with a jobs array")
+    provider = str(source.get("provider", "anthropic")).strip().casefold()
+    if provider not in {"anthropic", "openai"}:
+        raise SprintError("batch provider must be anthropic or openai")
+
+    jobs: dict[str, dict[str, Any]] = {}
+    for job in raw_jobs:
+        if not isinstance(job, dict):
+            raise SprintError("each batch job must be an object")
+        key = normalize_key(job.get("ticket"))
+        if key in jobs:
+            raise SprintError(f"duplicate batch ticket: {key}")
+        if job.get("background") is not True or job.get("interactive") is not False:
+            raise SprintError(f"ticket {key} is not a non-interactive background job")
+        params = job.get("params")
+        if not isinstance(params, dict):
+            raise SprintError(f"ticket {key} batch params must be an object")
+        required = ("model", "max_tokens", "messages") if provider == "anthropic" else (
+            "model", "max_output_tokens", "input"
+        )
+        missing = [name for name in required if name not in params]
+        if missing:
+            raise SprintError(f"ticket {key} batch params missing: {', '.join(missing)}")
+        if params.get("stream"):
+            raise SprintError(f"ticket {key} batch params cannot enable streaming")
+        input_key = "messages" if provider == "anthropic" else "input"
+        if not isinstance(params.get(input_key), list) or not params[input_key]:
+            raise SprintError(f"ticket {key} batch {input_key} must be a non-empty array")
+        jobs[key] = params
+
+    batch_id = uuid.uuid4().hex[:16]
+    extension = "json" if provider == "anthropic" else "jsonl"
+    request_path = cfg["state_dir"] / f"batch-{batch_id}.request.{extension}"
+    marker_path = cfg["state_dir"] / f"batch-{batch_id}.state.json"
+    with locked(path):
+        state = load(path)
+        current_plan = plan_value(state, cfg)
+        launch_order = current_plan["launch"]
+        unexpected = sorted(set(jobs) - set(launch_order))
+        if unexpected:
+            raise SprintError(
+                "batch may contain only currently launchable tickets: " + ", ".join(unexpected)
+            )
+        ordered_keys = [key for key in launch_order if key in jobs]
+        requests = []
+        marker_jobs = []
+        for key in ordered_keys:
+            custom_id = f"ticket_{key.replace('-', '_')}_{batch_id}"
+            run_ref = f"anthropic-batch:{batch_id}:{custom_id}"
+            if provider == "anthropic":
+                requests.append({"custom_id": custom_id, "params": jobs[key]})
+            else:
+                requests.append(
+                    {"custom_id": custom_id, "method": "POST", "url": "/v1/responses", "body": jobs[key]}
+                )
+            marker_jobs.append({"ticket": key, "custom_id": custom_id, "run_ref": run_ref})
+            ticket = state["tickets"][key]
+            ticket["state"] = "running"
+            ticket["reason"] = ""
+            ticket["run_ref"] = run_ref
+            ticket["attempts"] += 1
+            ticket["history"].append(
+                {"at": now(), "event": "batch-reserved", "batch_id": batch_id, "custom_id": custom_id}
+            )
+        if not requests:
+            raise SprintError("none of the supplied batch jobs are currently launchable")
+        request = {"requests": requests}
+        endpoint = "/v1/messages/batches" if provider == "anthropic" else "/v1/batches"
+        marker = {
+            "schema_version": 1,
+            "batch_id": batch_id,
+            "sprint_id": state["sprint"]["id"],
+            "provider": provider,
+            "status": "pending_submission" if provider == "anthropic" else "pending_upload",
+            "endpoint": endpoint,
+            "request_file": str(request_path),
+            "provider_batch_id": "",
+            "jobs": marker_jobs,
+            "created_at": now(),
+            "updated_at": now(),
+        }
+        if provider == "anthropic":
+            write_json(request_path, request)
+        else:
+            write_jsonl(request_path, requests)
+        state.setdefault("batches", {})[batch_id] = marker
+        save(path, state)
+        write_json(marker_path, marker)
+    emit(
+        {
+            "batch_id": batch_id,
+            "provider": provider,
+            "status": marker["status"],
+            "request": str(request_path),
+            "marker": str(marker_path),
+            "tickets": ordered_keys,
+        }
+    )
+
+
 def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     path = state_path(cfg["state_dir"], str(args.sprint))
     key = normalize_key(args.ticket)
@@ -570,6 +705,12 @@ def parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name)
         command.add_argument("--sprint", required=True)
         command.set_defaults(func=func)
+    batch_parser = commands.add_parser(
+        "prepare-batch", help="serialize and reserve non-interactive background Message Batch jobs"
+    )
+    batch_parser.add_argument("--sprint", required=True)
+    batch_parser.add_argument("--jobs", required=True)
+    batch_parser.set_defaults(func=prepare_batch)
     reserve_parser = commands.add_parser("reserve")
     reserve_parser.add_argument("--sprint", required=True)
     reserve_parser.add_argument("--ticket", required=True)

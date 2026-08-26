@@ -19,6 +19,8 @@ reading them:
 - `../../agents/orchestration-design-reviewer.md`
 - `../../agents/orchestration-implementer.md`
 - `../../agents/orchestration-security-reviewer.md`
+- `../../scripts/context_pipeline.py`
+- `../../scripts/api_agent.py`
 - `../../scripts/merge-guard.sh`
 - `../../scripts/merge-on-green.sh`
 - `../../scripts/orchestration-engine.py`
@@ -30,6 +32,15 @@ Execute scripts by absolute path while keeping the target repository as the
 working directory.
 
 ## Procedure
+
+Before each `code-reviewer` or `security-reviewer` pass, resolve its route with
+`scripts/context_pipeline.py route --config .orchestration/config.yaml --role
+<role>`. Desktop routes use fresh native agents. API routes build their request
+with `context_pipeline.py payload --config ... --role <role>` and use the
+`api_agent.py run --request -` adapter with the ticket and a stable run id.
+Desktop fallback is allowed only before provider
+acknowledgement; submitted, timed-out, or uncertain work must be reconciled
+instead of duplicated.
 
 1. Read `.orchestration/config.yaml` and run
    `orchestration-engine.py validate-config`. For `schema_version: 2`, use
@@ -49,18 +60,22 @@ working directory.
 3. Run the code-review gate as a fresh review pass. If the host supports
    subagents, launch one with `orchestration-code-reviewer.md`; otherwise apply
    that brief yourself without using the implementer's reasoning as evidence.
+   Generate and pass the raw unified base-to-head git diff as the default and
+   authoritative code input, alongside only the ticket, configured rules docs,
+   stable repository map, and round brief. Do not pass a full-codebase index;
+   additional source is allowed only for a named verification or regression.
    The reviewer must finish the full checklist, diff, and adversarial matrix even
-   after finding a blocker, batch all findings, and end in `VERDICT: PASS` or
-   `VERDICT: FAIL`. Each finding must carry a stable `[component: ...]` key.
+   after finding a blocker, then return only concise structured review JSON.
+   Explanations belong only to findings; each finding has a stable component key.
 4. Inspect the PR diff against `security_required_when`. If any trigger matches,
-   run a fresh security-review pass using `orchestration-security-reviewer.md`.
+   run a fresh security-review pass using `orchestration-security-reviewer.md`
+   with the same raw unified diff and diff-isolated context.
    If nothing matches, record that the security gate was skipped because the diff
    has no configured security surface.
 5. Record every completed gate through the ledger, blocking and advisory findings
-   alike: `review-ledger.py record <pr> --gate code-review --verdict FAIL
-   --blocking "src/auth/session.ts:refreshToken" --advisory "src/ui/Badge.tsx:Badge"`.
-   Pass `--regression <key>` for any blocking finding the reviewer marked
-   `REGRESSION`. The ledger increments strikes, auto-resolves components this gate
+   alike: `review-ledger.py record <pr> --gate code-review --result
+   .orchestration/.review-results/code-review.json`. The validated JSON carries
+   disposition, severity, regression, and explanation. The ledger increments strikes, auto-resolves components this gate
    no longer reports, demotes out-of-scope new findings in a frozen round, and
    returns `next_action`. Its `effective_verdict` governs, not the claimed one.
 6. Act on `next_action`. Never merge while a blocking component is open.

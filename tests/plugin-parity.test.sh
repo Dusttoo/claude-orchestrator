@@ -34,7 +34,7 @@ contains_contract() {
   local label="$1" pattern="$2"; shift 2
   local file
   for file in "$@"; do
-    if ! rg -q "$pattern" "$ROOT/$file"; then
+    if ! rg -q -- "$pattern" "$ROOT/$file"; then
       fail_case "$label missing from $file"
       return
     fi
@@ -54,11 +54,34 @@ contains_contract "three-way sprint summary" 'user-action' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "optional sprint ticket priority ordering" 'priority' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "pruned Jira field requests" 'jira_fields' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "sanitized Jira context" 'sanitize-jira' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "asynchronous Anthropic sprint batches" 'prepare-batch' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "per-role sprint execution routing" 'context_pipeline\.py route' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "budgeted API sprint runner" 'api_agent\.py run' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 
 contains_contract "durable review ledger" 'review-ledger\.py' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
   commands/gate.md skills/gate-pr/SKILL.md
+contains_contract "structured reviewer result recording" '--result' \
+  commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
+  commands/gate.md skills/gate-pr/SKILL.md
 contains_contract "bounded review loop" 'escalate-human' \
+  commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
+  commands/gate.md skills/gate-pr/SKILL.md
+contains_contract "per-role ticket execution routing" 'context_pipeline\.py route' \
+  commands/orchestrate.md skills/orchestrate-ticket/SKILL.md
+contains_contract "per-role gate execution routing" 'context_pipeline\.py route' \
+  commands/gate.md skills/gate-pr/SKILL.md
+contains_contract "constrained API ticket runner" 'api_agent\.py run' \
+  commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
+  commands/gate.md skills/gate-pr/SKILL.md
+contains_contract "safe pre-acknowledgement fallback" 'uncertain' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
   commands/gate.md skills/gate-pr/SKILL.md
 

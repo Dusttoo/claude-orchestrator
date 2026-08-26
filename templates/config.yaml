@@ -26,6 +26,70 @@
 # explicitly migrate to schema_version: 2.
 schema_version: 1
 
+# --- LLM execution routing ---------------------------------------------- agent
+# Existing repositories remain on desktop execution unless they opt into API.
+# Provider/model/effort are used only by API routes. A role inherits every
+# unspecified global field and may override any field independently.
+#
+# `fallback: desktop` is deliberately narrow: use it only when an API request
+# failed before receiving any provider/run id. A submitted, accepted, or
+# uncertain request keeps its API reservation and must be reconciled; launching
+# a desktop fallback then could duplicate writes, PRs, or billing.
+llm:
+  execution: desktop             # desktop | api
+  provider: anthropic            # anthropic | openai
+  model: ""                      # required when effective execution is api
+  effort: ""                     # optional: low | medium | high | xhigh | max
+  fallback: none                 # desktop | none; applies only to API launch
+  # Hard ceilings are checked before every provider request. The runner reserves
+  # the request's counted input plus its full output allowance, so concurrent
+  # workers cannot race past a shared ticket or sprint limit.
+  budgets:
+    max_usd_per_run: 1.00
+    max_usd_per_ticket: 2.00
+    max_usd_per_sprint: 20.00
+    max_output_tokens_per_turn: 4096
+    max_tool_rounds: 8
+    max_tool_output_chars: 12000
+    tool_timeout_seconds: 300
+    max_pre_ack_retries: 2       # only explicit rate-limit/overload rejections
+    retry_backoff_seconds: 1
+  # Rates are USD per million tokens and are deliberately explicit: an unknown
+  # model fails closed instead of being costed with a guessed price. Verify rates
+  # when upgrading the plugin/model. These entries were checked 2026-08-26.
+  pricing:
+    claude-sonnet-5:
+      input_per_mtok: 2.00
+      cache_write_per_mtok: 2.50
+      cache_read_per_mtok: 0.20
+      output_per_mtok: 10.00
+    gpt-5.6-sol:
+      input_per_mtok: 4.00
+      cache_write_per_mtok: 5.00
+      cache_read_per_mtok: 0.40
+      output_per_mtok: 20.00
+      long_context_threshold_tokens: 272000
+      long_context_input_multiplier: 2.00
+      long_context_output_multiplier: 1.50
+  roles:
+    # implementer:
+    #   execution: api
+    #   provider: anthropic
+    #   model: claude-sonnet-5
+    #   effort: high
+    #   fallback: desktop
+    #   allowed_tools: [read_file, search, git_diff, git_status, run_check, apply_patch]
+    # code-reviewer:
+    #   execution: api
+    #   provider: openai
+    #   model: gpt-5.6-sol
+    #   effort: medium
+    #   allowed_tools: [read_file, search, git_diff, git_status, run_check]
+    # security-reviewer:
+    #   execution: desktop
+    # visual-qa:
+    #   execution: desktop        # API runner is text/code only; keep visual QA native
+
 # --- Branch model --------------------------------------------------------- both
 integration_branch: ""          # fill for schema v1, e.g. the branch feature work targets
 production_branch: ""           # fill for schema v1, e.g. the protected release/history target
@@ -73,6 +137,11 @@ self_check:
   # Example repo-specific convention (delete if not applicable):
   # - name: no-hex-in-components
   #   run: '! grep -rqn "#[0-9a-fA-F]\{3,\}" src/components'
+
+# Successful command output is discarded. On failure, gates emit only this many
+# trailing lines into model context and retain the full 0600 log under
+# .orchestration/.gate-logs for an explicit diagnostic check.
+gate_log_lines: 80
 
 # --- Heavy / optional verification --------------------------------------- agent
 # Named headless pass/fail suites (e.g. the full e2e run). Opt-in: they assume a
@@ -136,6 +205,18 @@ security_required_when:
 ticket:
   kind: none                  # jira | github | none
   project: ""                 # optional tracker project/key; unused when kind=none
+  # Jira adapters MUST pass this list as the API's `fields` parameter, then run
+  # the response through scripts/context_pipeline.py sanitize-jira before any
+  # ticket text enters model context. Omit jira_fields to use the same defaults.
+  jira_fields:
+    - key
+    - summary
+    - description
+    - status
+    - priority
+    - components
+    - subtasks
+    - issuelinks
 
 # --- Sprint orchestration ------------------------------------------------- agent
 # Used by orchestrate-sprint when ticket.kind is jira. `active` is resolved to an

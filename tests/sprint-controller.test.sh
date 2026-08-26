@@ -140,6 +140,54 @@ JSON
 run_fail "duplicate normalized Jira keys fail closed" "$CONTROLLER" sync --inventory duplicate.json
 run_fail "checkpoint directory cannot escape the repository" "$CONTROLLER" --state-dir ../outside sync --inventory inventory.json
 
+cat > "$TMP/repo/batch-inventory.json" <<'JSON'
+{"project":"PROJ","sprint":{"id":"45","name":"batch"},"source_query":"q","tickets":[{"key":"PROJ-40","summary":"batch one","status":"Ready","dependencies":[]},{"key":"PROJ-41","summary":"batch two","status":"Ready","dependencies":[]}]}
+JSON
+cat > "$TMP/repo/batch-jobs.json" <<'JSON'
+{"jobs":[{"ticket":"PROJ-40","background":true,"interactive":false,"params":{"model":"claude-test","max_tokens":100,"system":[{"type":"text","text":"cached","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"ticket 40"}]}},{"ticket":"PROJ-41","background":true,"interactive":false,"params":{"model":"claude-test","max_tokens":100,"messages":[{"role":"user","content":"ticket 41"}]}}]}
+JSON
+run_ok "batch sprint inventory syncs" "$CONTROLLER" sync --inventory batch-inventory.json
+"$CONTROLLER" prepare-batch --sprint 45 --jobs batch-jobs.json > "$TMP/batch-result.json"
+json_check "non-interactive background lanes serialize as one Message Batch" "$TMP/batch-result.json" 'data["status"] == "pending_submission" and data["tickets"] == ["PROJ-40", "PROJ-41"]'
+python3 - "$TMP/batch-result.json" <<'PY'
+import json, sys
+result=json.load(open(sys.argv[1]))
+request=json.load(open(result["request"]))
+marker=json.load(open(result["marker"]))
+assert len(request["requests"]) == 2
+assert all(set(item) == {"custom_id", "params"} for item in request["requests"])
+assert marker["endpoint"] == "/v1/messages/batches"
+assert marker["status"] == "pending_submission"
+PY
+if [ "$?" -eq 0 ]; then ok "batch request and durable state marker match Anthropic shape"; else fail_case "batch request and durable state marker match Anthropic shape"; fi
+"$CONTROLLER" plan --sprint 45 > "$TMP/batch-plan.json"
+json_check "serialized batch jobs atomically reserve their sprint lanes" "$TMP/batch-plan.json" 'data["launch"] == [] and data["running"] == ["PROJ-40", "PROJ-41"]'
+
+cat > "$TMP/repo/interactive-job.json" <<'JSON'
+{"jobs":[{"ticket":"PROJ-40","background":true,"interactive":true,"params":{"model":"claude-test","max_tokens":10,"messages":[{"role":"user","content":"x"}]}}]}
+JSON
+run_fail "interactive work is rejected from asynchronous batching" "$CONTROLLER" prepare-batch --sprint 45 --jobs interactive-job.json
+
+cat > "$TMP/repo/openai-inventory.json" <<'JSON'
+{"project":"PROJ","sprint":{"id":"46","name":"openai batch"},"source_query":"q","tickets":[{"key":"PROJ-50","summary":"openai lane","status":"Ready","dependencies":[]}]}
+JSON
+cat > "$TMP/repo/openai-jobs.json" <<'JSON'
+{"provider":"openai","jobs":[{"ticket":"PROJ-50","background":true,"interactive":false,"params":{"model":"gpt-test","max_output_tokens":100,"input":[{"role":"developer","content":"stable"},{"role":"user","content":"ticket 50"}]}}]}
+JSON
+run_ok "OpenAI batch sprint inventory syncs" "$CONTROLLER" sync --inventory openai-inventory.json
+"$CONTROLLER" prepare-batch --sprint 46 --jobs openai-jobs.json > "$TMP/openai-batch-result.json"
+python3 - "$TMP/openai-batch-result.json" <<'PY'
+import json, sys
+result=json.load(open(sys.argv[1]))
+assert result["provider"] == "openai" and result["status"] == "pending_upload"
+line=json.loads(open(result["request"]).readline())
+marker=json.load(open(result["marker"]))
+assert set(line) == {"custom_id", "method", "url", "body"}
+assert line["method"] == "POST" and line["url"] == "/v1/responses"
+assert marker["endpoint"] == "/v1/batches" and marker["provider"] == "openai"
+PY
+if [ "$?" -eq 0 ]; then ok "OpenAI background lanes serialize to Batch JSONL"; else fail_case "OpenAI background lanes serialize to Batch JSONL"; fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi
 [ "$fails" -eq 0 ]
