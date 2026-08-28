@@ -29,6 +29,10 @@ llm:
       effort: medium
     security-reviewer:
       execution: desktop
+    sprint-worker:
+      execution: api
+      provider: azure_adm
+      model: grok-4-6-eval
 ```
 
 Role overrides inherit each omitted field from `llm`. Built-in role names are
@@ -46,6 +50,9 @@ scripts/context_pipeline.py route --config .orchestration/config.yaml \
 - `execution: api` builds the provider request with `context_pipeline.py payload
   --config ... --role ...`, then submits it through `api_agent.py run`. The
   runner owns the constrained tool-call loop, usage ledger, and budget stops.
+- `provider: azure_adm` uses Azure's OpenAI-compatible Chat Completions endpoint.
+  Set `AZURE_ADM_API_KEY` and the resource-specific `AZURE_ADM_BASE_URL`; route
+  `model` values to Azure deployment names.
 - Batch jobs use the same resolved provider/model route before
   `sprint-controller.py prepare-batch` persists the provider-native request.
 

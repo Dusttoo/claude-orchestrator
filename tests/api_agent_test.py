@@ -112,18 +112,35 @@ self_check:
             "export ANTHROPIC_API_KEY='repo-key'\n"
             "ANTHROPIC_BASE_URL=https://proxy.example/v1 # optional proxy\n"
             "OPENAI_API_KEY=repo-openai\n"
+            "AZURE_ADM_API_KEY=repo-azure\n"
+            "AZURE_ADM_BASE_URL=https://resource.openai.azure.com/openai/v1\n"
             "PATH=/untrusted/path\n",
             encoding="utf-8",
         )
         with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "container-key"}, clear=False):
             os.environ.pop("ANTHROPIC_BASE_URL", None)
             os.environ.pop("OPENAI_API_KEY", None)
+            os.environ.pop("AZURE_ADM_API_KEY", None)
+            os.environ.pop("AZURE_ADM_BASE_URL", None)
             loaded = api_agent.load_orchestration_env(config)
             self.assertEqual(os.environ["ANTHROPIC_API_KEY"], "container-key")
             self.assertEqual(os.environ["ANTHROPIC_BASE_URL"], "https://proxy.example/v1")
             self.assertEqual(os.environ["OPENAI_API_KEY"], "repo-openai")
+            self.assertEqual(os.environ["AZURE_ADM_API_KEY"], "repo-azure")
+            self.assertEqual(
+                os.environ["AZURE_ADM_BASE_URL"],
+                "https://resource.openai.azure.com/openai/v1",
+            )
             self.assertNotEqual(os.environ.get("PATH"), "/untrusted/path")
-            self.assertEqual(loaded, ["ANTHROPIC_BASE_URL", "OPENAI_API_KEY"])
+            self.assertEqual(
+                loaded,
+                [
+                    "ANTHROPIC_BASE_URL",
+                    "OPENAI_API_KEY",
+                    "AZURE_ADM_API_KEY",
+                    "AZURE_ADM_BASE_URL",
+                ],
+            )
 
     def test_repository_env_rejects_shell_syntax(self):
         config = self.config()
@@ -226,6 +243,82 @@ self_check:
         self.assertEqual(response_calls[1][2]["input"][0]["type"], "function_call_output")
         self.assertEqual(response_calls[1][2]["text"], {"verbosity": "low"})
         self.assertIn("apply_patch", {tool["name"] for tool in response_calls[0][2]["tools"]})
+
+    def test_azure_adm_chat_completion_tool_loop(self):
+        transport = FakeTransport(
+            [
+                {
+                    "id": "chat_1",
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "git_status", "arguments": "{}"},
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 80, "completion_tokens": 8},
+                },
+                {
+                    "id": "chat_2",
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "done"},
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 70,
+                        "prompt_tokens_details": {"cached_tokens": 40},
+                        "completion_tokens": 4,
+                        "completion_tokens_details": {"reasoning_tokens": 2},
+                    },
+                },
+            ]
+        )
+        config = self.config(
+            provider="azure_adm",
+            extra="    implementer:\n      allowed_tools: [read_file, search, git_diff, git_status, run_check, apply_patch]",
+        )
+        agent = api_agent.ApiAgent(
+            root=self.root,
+            config_path=config,
+            role="implementer",
+            ticket="PROJ-3",
+            sprint=None,
+            run_id="azure-adm-run",
+            transport=transport,
+        )
+        result = agent.run(
+            {
+                "model": "test-model",
+                "max_completion_tokens": 100,
+                "messages": [{"role": "user", "content": "work"}],
+            }
+        )
+        chat_calls = [call for call in transport.calls if call[1] == "chat/completions"]
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["output_text"], "done")
+        self.assertEqual(len(chat_calls), 2)
+        self.assertFalse(any(call[1].endswith("input_tokens") for call in transport.calls))
+        self.assertIn(
+            "apply_patch",
+            {tool["function"]["name"] for tool in chat_calls[0][2]["tools"]},
+        )
+        self.assertEqual(chat_calls[1][2]["messages"][-1]["role"], "tool")
+        self.assertEqual(chat_calls[1][2]["messages"][-1]["tool_call_id"], "call_1")
+        summary = agent.ledger.summary()
+        self.assertEqual(summary["input_tokens"], 110)
+        self.assertEqual(summary["cache_read_tokens"], 40)
+        self.assertEqual(summary["output_tokens"], 12)
 
     def test_budget_blocks_before_provider_submission(self):
         transport = FakeTransport([], count=2_000_000)

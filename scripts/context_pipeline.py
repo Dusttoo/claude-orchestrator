@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build compact Anthropic/OpenAI payloads and prune Jira responses.
+"""Build compact Anthropic/OpenAI/Azure ADM payloads and prune Jira responses.
 
 This module is deliberately transport-neutral: host adapters own credentials and
 HTTP, while this layer owns stable prompt ordering, cache boundaries, Jira field
@@ -44,7 +44,7 @@ DROP_JIRA_KEYS = {
 ROUTE_FIELDS = {"execution", "provider", "fallback", "model", "effort", "allowed_tools"}
 LLM_POLICY_BLOCKS = {"budgets", "pricing"}
 EXECUTIONS = {"desktop", "api"}
-PROVIDERS = {"anthropic", "openai"}
+PROVIDERS = {"anthropic", "openai", "azure_adm"}
 FALLBACKS = {"desktop", "none"}
 EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 REVIEW_MODES = {"code-review", "security-review"}
@@ -244,7 +244,9 @@ def _validate_route(route: dict[str, Any], role: str) -> dict[str, Any]:
     if execution not in EXECUTIONS:
         raise ContextError(f"llm route {role} execution must be desktop or api")
     if provider not in PROVIDERS:
-        raise ContextError(f"llm route {role} provider must be anthropic or openai")
+        raise ContextError(
+            f"llm route {role} provider must be anthropic, openai, or azure_adm"
+        )
     if fallback not in FALLBACKS:
         raise ContextError(f"llm route {role} fallback must be desktop or none")
     if effort and effort not in EFFORTS:
@@ -555,6 +557,26 @@ def openai_payload(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def azure_adm_payload(args: argparse.Namespace) -> dict[str, Any]:
+    """Return an OpenAI-compatible Chat Completions body for Azure Direct Models."""
+    stable, dynamic = ordered_context(args)
+    system = "\n\n".join(stable)
+    if args.mode in REVIEW_MODES:
+        system += (
+            "\n\nReturn only a JSON object matching this schema. Do not wrap it in "
+            "Markdown or add commentary:\n"
+            + json.dumps(review_output_schema(args.mode), separators=(",", ":"))
+        )
+    return {
+        "model": args.model,
+        "max_completion_tokens": args.max_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": dynamic},
+        ],
+    }
+
+
 def provider_payload(args: argparse.Namespace) -> dict[str, Any]:
     if args.config:
         if not args.role:
@@ -573,12 +595,14 @@ def provider_payload(args: argparse.Namespace) -> dict[str, Any]:
         raise ContextError("--model is required without an API route config")
     if args.provider == "anthropic":
         return anthropic_payload(args)
+    if args.provider == "azure_adm":
+        return azure_adm_payload(args)
     return openai_payload(args)
 
 
 def add_payload_arguments(command: argparse.ArgumentParser, provider: bool = True) -> None:
     if provider:
-        command.add_argument("--provider", choices=["anthropic", "openai"])
+        command.add_argument("--provider", choices=["anthropic", "openai", "azure_adm"])
     command.add_argument("--config", help="resolve provider/model/effort from an API role route")
     command.add_argument("--role", help="role to resolve when --config is used")
     command.add_argument("--role-file", action="append", default=[], required=True)
