@@ -38,8 +38,8 @@ Only define the provider the repository uses. Optional custom endpoints are
 Azure Direct Models. The Azure `model` route value is the deployment name. The
 runner parses this file as data; it does not execute shell syntax or expand
 variables. Only the documented provider names are loaded. Variables already
-supplied by a cloud container or host environment take precedence, making
-platform secret injection the highest-priority source.
+supplied by a cloud container or host environment take precedence, making platform secret injection
+the highest-priority source.
 
 Always gitignore `.orchestration/.env`. Keys are never copied into
 `config.yaml`, run state, logs, or the usage ledger.
