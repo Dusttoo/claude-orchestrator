@@ -44,9 +44,19 @@ platform secret injection the highest-priority source.
 Always gitignore `.orchestration/.env`. Keys are never copied into
 `config.yaml`, run state, logs, or the usage ledger.
 
-The runner retries token-count calls and explicit provider rate-limit/overload
-rejections up to `max_pre_ack_retries`, with bounded backoff. It never retries a
-model submission timeout or another ambiguous transport/server outcome.
+The runner retries explicit provider rate-limit rejections independently from
+other pre-ack failures. For HTTP 429 it honors Azure's `retry-after-ms` or
+`Retry-After` header. If neither is present, it uses bounded exponential backoff
+with jitter, up to `max_rate_limit_retries` and
+`max_rate_limit_wait_seconds`. Known-not-accepted 429 requests reuse the same
+reservation and client request id. Explicit overload rejections use the smaller
+`max_pre_ack_retries` policy. The runner never retries a model submission
+timeout or another ambiguous transport/server outcome.
+
+Rate-limit retries preserve a ticket lane instead of losing its checkpoint, but
+they do not create throughput. Size TPM for the configured concurrency and keep
+`max_completion_tokens` close to expected output because Azure may include the
+maximum output allowance in its rate-limit estimate.
 
 ## Role-limited tools
 

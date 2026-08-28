@@ -53,7 +53,7 @@ check "implementers are not forced into the reviewer schema" '"text" not in data
   --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" \
   --mode code-review --execution gate --model grok-eval > "$TMP/azure-adm.json"
 check "Azure ADM payload uses Chat Completions messages" 'data["model"] == "grok-eval" and data["messages"][0]["role"] == "system" and data["messages"][1]["role"] == "user" and data["max_completion_tokens"] == 8192' "$TMP/azure-adm.json"
-check "Azure ADM reviewer contract is embedded for text-only model compatibility" '"Return only a JSON object" in data["messages"][0]["content"] and "code-review" in data["messages"][0]["content"]' "$TMP/azure-adm.json"
+check "Azure ADM reviewer contract brackets dynamic context for MAI compatibility" '"Your entire final response must be exactly one JSON object" in data["messages"][0]["content"] and "Your entire final response must be exactly one JSON object" in data["messages"][1]["content"] and data["messages"][1]["content"].rstrip().endswith("}") and "code-review" in data["messages"][0]["content"]' "$TMP/azure-adm.json"
 
 cat > "$TMP/pass-review.json" <<'JSON'
 {"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[{"name":"acceptance coverage","status":"pass"}],"findings":[]}

@@ -15,6 +15,7 @@ import fcntl
 import importlib.util
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -50,7 +51,10 @@ DEFAULT_BUDGETS = {
     "max_tool_output_chars": 12000,
     "tool_timeout_seconds": 300,
     "max_pre_ack_retries": 2,
-    "retry_backoff_seconds": 1,
+    "max_rate_limit_retries": 8,
+    "max_rate_limit_wait_seconds": 600,
+    "retry_backoff_seconds": 2,
+    "retry_max_backoff_seconds": 60,
 }
 CREDENTIAL_ENV_KEYS = {
     "ANTHROPIC_API_KEY",
@@ -71,10 +75,11 @@ class BudgetError(AgentError):
 
 
 class ProviderHTTPError(AgentError):
-    def __init__(self, status: int, body: str):
+    def __init__(self, status: int, body: str, retry_after_seconds: float | None = None):
         super().__init__(f"provider returned HTTP {status}: {body[:500]}")
         self.status = status
         self.body = body
+        self.retry_after_seconds = retry_after_seconds
 
 
 def load_orchestration_env(config_path: Path) -> list[str]:
@@ -293,10 +298,15 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
         "max_tool_output_chars",
         "tool_timeout_seconds",
         "max_pre_ack_retries",
+        "max_rate_limit_retries",
+        "max_rate_limit_wait_seconds",
         "retry_backoff_seconds",
+        "retry_max_backoff_seconds",
     ):
         if key in raw:
-            minimum = 0 if key in {"max_pre_ack_retries", "retry_backoff_seconds"} else 1
+            minimum = 0 if key in {
+                "max_pre_ack_retries", "max_rate_limit_retries", "retry_backoff_seconds"
+            } else 1
             result[key] = int_value(raw[key], f"llm.budgets.{key}", minimum=minimum)
     if result["max_usd_per_run"] <= 0:
         raise AgentError("llm.budgets.max_usd_per_run must be greater than zero")
@@ -571,7 +581,17 @@ class HttpTransport:
                 body = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            raise ProviderHTTPError(exc.code, body) from exc
+            retry_after = None
+            raw_ms = exc.headers.get("retry-after-ms") if exc.headers else None
+            raw_seconds = exc.headers.get("Retry-After") if exc.headers else None
+            try:
+                if raw_ms is not None:
+                    retry_after = max(0.0, float(raw_ms) / 1000.0)
+                elif raw_seconds is not None:
+                    retry_after = max(0.0, float(raw_seconds))
+            except ValueError:
+                retry_after = None
+            raise ProviderHTTPError(exc.code, body, retry_after) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise ProviderAmbiguous(f"provider submission outcome is unknown: {exc}") from exc
         try:
@@ -1019,10 +1039,12 @@ class ApiAgent:
             "anthropic": "messages",
             "azure_adm": "chat/completions",
         }.get(self.provider, "responses")
-        attempts = self.budgets["max_pre_ack_retries"] + 1
         response = None
+        rate_limit_retries = 0
+        overload_retries = 0
+        rate_limit_wait = 0.0
         try:
-            for attempt in range(attempts):
+            while True:
                 try:
                     response = self.transport.request(
                         self.provider, endpoint, body, idempotency_key=reservation
@@ -1032,10 +1054,38 @@ class ApiAgent:
                     # A returned rate-limit/overload rejection is known not to
                     # have started model work. Retry only those explicit cases,
                     # preserving the same idempotency key and reservation.
-                    if exc.status not in {429, 529} or attempt + 1 >= attempts:
+                    if exc.status == 429:
+                        if rate_limit_retries >= self.budgets["max_rate_limit_retries"]:
+                            raise
+                        if exc.retry_after_seconds is not None:
+                            delay = exc.retry_after_seconds
+                        else:
+                            base = self.budgets["retry_backoff_seconds"] * (2 ** rate_limit_retries)
+                            delay = min(base, self.budgets["retry_max_backoff_seconds"])
+                            if delay:
+                                delay += random.uniform(0, min(1.0, delay * 0.1))
+                        if rate_limit_wait + delay > self.budgets["max_rate_limit_wait_seconds"]:
+                            raise
+                        rate_limit_retries += 1
+                        rate_limit_wait += delay
+                        self._save(
+                            retry_count=rate_limit_retries,
+                            last_retry_status=exc.status,
+                            last_retry_delay_seconds=round(delay, 3),
+                            total_rate_limit_wait_seconds=round(rate_limit_wait, 3),
+                        )
+                        time.sleep(delay)
+                        continue
+                    if exc.status != 529 or overload_retries >= self.budgets["max_pre_ack_retries"]:
                         raise
-                    self._save(retry_count=attempt + 1, last_retry_status=exc.status)
-                    time.sleep(self.budgets["retry_backoff_seconds"] * (attempt + 1))
+                    overload_retries += 1
+                    delay = self.budgets["retry_backoff_seconds"] * overload_retries
+                    self._save(
+                        overload_retry_count=overload_retries,
+                        last_retry_status=exc.status,
+                        last_retry_delay_seconds=delay,
+                    )
+                    time.sleep(delay)
         except ProviderHTTPError as exc:
             if (400 <= exc.status < 500 and exc.status not in {408, 409}) or exc.status == 529:
                 self.ledger.release(reservation, self.run_id, f"provider rejected HTTP {exc.status}")

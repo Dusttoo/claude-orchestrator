@@ -343,14 +343,37 @@ self_check:
             ]
         )
         agent = self.agent(transport, run_id="retry-run")
-        result = agent.run(
-            {"model": "test-model", "max_tokens": 100, "system": [], "messages": [{"role": "user", "content": "review"}]}
-        )
+        with mock.patch.object(api_agent.time, "sleep") as sleep:
+            result = agent.run(
+                {"model": "test-model", "max_tokens": 100, "system": [], "messages": [{"role": "user", "content": "review"}]}
+            )
         message_calls = [call for call in transport.calls if call[1] == "messages"]
         self.assertEqual(result["status"], "completed")
         self.assertEqual(len(message_calls), 2)
         self.assertEqual(message_calls[0][3], message_calls[1][3])
         self.assertEqual(agent.state["retry_count"], 1)
+        sleep.assert_called_once_with(0)
+
+    def test_rate_limit_honors_provider_retry_after(self):
+        transport = FakeTransport(
+            [
+                api_agent.ProviderHTTPError(429, "rate limited", retry_after_seconds=17.5),
+                {
+                    "id": "msg_after_retry_after",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 100, "output_tokens": 2},
+                    "content": [{"type": "text", "text": CLEAN_REVIEW}],
+                },
+            ]
+        )
+        agent = self.agent(transport, run_id="retry-after-run")
+        with mock.patch.object(api_agent.time, "sleep") as sleep:
+            result = agent.run(
+                {"model": "test-model", "max_tokens": 100, "system": [], "messages": [{"role": "user", "content": "review"}]}
+            )
+        self.assertEqual(result["status"], "completed")
+        sleep.assert_called_once_with(17.5)
+        self.assertEqual(agent.state["total_rate_limit_wait_seconds"], 17.5)
 
     def test_reviewer_output_fails_closed_when_not_structured(self):
         transport = FakeTransport(

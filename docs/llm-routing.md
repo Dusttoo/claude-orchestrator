@@ -53,6 +53,11 @@ scripts/context_pipeline.py route --config .orchestration/config.yaml \
 - `provider: azure_adm` uses Azure's OpenAI-compatible Chat Completions endpoint.
   Set `AZURE_ADM_API_KEY` and the resource-specific `AZURE_ADM_BASE_URL`; route
   `model` values to Azure deployment names.
+- Azure Direct Model review payloads repeat the strict JSON-only result contract
+  as both a system instruction and the final user instruction. This supports
+  deployments such as MAI-Thinking that do not enable structured
+  `response_format`; the runner still validates the object and fails closed on
+  surrounding prose.
 - Batch jobs use the same resolved provider/model route before
   `sprint-controller.py prepare-batch` persists the provider-native request.
 

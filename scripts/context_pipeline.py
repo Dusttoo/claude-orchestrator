@@ -562,11 +562,18 @@ def azure_adm_payload(args: argparse.Namespace) -> dict[str, Any]:
     stable, dynamic = ordered_context(args)
     system = "\n\n".join(stable)
     if args.mode in REVIEW_MODES:
-        system += (
-            "\n\nReturn only a JSON object matching this schema. Do not wrap it in "
-            "Markdown or add commentary:\n"
+        contract = (
+            "FINAL RESPONSE CONTRACT: Your entire final response must be exactly one JSON "
+            "object beginning with { and ending with }. Do not emit analysis, Markdown, a "
+            "heading, commentary, or a code fence before or after the object. The object must "
+            "match this schema: "
             + json.dumps(review_output_schema(args.mode), separators=(",", ":"))
         )
+        system += "\n\n" + contract
+        # Some Azure Direct Models follow the most recent instruction more
+        # reliably than a long system prefix. Repeat the contract after the
+        # dynamic diff so it is the final instruction before generation.
+        dynamic += "\n\n" + contract
     return {
         "model": args.model,
         "max_completion_tokens": args.max_tokens,
