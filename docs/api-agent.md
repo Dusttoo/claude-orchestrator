@@ -4,8 +4,8 @@
 route. Claude Code or Codex Desktop can remain the interactive controller: it
 builds the role payload, launches this runner as a child process, reports its
 state, and asks the user for any required approval. The worker model traffic is
-billed to the configured Anthropic or OpenAI API account rather than the desktop
-agent surface.
+billed to the configured Anthropic, OpenAI, or Azure Direct Model account rather
+than the desktop agent surface.
 
 ## Run one role
 
@@ -29,20 +29,34 @@ Put repository-specific provider credentials in `.orchestration/.env`, beside
 ```dotenv
 ANTHROPIC_API_KEY=your-anthropic-key
 OPENAI_API_KEY=your-openai-key
+AZURE_ADM_API_KEY=your-azure-resource-key
+AZURE_ADM_BASE_URL=https://your-resource.openai.azure.com/openai/v1
 ```
 
 Only define the provider the repository uses. Optional custom endpoints are
-`ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`. The runner parses this file as data;
-it does not execute shell syntax or expand variables. Only those four names are
-loaded. Variables already supplied by a cloud container or host environment
-take precedence, making platform secret injection the highest-priority source.
+`ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`; `AZURE_ADM_BASE_URL` is required for
+Azure Direct Models. The Azure `model` route value is the deployment name. The
+runner parses this file as data; it does not execute shell syntax or expand
+variables. Only the documented provider names are loaded. Variables already
+supplied by a cloud container or host environment take precedence, making platform secret injection
+the highest-priority source.
 
 Always gitignore `.orchestration/.env`. Keys are never copied into
 `config.yaml`, run state, logs, or the usage ledger.
 
-The runner retries token-count calls and explicit provider rate-limit/overload
-rejections up to `max_pre_ack_retries`, with bounded backoff. It never retries a
-model submission timeout or another ambiguous transport/server outcome.
+The runner retries explicit provider rate-limit rejections independently from
+other pre-ack failures. For HTTP 429 it honors Azure's `retry-after-ms` or
+`Retry-After` header. If neither is present, it uses bounded exponential backoff
+with jitter, up to `max_rate_limit_retries` and
+`max_rate_limit_wait_seconds`. Known-not-accepted 429 requests reuse the same
+reservation and client request id. Explicit overload rejections use the smaller
+`max_pre_ack_retries` policy. The runner never retries a model submission
+timeout or another ambiguous transport/server outcome.
+
+Rate-limit retries preserve a ticket lane instead of losing its checkpoint, but
+they do not create throughput. Size TPM for the configured concurrency and keep
+`max_completion_tokens` close to expected output because Azure may include the
+maximum output allowance in its rate-limit estimate.
 
 ## Role-limited tools
 

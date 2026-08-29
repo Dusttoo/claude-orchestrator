@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one constrained orchestration agent through Anthropic or OpenAI.
+"""Run one constrained orchestration agent through Anthropic, OpenAI, or Azure ADM.
 
 The runner is intentionally SDK-free. It owns provider submission, client tool
 loops, durable request markers, worst-case budget reservations, and actual usage
@@ -15,6 +15,7 @@ import fcntl
 import importlib.util
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -50,13 +51,18 @@ DEFAULT_BUDGETS = {
     "max_tool_output_chars": 12000,
     "tool_timeout_seconds": 300,
     "max_pre_ack_retries": 2,
-    "retry_backoff_seconds": 1,
+    "max_rate_limit_retries": 8,
+    "max_rate_limit_wait_seconds": 600,
+    "retry_backoff_seconds": 2,
+    "retry_max_backoff_seconds": 60,
 }
 CREDENTIAL_ENV_KEYS = {
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
+    "AZURE_ADM_API_KEY",
+    "AZURE_ADM_BASE_URL",
 }
 
 
@@ -69,10 +75,11 @@ class BudgetError(AgentError):
 
 
 class ProviderHTTPError(AgentError):
-    def __init__(self, status: int, body: str):
+    def __init__(self, status: int, body: str, retry_after_seconds: float | None = None):
         super().__init__(f"provider returned HTTP {status}: {body[:500]}")
         self.status = status
         self.body = body
+        self.retry_after_seconds = retry_after_seconds
 
 
 def load_orchestration_env(config_path: Path) -> list[str]:
@@ -291,10 +298,15 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
         "max_tool_output_chars",
         "tool_timeout_seconds",
         "max_pre_ack_retries",
+        "max_rate_limit_retries",
+        "max_rate_limit_wait_seconds",
         "retry_backoff_seconds",
+        "retry_max_backoff_seconds",
     ):
         if key in raw:
-            minimum = 0 if key in {"max_pre_ack_retries", "retry_backoff_seconds"} else 1
+            minimum = 0 if key in {
+                "max_pre_ack_retries", "max_rate_limit_retries", "retry_backoff_seconds"
+            } else 1
             result[key] = int_value(raw[key], f"llm.budgets.{key}", minimum=minimum)
     if result["max_usd_per_run"] <= 0:
         raise AgentError("llm.budgets.max_usd_per_run must be greater than zero")
@@ -535,6 +547,14 @@ class HttpTransport:
             key = os.environ.get("ANTHROPIC_API_KEY")
             base = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
             headers = {"x-api-key": key or "", "anthropic-version": "2023-06-01"}
+        elif provider == "azure_adm":
+            key = os.environ.get("AZURE_ADM_API_KEY")
+            base = os.environ.get("AZURE_ADM_BASE_URL", "")
+            headers = {"api-key": key or ""}
+            if not base:
+                raise AgentError(
+                    "AZURE_ADM_BASE_URL is required for azure_adm API execution"
+                )
         else:
             key = os.environ.get("OPENAI_API_KEY")
             base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -544,9 +564,12 @@ class HttpTransport:
                 f"{provider.upper()}_API_KEY is required for {provider} API execution"
             )
         headers["Content-Type"] = "application/json"
-        headers["User-Agent"] = "claude-orchestrator-api-agent/0.5.2"
+        headers["User-Agent"] = "claude-orchestrator-api-agent/0.6.0"
         if idempotency_key:
-            headers["Idempotency-Key"] = idempotency_key
+            if provider == "azure_adm":
+                headers["x-ms-client-request-id"] = idempotency_key
+            else:
+                headers["Idempotency-Key"] = idempotency_key
         request = urllib.request.Request(
             base.rstrip("/") + "/" + path.lstrip("/"),
             data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
@@ -558,7 +581,17 @@ class HttpTransport:
                 body = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            raise ProviderHTTPError(exc.code, body) from exc
+            retry_after = None
+            raw_ms = exc.headers.get("retry-after-ms") if exc.headers else None
+            raw_seconds = exc.headers.get("Retry-After") if exc.headers else None
+            try:
+                if raw_ms is not None:
+                    retry_after = max(0.0, float(raw_ms) / 1000.0)
+                elif raw_seconds is not None:
+                    retry_after = max(0.0, float(raw_seconds))
+            except ValueError:
+                retry_after = None
+            raise ProviderHTTPError(exc.code, body, retry_after) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise ProviderAmbiguous(f"provider submission outcome is unknown: {exc}") from exc
         try:
@@ -726,7 +759,9 @@ TOOL_SPECS = {
         },
     ),
     "apply_patch": (
-        "Apply a text-only unified patch inside the repository after Git validation.",
+        "Apply a text-only standard unified Git patch inside the repository after Git validation. "
+        "The patch must use diff --git / --- a/path / +++ b/path / @@ hunk syntax accepted by "
+        "git apply; do not use wrapper markers such as '*** Begin Patch' or '*** Update File'.",
         {
             "type": "object",
             "properties": {"patch": {"type": "string"}},
@@ -754,6 +789,17 @@ def tools_for_role(role: str, configured: list[str] | None, provider: str) -> li
         if provider == "anthropic":
             result.append(
                 {"name": name, "description": description, "input_schema": schema, "strict": True}
+            )
+        elif provider == "azure_adm":
+            result.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": schema,
+                    },
+                }
             )
         else:
             result.append(
@@ -783,6 +829,23 @@ def normalize_usage(provider: str, response: dict[str, Any]) -> dict[str, int]:
             "output_tokens": int(usage.get("output_tokens") or 0),
             "reasoning_tokens": int((usage.get("output_tokens_details") or {}).get("thinking_tokens") or 0),
         }
+    if provider == "azure_adm":
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        completion_details = usage.get("completion_tokens_details") or {}
+        total = int(usage.get("prompt_tokens") or 0)
+        cached = int(prompt_details.get("cached_tokens") or 0)
+        visible_output = int(usage.get("completion_tokens") or 0)
+        billed_output = max(
+            visible_output,
+            int(usage.get("total_tokens") or 0) - total,
+        )
+        return {
+            "input_tokens": max(0, total - cached),
+            "cache_write_tokens": 0,
+            "cache_read_tokens": cached,
+            "output_tokens": billed_output,
+            "reasoning_tokens": int(completion_details.get("reasoning_tokens") or 0),
+        }
     details = usage.get("input_tokens_details") or {}
     total = int(usage.get("input_tokens") or 0)
     cached = int(details.get("cached_tokens") or 0)
@@ -803,6 +866,11 @@ def response_text(provider: str, response: dict[str, Any]) -> str:
             for block in response.get("content", [])
             if block.get("type") == "text"
         ).strip()
+    if provider == "azure_adm":
+        choices = response.get("choices") or []
+        if not choices:
+            return ""
+        return str((choices[0].get("message") or {}).get("content") or "").strip()
     if response.get("output_text"):
         return str(response["output_text"]).strip()
     chunks = []
@@ -816,6 +884,21 @@ def response_text(provider: str, response: dict[str, Any]) -> str:
 
 
 def tool_calls(provider: str, response: dict[str, Any]) -> list[dict[str, Any]]:
+    if provider == "azure_adm":
+        choices = response.get("choices") or []
+        if not choices:
+            return []
+        calls = (choices[0].get("message") or {}).get("tool_calls") or []
+        return [
+            {
+                "type": "function_call",
+                "id": str(call.get("id") or ""),
+                "call_id": str(call.get("id") or ""),
+                "name": str((call.get("function") or {}).get("name") or ""),
+                "arguments": str((call.get("function") or {}).get("arguments") or "{}"),
+            }
+            for call in calls
+        ]
     source = response.get("content", []) if provider == "anthropic" else response.get("output", [])
     expected = "tool_use" if provider == "anthropic" else "function_call"
     return [item for item in source if item.get("type") == expected]
@@ -887,6 +970,16 @@ class ApiAgent:
         atomic_json(self.state_path, self.state)
 
     def _count(self, body: dict[str, Any]) -> int:
+        if self.provider == "azure_adm":
+            # Azure Direct Model chat deployments do not expose a separate token
+            # counting endpoint. One UTF-8 byte per token is a deliberately
+            # conservative upper bound for pre-submit budget reservation.
+            count_body = dict(body)
+            count_body.pop("max_completion_tokens", None)
+            return max(
+                1,
+                len(json.dumps(count_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")),
+            )
         count_body = dict(body)
         if self.provider == "anthropic":
             count_body.pop("max_tokens", None)
@@ -921,6 +1014,8 @@ class ApiAgent:
         output_cap = (
             int(body.get("max_tokens") or 0)
             if self.provider == "anthropic"
+            else int(body.get("max_completion_tokens") or 0)
+            if self.provider == "azure_adm"
             else int(body.get("max_output_tokens") or 0)
         )
         projected = self.pricing.worst_case(input_tokens, output_cap)
@@ -940,11 +1035,16 @@ class ApiAgent:
             pending_request=body,
             projected_cost_usd=str(projected),
         )
-        endpoint = "messages" if self.provider == "anthropic" else "responses"
-        attempts = self.budgets["max_pre_ack_retries"] + 1
+        endpoint = {
+            "anthropic": "messages",
+            "azure_adm": "chat/completions",
+        }.get(self.provider, "responses")
         response = None
+        rate_limit_retries = 0
+        overload_retries = 0
+        rate_limit_wait = 0.0
         try:
-            for attempt in range(attempts):
+            while True:
                 try:
                     response = self.transport.request(
                         self.provider, endpoint, body, idempotency_key=reservation
@@ -954,10 +1054,38 @@ class ApiAgent:
                     # A returned rate-limit/overload rejection is known not to
                     # have started model work. Retry only those explicit cases,
                     # preserving the same idempotency key and reservation.
-                    if exc.status not in {429, 529} or attempt + 1 >= attempts:
+                    if exc.status == 429:
+                        if rate_limit_retries >= self.budgets["max_rate_limit_retries"]:
+                            raise
+                        if exc.retry_after_seconds is not None:
+                            delay = exc.retry_after_seconds
+                        else:
+                            base = self.budgets["retry_backoff_seconds"] * (2 ** rate_limit_retries)
+                            delay = min(base, self.budgets["retry_max_backoff_seconds"])
+                            if delay:
+                                delay += random.uniform(0, min(1.0, delay * 0.1))
+                        if rate_limit_wait + delay > self.budgets["max_rate_limit_wait_seconds"]:
+                            raise
+                        rate_limit_retries += 1
+                        rate_limit_wait += delay
+                        self._save(
+                            retry_count=rate_limit_retries,
+                            last_retry_status=exc.status,
+                            last_retry_delay_seconds=round(delay, 3),
+                            total_rate_limit_wait_seconds=round(rate_limit_wait, 3),
+                        )
+                        time.sleep(delay)
+                        continue
+                    if exc.status != 529 or overload_retries >= self.budgets["max_pre_ack_retries"]:
                         raise
-                    self._save(retry_count=attempt + 1, last_retry_status=exc.status)
-                    time.sleep(self.budgets["retry_backoff_seconds"] * (attempt + 1))
+                    overload_retries += 1
+                    delay = self.budgets["retry_backoff_seconds"] * overload_retries
+                    self._save(
+                        overload_retry_count=overload_retries,
+                        last_retry_status=exc.status,
+                        last_retry_delay_seconds=delay,
+                    )
+                    time.sleep(delay)
         except ProviderHTTPError as exc:
             if (400 <= exc.status < 500 and exc.status not in {408, 409}) or exc.status == 529:
                 self.ledger.release(reservation, self.run_id, f"provider rejected HTTP {exc.status}")
@@ -1011,7 +1139,12 @@ class ApiAgent:
 
     def _execute_calls(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         results = []
-        allowed = {tool["name"] for tool in self.tools}
+        allowed = {
+            str((tool.get("function") or {}).get("name") or "")
+            if self.provider == "azure_adm"
+            else str(tool.get("name") or "")
+            for tool in self.tools
+        }
         for call in calls:
             name = str(call.get("name") or "")
             call_id = str(call.get("id") or call.get("call_id") or "")
@@ -1036,6 +1169,10 @@ class ApiAgent:
                 results.append(
                     {"type": "tool_result", "tool_use_id": call_id, "content": output, "is_error": is_error}
                 )
+            elif self.provider == "azure_adm":
+                results.append(
+                    {"role": "tool", "tool_call_id": call_id, "content": output}
+                )
             else:
                 results.append(
                     {"type": "function_call_output", "call_id": str(call.get("call_id") or call_id), "output": output}
@@ -1045,7 +1182,13 @@ class ApiAgent:
     def run(self, request: dict[str, Any]) -> dict[str, Any]:
         if str(request.get("model") or "") != self.model:
             raise AgentError("request model does not match the resolved role route")
-        cap_key = "max_tokens" if self.provider == "anthropic" else "max_output_tokens"
+        cap_key = (
+            "max_tokens"
+            if self.provider == "anthropic"
+            else "max_completion_tokens"
+            if self.provider == "azure_adm"
+            else "max_output_tokens"
+        )
         requested_cap = int(request.get(cap_key) or 0)
         if requested_cap <= 0:
             raise AgentError(f"request requires a positive {cap_key}")
@@ -1071,7 +1214,11 @@ class ApiAgent:
             transcript.append(
                 {
                     "response_id": response.get("id"),
-                    "stop_reason": response.get("stop_reason") or response.get("status"),
+                    "stop_reason": (
+                        ((response.get("choices") or [{}])[0].get("finish_reason"))
+                        if self.provider == "azure_adm"
+                        else response.get("stop_reason") or response.get("status")
+                    ),
                     "text": text,
                     "tool_calls": [
                         {"name": call.get("name"), "id": call.get("id") or call.get("call_id")}
@@ -1086,6 +1233,10 @@ class ApiAgent:
                     status = "incomplete"
                 if self.provider == "openai" and response.get("status") != "completed":
                     status = "incomplete"
+                if self.provider == "azure_adm":
+                    choices = response.get("choices") or []
+                    if not choices or choices[0].get("finish_reason") != "stop":
+                        status = "incomplete"
                 review = None
                 review_gate = {
                     "code-reviewer": "code-review",
@@ -1124,6 +1275,30 @@ class ApiAgent:
                 messages.append({"role": "assistant", "content": response.get("content") or []})
                 messages.append({"role": "user", "content": results})
                 body = dict(body)
+                body["messages"] = messages
+            elif self.provider == "azure_adm":
+                choices = response.get("choices") or []
+                assistant = dict((choices[0].get("message") or {}) if choices else {})
+                messages = list(body.get("messages") or [])
+                messages.append(
+                    {
+                        key: assistant[key]
+                        for key in ("role", "content", "tool_calls")
+                        if key in assistant
+                    }
+                )
+                messages.extend(results)
+                body = {
+                    key: body[key]
+                    for key in (
+                        "model",
+                        "max_completion_tokens",
+                        "tools",
+                        "tool_choice",
+                        "parallel_tool_calls",
+                    )
+                    if key in body
+                }
                 body["messages"] = messages
             else:
                 keep = {

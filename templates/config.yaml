@@ -37,7 +37,7 @@ schema_version: 1
 # a desktop fallback then could duplicate writes, PRs, or billing.
 llm:
   execution: desktop             # desktop | api
-  provider: anthropic            # anthropic | openai
+  provider: anthropic            # anthropic | openai | azure_adm
   model: ""                      # required when effective execution is api
   effort: ""                     # optional: low | medium | high | xhigh | max
   fallback: none                 # desktop | none; applies only to API launch
@@ -52,8 +52,11 @@ llm:
     max_tool_rounds: 8
     max_tool_output_chars: 12000
     tool_timeout_seconds: 300
-    max_pre_ack_retries: 2       # only explicit rate-limit/overload rejections
-    retry_backoff_seconds: 1
+    max_pre_ack_retries: 2       # explicit overload rejections such as 529
+    max_rate_limit_retries: 8    # known-not-accepted 429s; safe to resubmit
+    max_rate_limit_wait_seconds: 600
+    retry_backoff_seconds: 2
+    retry_max_backoff_seconds: 60
   # Rates are USD per million tokens and are deliberately explicit: an unknown
   # model fails closed instead of being costed with a guessed price. Verify rates
   # when upgrading the plugin/model. These entries were checked 2026-08-26.
@@ -85,6 +88,11 @@ llm:
     #   model: gpt-5.6-sol
     #   effort: medium
     #   allowed_tools: [read_file, search, git_diff, git_status, run_check]
+    # sprint-worker:
+    #   execution: api
+    #   provider: azure_adm
+    #   model: grok-4-6-eval     # Azure deployment name, not catalog model name
+    #   allowed_tools: [read_file, search, git_diff, git_status, run_check, apply_patch]
     # security-reviewer:
     #   execution: desktop
     # visual-qa:

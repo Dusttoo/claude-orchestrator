@@ -48,13 +48,15 @@ with `context_pipeline.py route`. Desktop routes use the native host agent; API
 routes build requests with `context_pipeline.py payload --config ... --role
 ...` and foreground jobs execute through `api_agent.py run`, which enforces role
 tools and run/ticket/sprint budgets. Anthropic Messages and OpenAI Responses
-payloads share the same stable order:
+payloads, plus Azure Direct Model Chat Completions payloads, share the same stable order:
 role brief, repository rules, then the baseline repository map. Gate and
 on-demand payloads place the provider-native explicit cache breakpoint at the
 selected stable boundary; ticket data and the raw active-branch diff remain in
 the uncached user message. Optional `--effort` maps to OpenAI reasoning effort
-or Anthropic adaptive-thinking effort; fixed `budget_tokens` is intentionally
-not assumed because support differs across model generations.
+or Anthropic adaptive-thinking effort. Azure Direct Model routes omit the
+provider-specific effort field for cross-model compatibility; fixed
+`budget_tokens` is intentionally not assumed because support differs across
+model generations.
 
 Non-interactive background lanes can be prepared with `prepare-batch`. The
 controller accepts only current `plan.launch` tickets explicitly marked as
