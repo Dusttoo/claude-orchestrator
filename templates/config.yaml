@@ -43,7 +43,9 @@ llm:
   fallback: none                 # desktop | none; applies only to API launch
   # Hard ceilings are checked before every provider request. The runner reserves
   # the request's counted input plus its full output allowance, so concurrent
-  # workers cannot race past a shared ticket or sprint limit.
+  # workers cannot race past a shared ticket or sprint limit. The ledger these
+  # limits are counted against belongs to the repository, not to a lane's git
+  # worktree, so N concurrent lanes share one ceiling instead of getting N.
   budgets:
     max_usd_per_run: 1.00
     max_usd_per_ticket: 2.00

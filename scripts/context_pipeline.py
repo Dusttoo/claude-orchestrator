@@ -503,9 +503,8 @@ def anthropic_payload(args: argparse.Namespace) -> dict[str, Any]:
     boundary = args.cache_boundary
     if boundary == "auto":
         boundary = "repo-map"
-    if args.execution in {"on-demand", "gate"}:
-        index = 1 if boundary == "rules" else 2
-        system[index]["cache_control"] = {"type": "ephemeral"}
+    index = 1 if boundary == "rules" else 2
+    system[index]["cache_control"] = {"type": "ephemeral"}
     result: dict[str, Any] = {
         "model": args.model,
         "max_tokens": args.max_tokens,
@@ -538,12 +537,11 @@ def openai_payload(args: argparse.Namespace) -> dict[str, Any]:
             {"role": "user", "content": [{"type": "input_text", "text": dynamic}]},
         ],
     }
-    if args.execution in {"on-demand", "gate"}:
-        index = 1 if boundary == "rules" else 2
-        blocks[index]["prompt_cache_breakpoint"] = {"mode": "explicit"}
-        result["prompt_cache_options"] = {"mode": "explicit"}
-        cache_source = "\n".join(stable[: index + 1]).encode("utf-8")
-        result["prompt_cache_key"] = "orchestration-" + hashlib.sha256(cache_source).hexdigest()[:24]
+    index = 1 if boundary == "rules" else 2
+    blocks[index]["prompt_cache_breakpoint"] = {"mode": "explicit"}
+    result["prompt_cache_options"] = {"mode": "explicit"}
+    cache_source = "\n".join(stable[: index + 1]).encode("utf-8")
+    result["prompt_cache_key"] = "orchestration-" + hashlib.sha256(cache_source).hexdigest()[:24]
     if args.effort:
         result["reasoning"] = {"effort": args.effort}
     if args.mode in REVIEW_MODES:
@@ -620,8 +618,13 @@ def add_payload_arguments(command: argparse.ArgumentParser, provider: bool = Tru
     command.add_argument(
         "--mode", choices=["implement", "code-review", "security-review"], default="implement"
     )
+    # Retained as a call-site label. Cache breakpoints are now unconditional:
+    # an execution mode must never be able to silently disable prompt caching.
     command.add_argument(
-        "--execution", choices=["interactive", "on-demand", "gate"], default="on-demand"
+        "--execution",
+        choices=["on-demand", "gate"],
+        default="on-demand",
+        help="call-site label; does not change the emitted payload",
     )
     command.add_argument("--cache-boundary", choices=["auto", "rules", "repo-map"], default="auto")
     command.add_argument("--model")

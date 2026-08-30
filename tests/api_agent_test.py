@@ -187,6 +187,269 @@ self_check:
         self.assertEqual(summary["output_tokens"], 15)
         self.assertEqual(summary["open_reservations"], [])
 
+    def test_rolling_cache_breakpoint_moves_to_the_conversation_end(self):
+        transport = FakeTransport(
+            [
+                {
+                    "id": "msg_1",
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 100, "output_tokens": 10},
+                    "content": [{"type": "tool_use", "id": "tool_1", "name": "git_status", "input": {}}],
+                },
+                {
+                    "id": "msg_2",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 20, "output_tokens": 5},
+                    "content": [{"type": "text", "text": CLEAN_REVIEW}],
+                },
+            ]
+        )
+        agent = self.agent(transport)
+        agent.run(
+            {"model": "test-model", "max_tokens": 500, "system": [], "messages": [{"role": "user", "content": "review"}]}
+        )
+        resubmitted = [call for call in transport.calls if call[1] == "messages"][1][2]["messages"]
+        marked = [
+            (index, block)
+            for index, message in enumerate(resubmitted)
+            for block in message["content"]
+            if isinstance(block, dict) and "cache_control" in block
+        ]
+        # Exactly one breakpoint, on the newest block: system and tools already
+        # spend two of Anthropic's four, and adding one per round would exceed it.
+        self.assertEqual(len(marked), 1)
+        self.assertEqual(marked[0][0], len(resubmitted) - 1)
+        self.assertEqual(resubmitted[-1]["content"][-1]["cache_control"], {"type": "ephemeral"})
+
+    def test_rolling_cache_breakpoint_does_not_mutate_provider_content(self):
+        assistant_content = [{"type": "text", "text": "prior"}]
+        messages = [
+            {"role": "user", "content": "review"},
+            {"role": "assistant", "content": assistant_content},
+        ]
+        rolled = api_agent.roll_conversation_cache_breakpoint(messages)
+        self.assertEqual(rolled[-1]["content"][-1]["cache_control"], {"type": "ephemeral"})
+        self.assertNotIn("cache_control", assistant_content[-1])
+
+    def _commit_initial(self):
+        git = [
+            "git", "-C", str(self.root),
+            "-c", "user.email=test@example.com",
+            "-c", "user.name=test",
+        ]
+        (self.root / "README.md").write_text("seed\n", encoding="utf-8")
+        subprocess.run(git + ["add", "README.md"], check=True, capture_output=True)
+        subprocess.run(git + ["commit", "-qm", "seed"], check=True, capture_output=True)
+        return git
+
+    @staticmethod
+    def _completed_transport():
+        return FakeTransport(
+            [
+                {
+                    "id": "msg_done",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 40, "output_tokens": 5},
+                    "content": [{"type": "text", "text": CLEAN_REVIEW}],
+                }
+            ]
+        )
+
+    def test_worktree_lanes_share_one_usage_ledger(self):
+        git = self._commit_initial()
+        worktree = self.root / ".claude" / "worktrees" / "agent-1"
+        subprocess.run(
+            git + ["worktree", "add", "-q", str(worktree), "-b", "lane-1"],
+            check=True,
+            capture_output=True,
+        )
+        config = self.config()
+        body = {
+            "model": "test-model",
+            "max_tokens": 500,
+            "system": [],
+            "messages": [{"role": "user", "content": "review"}],
+        }
+
+        main_agent = self.agent(self._completed_transport(), run_id="main-run")
+        main_agent.run(dict(body))
+
+        lane = api_agent.ApiAgent(
+            root=worktree,
+            config_path=config,
+            role="code-reviewer",
+            ticket="PROJ-1",
+            sprint="SPRINT-1",
+            run_id="lane-run",
+            transport=self._completed_transport(),
+        )
+        lane.run(dict(body))
+
+        shared = (self.root / ".orchestration" / ".llm-usage").resolve()
+        self.assertEqual(lane.ledger.directory, shared)
+        self.assertFalse((worktree / ".orchestration" / ".llm-usage").exists())
+        # Both lanes counted against one ceiling instead of one ledger each.
+        self.assertEqual(lane.ledger.summary()["input_tokens"], 80)
+        self.assertEqual(lane.ledger.summary()["output_tokens"], 10)
+        # Tool sandboxing still resolves to the lane's own checkout.
+        self.assertEqual(lane.tool_executor.root, worktree.resolve())
+
+    def test_usage_root_override_redirects_the_ledger(self):
+        override = Path(self.temp.name) / "elsewhere"
+        override.mkdir()
+        with mock.patch.dict(os.environ, {"ORCHESTRATION_USAGE_ROOT": str(override)}):
+            self.assertEqual(api_agent.shared_repository_root(self.root), override.resolve())
+
+    def test_shared_root_falls_back_outside_a_repository(self):
+        plain = Path(self.temp.name) / "plain"
+        plain.mkdir()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ORCHESTRATION_USAGE_ROOT", None)
+            with mock.patch.object(
+                api_agent.subprocess, "run", side_effect=OSError("git missing")
+            ):
+                self.assertEqual(api_agent.shared_repository_root(plain), plain.resolve())
+
+    def test_usage_events_record_role_and_request_latency(self):
+        transport = FakeTransport(
+            [
+                {
+                    "id": "msg_1",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 30, "cache_read_input_tokens": 70, "output_tokens": 5},
+                    "content": [{"type": "text", "text": CLEAN_REVIEW}],
+                }
+            ]
+        )
+        agent = self.agent(transport)
+        agent.run(
+            {"model": "test-model", "max_tokens": 500, "system": [], "messages": [{"role": "user", "content": "review"}]}
+        )
+        events = agent.ledger._events()
+        usage = [event for event in events if event["kind"] == "usage"]
+        reservation = [event for event in events if event["kind"] == "reservation"]
+        self.assertEqual(usage[0]["role"], "code-reviewer")
+        self.assertEqual(reservation[0]["role"], "code-reviewer")
+        self.assertIsInstance(usage[0]["latency_ms"], int)
+        self.assertGreaterEqual(usage[0]["latency_ms"], 0)
+        self.assertEqual(usage[0]["tool_round"], 0)
+
+    def _report_args(self, **overrides):
+        defaults = {
+            "group_by": "role",
+            "since": None,
+            "until": None,
+            "role": None,
+            "model": None,
+            "provider": None,
+            "ticket": None,
+            "sprint": None,
+            "top": None,
+            "format": "json",
+        }
+        defaults.update(overrides)
+        return api_agent.argparse.Namespace(**defaults)
+
+    def _write_ledger(self, events):
+        directory = self.root / ".orchestration" / ".llm-usage"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "usage.jsonl").write_text(
+            "".join(json.dumps(event, separators=(",", ":")) + "\n" for event in events),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _usage_event(role, cost, *, cache_read=900, fresh=100, latency=1000, age_hours=1, **extra):
+        moment = api_agent.dt.datetime.now(api_agent.dt.timezone.utc) - api_agent.dt.timedelta(
+            hours=age_hours
+        )
+        event = {
+            "kind": "usage",
+            "timestamp": moment.isoformat(),
+            "reservation_id": f"resv_{role}_{age_hours}_{cost}",
+            "run_id": f"run_{role}",
+            "role": role,
+            "ticket": "PROD-1",
+            "sprint": "SPRINT-1",
+            "provider": "anthropic",
+            "model": "test-model",
+            "response_id": f"msg_{role}_{age_hours}",
+            "input_tokens": fresh,
+            "cache_write_tokens": 0,
+            "cache_read_tokens": cache_read,
+            "output_tokens": 10,
+            "reasoning_tokens": 0,
+            "latency_ms": latency,
+            "cost_usd": cost,
+        }
+        event.update(extra)
+        return event
+
+    def test_report_groups_by_role_with_cache_hit_rate(self):
+        self._write_ledger(
+            [
+                self._usage_event("implementer", "0.500000", cache_read=900, fresh=100),
+                self._usage_event("implementer", "0.250000", cache_read=900, fresh=100, age_hours=2),
+                self._usage_event("code-reviewer", "0.100000", cache_read=500, fresh=500, age_hours=3),
+            ]
+        )
+        report = api_agent.build_report(self.root, self._report_args())
+        keys = [group["key"] for group in report["groups"]]
+        self.assertEqual(keys, ["implementer", "code-reviewer"])
+        implementer = report["groups"][0]
+        self.assertEqual(implementer["requests"], 2)
+        self.assertEqual(implementer["cache_hit_rate"], 0.9)
+        self.assertEqual(report["groups"][1]["cache_hit_rate"], 0.5)
+        self.assertEqual(report["totals"]["requests"], 3)
+        self.assertEqual(report["totals"]["cost_usd"], "0.850000")
+
+    def test_report_window_and_role_filter_narrow_the_ledger(self):
+        self._write_ledger(
+            [
+                self._usage_event("implementer", "1.000000", age_hours=1),
+                self._usage_event("implementer", "2.000000", age_hours=200),
+                self._usage_event("code-reviewer", "4.000000", age_hours=1),
+            ]
+        )
+        recent = api_agent.build_report(self.root, self._report_args(since="24h"))
+        self.assertEqual(recent["totals"]["requests"], 2)
+        self.assertEqual(recent["totals"]["cost_usd"], "5.000000")
+        scoped = api_agent.build_report(self.root, self._report_args(role="code-reviewer"))
+        self.assertEqual(scoped["totals"]["cost_usd"], "4.000000")
+        self.assertEqual(scoped["filters"], {"role": "code-reviewer"})
+
+    def test_report_tolerates_ledger_entries_without_performance_fields(self):
+        legacy = self._usage_event("implementer", "0.100000")
+        del legacy["latency_ms"]
+        del legacy["role"]
+        self._write_ledger([legacy])
+        report = api_agent.build_report(self.root, self._report_args())
+        self.assertEqual(report["groups"][0]["key"], "unknown")
+        self.assertIsNone(report["totals"]["latency_p50_ms"])
+        self.assertEqual(report["totals"]["latency_samples"], 0)
+        self.assertIn("latency recorded for 0 of 1 requests", api_agent.format_report(report))
+
+    def test_report_top_reports_what_it_hid(self):
+        self._write_ledger(
+            [self._usage_event(f"role-{index}", f"{index}.000000", age_hours=index + 1) for index in range(1, 5)]
+        )
+        report = api_agent.build_report(self.root, self._report_args(top=2))
+        self.assertEqual(len(report["groups"]), 2)
+        self.assertEqual(report["groups_hidden_by_top"], 2)
+        self.assertEqual(report["totals"]["requests"], 4)
+        self.assertIn("2 further groups hidden", api_agent.format_report(report))
+
+    def test_parse_window_accepts_relative_and_absolute_forms(self):
+        now = api_agent.dt.datetime.now(api_agent.dt.timezone.utc)
+        self.assertLess(abs((now - api_agent.parse_window("30m")).total_seconds() - 1800), 5)
+        self.assertLess(abs((now - api_agent.parse_window("2w")).total_seconds() - 1209600), 5)
+        absolute = api_agent.parse_window("2026-08-01T00:00:00+00:00")
+        self.assertEqual(absolute.year, 2026)
+        # A naive timestamp is read as UTC rather than silently taking local time.
+        self.assertEqual(api_agent.parse_window("2026-08-01").tzinfo, api_agent.dt.timezone.utc)
+        with self.assertRaises(api_agent.AgentError):
+            api_agent.parse_window("last tuesday")
+
     def test_openai_tool_loop_uses_previous_response_id(self):
         transport = FakeTransport(
             [
