@@ -48,6 +48,15 @@ check "OpenAI reviewers use low-verbosity strict structured output" 'data["text"
   --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --mode implement \
   --execution on-demand --model test-model > "$TMP/implement.json"
 check "implementers are not forced into the reviewer schema" '"text" not in data' "$TMP/implement.json"
+check "implement payloads still carry the explicit cache breakpoint" 'data["input"][0]["content"][2]["prompt_cache_breakpoint"] == {"mode":"explicit"} and data["prompt_cache_key"].startswith("orchestration-")' "$TMP/implement.json"
+
+"$PIPELINE" anthropic --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
+  --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --mode implement \
+  --execution on-demand --model test-model > "$TMP/implement-anthropic.json"
+check "Anthropic implement payloads cache the stable prefix too" 'data["system"][2]["cache_control"] == {"type":"ephemeral"}' "$TMP/implement-anthropic.json"
+run_fail "no execution mode can silently disable prompt caching" "$PIPELINE" anthropic \
+  --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" --repo-map "$TMP/map.txt" \
+  --ticket "$TMP/ticket.json" --mode implement --execution interactive --model test-model
 
 "$PIPELINE" payload --provider azure_adm --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
   --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" \

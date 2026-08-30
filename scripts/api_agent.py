@@ -14,6 +14,7 @@ import datetime as dt
 import fcntl
 import importlib.util
 import json
+import math
 import os
 import random
 import re
@@ -180,6 +181,75 @@ def runtime_path(root: Path, relative: str) -> Path:
     if candidate != root and root not in candidate.parents:
         raise AgentError(f"runtime path escapes repository: {relative}")
     return candidate
+
+
+def shared_repository_root(root: Path) -> Path:
+    """Resolve the root that a repository shares with all of its git worktrees.
+
+    Budget ceilings are only real if every concurrent lane counts against one
+    ledger. Agent worktrees each carry their own checkout, so a worktree-relative
+    ledger silently multiplies `max_usd_per_ticket` and `max_usd_per_sprint` by
+    the number of running lanes. `git rev-parse --git-common-dir` names the
+    directory shared by the main checkout and all of its worktrees; its parent is
+    the canonical root. Fall back to the given root when git cannot answer, so a
+    non-repository directory still gets a working local ledger.
+    """
+    override = os.environ.get("ORCHESTRATION_USAGE_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return root.resolve()
+    common = (completed.stdout or "").strip()
+    if not common:
+        return root.resolve()
+    candidate = Path(common)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    parent = candidate.resolve().parent
+    return parent if parent.is_dir() else root.resolve()
+
+
+def roll_conversation_cache_breakpoint(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return messages carrying exactly one cache breakpoint at the conversation end.
+
+    An Anthropic request allows four breakpoints and already spends two on the
+    stable system prefix and the tool definitions. Without a third, every tool
+    round re-sends the whole accumulated transcript at full input price. Moving a
+    single breakpoint forward each round caches that transcript instead, and
+    moving rather than adding keeps the request inside the four-breakpoint cap.
+
+    The response content lists handed in by the transport are never mutated; the
+    stripped and marked blocks are copies.
+    """
+    result: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            blocks = [
+                {key: value for key, value in block.items() if key != "cache_control"}
+                if isinstance(block, dict) and "cache_control" in block
+                else block
+                for block in content
+            ]
+            message = dict(message, content=blocks)
+        result.append(message)
+    for message in reversed(result):
+        content = message.get("content")
+        if isinstance(content, list) and content and isinstance(content[-1], dict):
+            content[-1] = dict(content[-1], cache_control={"type": "ephemeral"})
+            break
+    return result
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -376,6 +446,7 @@ class UsageLedger:
         sprint: str | None,
         provider: str,
         model: str,
+        role: str | None = None,
     ) -> str:
         self.directory.mkdir(parents=True, exist_ok=True)
         with self.lock_path.open("a+", encoding="utf-8") as lock:
@@ -419,6 +490,7 @@ class UsageLedger:
                 "timestamp": utc_now(),
                 "reservation_id": reservation_id,
                 "run_id": run_id,
+                "role": role,
                 "ticket": ticket,
                 "sprint": sprint,
                 "provider": provider,
@@ -454,18 +526,31 @@ class UsageLedger:
         response_id: str,
         usage: dict[str, int],
         cost: Decimal,
+        role: str | None = None,
+        latency_ms: int | None = None,
+        rate_limit_wait_seconds: float | None = None,
+        tool_round: int | None = None,
     ) -> None:
+        # Performance fields are optional: a reconciled request is settled from
+        # provider records long after the fact and has no measurable latency.
+        performance = {
+            "latency_ms": latency_ms,
+            "rate_limit_wait_seconds": rate_limit_wait_seconds,
+            "tool_round": tool_round,
+        }
         event = {
             "kind": "usage",
             "timestamp": utc_now(),
             "reservation_id": reservation_id,
             "run_id": run_id,
+            "role": role,
             "ticket": ticket,
             "sprint": sprint,
             "provider": provider,
             "model": model,
             "response_id": response_id,
             **usage,
+            **{key: value for key, value in performance.items() if value is not None},
             "cost_usd": str(cost),
         }
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -932,8 +1017,11 @@ class ApiAgent:
         self.transport = transport
         self.pricing = Pricing.from_config(self.config, self.model)
         self.budgets = budgets_from_config(self.config)
-        self.ledger = UsageLedger(self.root)
-        state_directory = runtime_path(self.root, ".orchestration/.llm-runs")
+        # Tool execution stays sandboxed to this worktree; spend accounting and
+        # run state are repository-wide so concurrent lanes share one ceiling.
+        self.shared_root = shared_repository_root(self.root)
+        self.ledger = UsageLedger(self.shared_root)
+        state_directory = runtime_path(self.shared_root, ".orchestration/.llm-runs")
         self.state_path = state_directory / f"{run_id}.json"
         if self.state_path.exists():
             raise AgentError(
@@ -1027,6 +1115,7 @@ class ApiAgent:
             sprint=self.sprint,
             provider=self.provider,
             model=self.model,
+            role=self.role,
         )
         self.state["reservations"].append(reservation)
         self._save(
@@ -1040,15 +1129,21 @@ class ApiAgent:
             "azure_adm": "chat/completions",
         }.get(self.provider, "responses")
         response = None
+        latency_ms = None
         rate_limit_retries = 0
         overload_retries = 0
         rate_limit_wait = 0.0
         try:
             while True:
                 try:
+                    # Measure only the accepted attempt. Retry sleeps are
+                    # reported separately so blocked time never inflates the
+                    # provider's own latency.
+                    request_started = time.monotonic()
                     response = self.transport.request(
                         self.provider, endpoint, body, idempotency_key=reservation
                     )
+                    latency_ms = int((time.monotonic() - request_started) * 1000)
                     break
                 except ProviderHTTPError as exc:
                     # A returned rate-limit/overload rejection is known not to
@@ -1124,6 +1219,10 @@ class ApiAgent:
             response_id=response_id,
             usage=usage,
             cost=cost,
+            role=self.role,
+            latency_ms=latency_ms,
+            rate_limit_wait_seconds=round(rate_limit_wait, 3) if rate_limit_wait else None,
+            tool_round=int(self.state.get("tool_rounds") or 0),
         )
         cumulative = decimal_value(self.state.get("cost_usd", "0"), "state cost") + cost
         self.state["response_ids"].append(response_id)
@@ -1275,7 +1374,7 @@ class ApiAgent:
                 messages.append({"role": "assistant", "content": response.get("content") or []})
                 messages.append({"role": "user", "content": results})
                 body = dict(body)
-                body["messages"] = messages
+                body["messages"] = roll_conversation_cache_breakpoint(messages)
             elif self.provider == "azure_adm":
                 choices = response.get("choices") or []
                 assistant = dict((choices[0].get("message") or {}) if choices else {})
@@ -1329,6 +1428,233 @@ def read_request(path: str) -> dict[str, Any]:
     return value
 
 
+RELATIVE_WINDOW = re.compile(r"^(\d+)([mhdw])$")
+WINDOW_SECONDS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+TOKEN_FIELDS = (
+    "input_tokens",
+    "cache_write_tokens",
+    "cache_read_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+)
+GROUP_FIELDS = ("role", "model", "provider", "ticket", "sprint", "run_id", "day")
+
+
+def parse_window(value: str) -> dt.datetime:
+    """Accept `30m`, `24h`, `7d`, `2w`, or an absolute ISO 8601 timestamp."""
+    match = RELATIVE_WINDOW.match(value.strip())
+    if match:
+        amount, unit = int(match.group(1)), match.group(2)
+        return dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+            seconds=amount * WINDOW_SECONDS[unit]
+        )
+    try:
+        parsed = dt.datetime.fromisoformat(value.strip())
+    except ValueError as exc:
+        raise AgentError(
+            f"could not read time window {value!r}; use 7d, 24h, 30m, 2w, or an ISO 8601 timestamp"
+        ) from exc
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def event_time(event: dict[str, Any]) -> dt.datetime | None:
+    raw = str(event.get("timestamp") or "")
+    if not raw:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def percentile(values: list[int], fraction: float) -> int | None:
+    """Nearest-rank percentile. Small samples are the norm here, so no interpolation."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, math.ceil(fraction * len(ordered)))
+    return ordered[min(rank, len(ordered)) - 1]
+
+
+def group_key(event: dict[str, Any], field: str) -> str:
+    if field == "day":
+        moment = event_time(event)
+        return moment.date().isoformat() if moment else "unknown"
+    return str(event.get(field) or "unknown")
+
+
+def aggregate(events: list[dict[str, Any]]) -> dict[str, Any]:
+    tokens = {field: sum(int(event.get(field) or 0) for event in events) for field in TOKEN_FIELDS}
+    cost = sum(
+        (decimal_value(event.get("cost_usd", 0), "ledger cost") for event in events), Decimal("0")
+    )
+    billed_input = (
+        tokens["input_tokens"] + tokens["cache_read_tokens"] + tokens["cache_write_tokens"]
+    )
+    latencies = [int(event["latency_ms"]) for event in events if event.get("latency_ms") is not None]
+    waits = sum(float(event.get("rate_limit_wait_seconds") or 0) for event in events)
+    requests = len(events)
+    result: dict[str, Any] = {
+        "requests": requests,
+        "runs": len({str(event.get("run_id") or "") for event in events}),
+        "cost_usd": str(cost.quantize(Decimal("0.000001"))),
+        **tokens,
+        # The headline optimization metric: share of billed input served from cache.
+        "cache_hit_rate": round(tokens["cache_read_tokens"] / billed_input, 4)
+        if billed_input
+        else None,
+        "cost_per_request_usd": str((cost / requests).quantize(Decimal("0.000001")))
+        if requests
+        else None,
+        "latency_p50_ms": percentile(latencies, 0.50),
+        "latency_p95_ms": percentile(latencies, 0.95),
+        "rate_limit_wait_seconds": round(waits, 3) if waits else 0,
+        "latency_samples": len(latencies),
+    }
+    return result
+
+
+def build_report(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    ledger = UsageLedger(root)
+    events = ledger._events()
+    since = parse_window(args.since) if args.since else None
+    until = parse_window(args.until) if args.until else None
+
+    def in_window(event: dict[str, Any]) -> bool:
+        moment = event_time(event)
+        if moment is None:
+            return since is None and until is None
+        if since and moment < since:
+            return False
+        return not (until and moment > until)
+
+    filters = {
+        field: getattr(args, field)
+        for field in ("role", "model", "provider", "ticket", "sprint")
+        if getattr(args, field, None)
+    }
+
+    def matches(event: dict[str, Any]) -> bool:
+        return all(str(event.get(field) or "") == value for field, value in filters.items())
+
+    usage_events = [
+        event
+        for event in events
+        if event.get("kind") == "usage" and in_window(event) and matches(event)
+    ]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for event in usage_events:
+        grouped.setdefault(group_key(event, args.group_by), []).append(event)
+    groups = [{"key": key, **aggregate(items)} for key, items in grouped.items()]
+    if args.group_by == "day":
+        groups.sort(key=lambda row: row["key"])
+    else:
+        groups.sort(key=lambda row: Decimal(row["cost_usd"]), reverse=True)
+    hidden = 0
+    if args.top and len(groups) > args.top:
+        hidden = len(groups) - args.top
+        groups = groups[: args.top]
+
+    outcomes: dict[str, int] = {}
+    for state_file in sorted((root / ".orchestration" / ".llm-runs").glob("*.json")):
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        created = state.get("created_at")
+        probe = {"timestamp": created, **{key: state.get(key) for key in filters}}
+        if not (in_window(probe) and matches(probe)):
+            continue
+        status = str(state.get("status") or "unknown")
+        outcomes[status] = outcomes.get(status, 0) + 1
+
+    _, open_items = ledger._totals(events)
+    return {
+        "window": {
+            "since": since.isoformat() if since else None,
+            "until": until.isoformat() if until else None,
+        },
+        "filters": filters or None,
+        "group_by": args.group_by,
+        "groups": groups,
+        "groups_hidden_by_top": hidden,
+        "totals": aggregate(usage_events),
+        "run_outcomes": outcomes,
+        "open_reservations": list(open_items.values()),
+        "ledger": str(ledger.path),
+    }
+
+
+def format_report(report: dict[str, Any]) -> str:
+    columns = [
+        ("key", report["group_by"], 22, "<"),
+        ("requests", "reqs", 6, ">"),
+        ("runs", "runs", 5, ">"),
+        ("cost_usd", "cost_usd", 11, ">"),
+        ("input_tokens", "in_tok", 10, ">"),
+        ("cache_read_tokens", "cache_rd", 10, ">"),
+        ("cache_write_tokens", "cache_wr", 10, ">"),
+        ("output_tokens", "out_tok", 9, ">"),
+        ("cache_hit_rate", "cache_hit", 10, ">"),
+        ("latency_p50_ms", "p50_ms", 8, ">"),
+        ("latency_p95_ms", "p95_ms", 8, ">"),
+    ]
+
+    def cell(row: dict[str, Any], field: str) -> str:
+        value = row.get(field)
+        if value is None:
+            return "-"
+        if field == "cache_hit_rate":
+            return f"{value * 100:.1f}%"
+        if field == "cost_usd":
+            return f"${Decimal(value).quantize(Decimal('0.0001'))}"
+        if field.endswith("_tokens") and isinstance(value, int):
+            if value >= 1_000_000:
+                return f"{value / 1_000_000:.2f}M"
+            if value >= 10_000:
+                return f"{value / 1000:.1f}k"
+        return str(value)
+
+    def line(row: dict[str, Any]) -> str:
+        return "  ".join(f"{cell(row, f):{align}{width}}" for f, _, width, align in columns)
+
+    header = "  ".join(f"{label:{align}{width}}" for _, label, width, align in columns)
+    lines = [header, "-" * len(header)]
+    lines.extend(line(row) for row in report["groups"])
+    if not report["groups"]:
+        lines.append("(no usage recorded in this window)")
+    lines.append("-" * len(header))
+    lines.append(line({**report["totals"], "key": "TOTAL"}))
+    if report.get("groups_hidden_by_top"):
+        lines.append(
+            f"({report['groups_hidden_by_top']} further groups hidden by --top; "
+            "TOTAL covers every group in the window)"
+        )
+    window = report["window"]
+    if window["since"] or window["until"]:
+        lines.append("")
+        lines.append(f"window: {window['since'] or 'start'} -> {window['until'] or 'now'}")
+    if report["run_outcomes"]:
+        outcomes = ", ".join(f"{name} {count}" for name, count in sorted(report["run_outcomes"].items()))
+        lines.append(f"run outcomes: {outcomes}")
+    if report["open_reservations"]:
+        lines.append(
+            f"open reservations: {len(report['open_reservations'])} "
+            "(reconcile before trusting spend totals)"
+        )
+    waits = report["totals"].get("rate_limit_wait_seconds") or 0
+    if waits:
+        lines.append(f"time blocked on provider rate limits: {waits}s")
+    samples = report["totals"].get("latency_samples") or 0
+    if samples < report["totals"].get("requests", 0):
+        lines.append(
+            f"latency recorded for {samples} of {report['totals']['requests']} requests "
+            "(older ledger entries predate latency capture)"
+        )
+    return "\n".join(lines)
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
@@ -1343,6 +1669,20 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--result")
     usage = commands.add_parser("usage", help="summarize durable API usage and open reservations")
     usage.add_argument("--repo", default=".")
+    report = commands.add_parser(
+        "report", help="group durable API usage into cost and performance insights"
+    )
+    report.add_argument("--repo", default=".")
+    report.add_argument("--group-by", choices=list(GROUP_FIELDS), default="role")
+    report.add_argument("--since", help="7d, 24h, 30m, 2w, or an ISO 8601 timestamp")
+    report.add_argument("--until", help="7d, 24h, 30m, 2w, or an ISO 8601 timestamp")
+    report.add_argument("--role")
+    report.add_argument("--model")
+    report.add_argument("--provider")
+    report.add_argument("--ticket")
+    report.add_argument("--sprint")
+    report.add_argument("--top", type=int, help="keep only the N costliest groups")
+    report.add_argument("--format", choices=["table", "json"], default="table")
     reconcile = commands.add_parser(
         "reconcile", help="close an uncertain reservation after checking provider records"
     )
@@ -1398,6 +1738,7 @@ def reconcile_run(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             response_id=args.response_id,
             usage=usage,
             cost=cost,
+            role=state.get("role"),
         )
         status = "reconciled_completed"
         state.setdefault("response_ids", []).append(args.response_id)
@@ -1425,9 +1766,11 @@ def main() -> int:
     try:
         root = Path(args.repo).resolve()
         if args.command == "usage":
-            output = UsageLedger(root).summary()
+            output = UsageLedger(shared_repository_root(root)).summary()
+        elif args.command == "report":
+            output = build_report(shared_repository_root(root), args)
         elif args.command == "reconcile":
-            output = reconcile_run(args, root)
+            output = reconcile_run(args, shared_repository_root(root))
         else:
             run_id = args.run_id or "run_" + uuid.uuid4().hex
             if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", run_id):
@@ -1444,7 +1787,10 @@ def main() -> int:
             output = agent.run(read_request(args.request))
         if getattr(args, "result", None):
             atomic_json(Path(args.result), output)
-        print(json.dumps(output, indent=2, sort_keys=False))
+        if args.command == "report" and args.format == "table":
+            print(format_report(output))
+        else:
+            print(json.dumps(output, indent=2, sort_keys=False))
         status = output.get("status", "completed")
         return 0 if status in {"completed", "reconciled_not_found", "reconciled_completed"} else 3
     except (AgentError, OSError, json.JSONDecodeError) as exc:

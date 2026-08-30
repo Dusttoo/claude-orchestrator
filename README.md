@@ -119,10 +119,10 @@ supports them.
 | Layer | What it is |
 |---|---|
 | `agents/` | Role briefs: design-reviewer, implementer, code-reviewer, security-reviewer, visual-qa |
-| `commands/` | Claude Code slash commands: `/orchestrate`, `/orchestrate-sprint`, `/gate`, `/release`, `/orchestration-init` |
+| `commands/` | Claude Code slash commands: `/orchestrate`, `/orchestrate-sprint`, `/gate`, `/release`, `/orchestration-init`, `/orchestration-report` |
 | `hooks/` | Claude Code/Codex `PreToolUse` merge-guard + `Stop` worktree sweep |
 | `scripts/` | The mechanics: config reader, sprint controller, workflow engine, gate runner, merge-guard, safe-merge, worktree lifecycle, verification |
-| `skills/` | Codex/Claude natural-language procedures: orchestrate ticket/sprint, gate, release, init, scope, recover |
+| `skills/` | Codex/Claude natural-language procedures: orchestrate ticket/sprint, gate, release, init, scope, recover, report |
 | `templates/` | Configuration template plus the plugin-owned process reference |
 | `tests/` | Plugin-owned conformance suites; never copied into target repos |
 | `.codex-plugin/` | Codex plugin manifest exposing the `skills/` directory |
@@ -161,8 +161,8 @@ by `scripts/orchestration-engine.py`, a shared engine used by both Claude and
 Codex adapters. See [docs/workflow-configuration.md](docs/workflow-configuration.md).
 Desktop/API selection and inherited per-role overrides are documented in
 [docs/llm-routing.md](docs/llm-routing.md). The constrained provider runner,
-usage ledger, and recovery procedure are documented in
-[docs/api-agent.md](docs/api-agent.md).
+usage ledger, cost and performance reporting (`api_agent.py report`), and
+recovery procedure are documented in [docs/api-agent.md](docs/api-agent.md).
 
 ## Installation
 
@@ -242,6 +242,13 @@ with the same names take precedence. See [API agent runner](docs/api-agent.md).
 `/gate <pr>` runs just the review gates on an existing PR. `/release` advances a
 configured release or candidate transition through the shared workflow engine.
 Schema v1 repositories keep their legacy process until they migrate.
+
+`/orchestration-report [window] [group-by]` in Claude Code, or "report
+orchestration usage" in Codex, groups the durable usage ledger into cost and
+performance insights -- spend and cache hit rate by role, model, ticket, or day,
+latency percentiles, rate-limit stalls, and run outcomes -- then recommends
+config changes. It covers API-routed roles only; roles left on
+`execution: desktop` never reach the ledger.
 
 ## Running a sprint
 

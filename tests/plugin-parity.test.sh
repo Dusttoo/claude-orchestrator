@@ -93,6 +93,11 @@ contains_contract "explicit cleanup policy" 'worktree_cleanup' \
 contains_contract "hooks are optional" 'defense in depth' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md
 
+contains_contract "usage reporting entry point" 'api_agent\.py report' \
+  commands/orchestration-report.md skills/orchestration-report/SKILL.md
+contains_contract "reporting states its desktop coverage limit" 'execution: desktop' \
+  commands/orchestration-report.md skills/orchestration-report/SKILL.md
+
 if rg -q 'merge-guard\.sh" --assert-green "\$PR" "\$BRANCH"' "$ROOT/scripts/merge-on-green.sh"; then
   ok "sanctioned merge enforces evidence independently of host hooks"
 else

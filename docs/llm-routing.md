@@ -58,6 +58,11 @@ scripts/context_pipeline.py route --config .orchestration/config.yaml \
   deployments such as MAI-Thinking that do not enable structured
   `response_format`; the runner still validates the object and fails closed on
   surrounding prose.
+- Prompt caching is unconditional. Every payload the pipeline emits carries a
+  breakpoint on its stable prefix, and Anthropic tool loops roll a single
+  further breakpoint to the end of the conversation each round so the
+  accumulated transcript is not re-billed at full input price. No execution
+  mode can turn caching off.
 - Batch jobs use the same resolved provider/model route before
   `sprint-controller.py prepare-batch` persists the provider-native request.
 
