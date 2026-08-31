@@ -34,6 +34,14 @@ wins.
 
 ## Non-negotiable rules
 
+- **Repair mode closes stable IDs.** When the orchestrator supplies a repair
+  brief, do not begin with edits. Map every stable component ID to the verified
+  root cause, planned change, affected callers/boundaries, objective closure
+  condition, and named regression test or equivalent evidence. Address every ID
+  exactly once. After committing, emit the strict repair-report JSON required by
+  the brief; `closed` is a self-assessment only and independent re-review remains
+  authoritative. If any ID is unresolved, say so rather than claiming success.
+
 - **The pre-implementation artifacts are binding.** Before editing production
   code, read the adversarial test matrix supplied by the orchestrator and the
   design-gate artifact when one is required. Verify each row against the current

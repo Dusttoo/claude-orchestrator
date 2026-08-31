@@ -65,7 +65,9 @@ Steps:
    or other inspection, partial execution, cleanup recovery, permissions,
    concurrency, retries, and hostile input. N/A requires a reason. For planned
    security-sensitive infrastructure, launch a fresh
-   `orchestration-design-reviewer`; it must define the trust boundary and
+   `orchestration-design-reviewer`. Open `review-ledger.py design-open
+   <ticket-or-change>`, record every verdict with `design-record`, and stop with
+   `design-handoff` if `max_design_rounds` is spent. It must define the trust boundary and
    impossible guarantees, reject fragile designs, audit the matrix, and return
    `VERDICT: PASS` before implementation.
 
@@ -77,9 +79,10 @@ Steps:
    worktree, SELF_CHECK).
 
 4. **Gate.** Run the gate pipeline on the resulting PR -- invoke
-   `/orchestration:gate <pr>` (code-review, then security-review when the diff
+   `/orchestration:gate <pr>` (code-review and, when the diff
    hits a `security_required_when` trigger). Both must return validated structured
-   PASS results with no blocking findings.
+   PASS results with no blocking findings. Launch both required reviewers
+   concurrently against the same exact head and round brief.
    Give each reviewer the raw unified base-to-head git diff by default, not a
    full-codebase index; only a named verification or regression may expand scope.
    - Reviewers finish the entire checklist and adversarial sweep and batch all
@@ -92,12 +95,15 @@ Steps:
      .orchestration/.review-results/<gate>.json`. It normalizes each finding's
      `[component: <path>:<symbol>]` key, counts strikes across all gates and
      rounds, freezes blocking scope after round 1, and returns `next_action`.
-   - `review` returns blocking findings to a fresh implementer; advisory findings
-     go to the PR body instead. The second failure in one component returns
-     `redesign` -- run the design reviewer scoped to that component with a revised
-     adversarial matrix, never another narrow patch. `escalate-human` means the
-     round cap is spent: STOP, hand the user `review-ledger.py handoff <pr>`, and
-     do not run another round. Re-run complete gates. Do NOT merge on a FAIL.
+   - `review` first generates one `repair-brief` after all gates record. Give its
+     deduplicated stable IDs to a fresh implementer, require root cause/change/
+     affected-boundary/verification evidence for every ID, and record the strict
+     JSON with `record-repair`. Re-run required reviews concurrently on that exact
+     head, record each with `--head <exact-sha>`, and call
+     `complete-repair-review`. Advisory findings go to the PR body.
+     A component that survives a completed repair returns `redesign`. When the
+     repair cap is spent, the ledger returns `escalate-human`: STOP and hand the
+     user `review-ledger.py handoff <pr>`.
 
 5. **Verify (when configured).** For each entry in the config `verification:`
    block whose `when:` includes this configured target, run it on the rebased
@@ -122,5 +128,6 @@ Steps:
    when it is `manual`, preserve and report the worktree. Do not assume a Stop
    hook ran. Report what merged + the click path.
 
-Respect `concurrency_max`: at most that many heavy verification chains at once,
-on non-conflicting areas of the codebase. Dual gates on ONE PR run sequentially.
+Respect `concurrency_max` for ticket lanes and `max_heavy_processes` for local
+build/test/browser chains. Apply provider backpressure when the API ledger shows
+sustained throttling. Dual gates on ONE PR run concurrently against one head.

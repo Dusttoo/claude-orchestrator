@@ -114,3 +114,7 @@ Terminal results are recorded immediately. A refreshed Jira inventory may add
 metadata and tickets, but never overwrites a terminal or running local result.
 Tickets removed from a refreshed query become user action instead of silently
 launching from stale state.
+
+`concurrency_max` is a ticket-lane limit. The host separately admits local
+builds, full test suites, and browser runs under `max_heavy_processes`; model
+lanes waiting on providers do not justify oversubscribing those local commands.

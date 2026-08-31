@@ -49,6 +49,12 @@ grouping field (`role`, `model`, `provider`, `ticket`, `sprint`, `run_id`,
    or with `--role <role>` to isolate one lane. Use `--format json` when the
    result feeds a checkpoint or dashboard rather than a human.
 
+   For throughput and repair quality, run
+   `${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py metrics <pr>` for each
+   applicable durable PR ledger. Include first-attempt/cumulative closure, no-op
+   repairs, design/review rounds, and repair-review elapsed time beside the
+   role/model usage data.
+
 4. **Propose concrete edits.** Recommendations must name the config key and the
    value, in `.orchestration/config.yaml` -- a role's `model`, `effort`, or a
    `budgets` ceiling. Do not edit the config as part of reporting; show the

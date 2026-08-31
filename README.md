@@ -87,15 +87,18 @@ supports them.
   alternatives, and the adversarial tests that falsify its invariants.
 - **Reviews batch the whole sweep.** Finding one blocker never ends a review;
   reviewers finish the diff, checklist, and matrix and report all findings once.
-- **Two component failures trigger redesign.** A stable component-key ledger,
+- **A failed repair triggers scoped redesign.** A stable component-key ledger,
   persisted by `scripts/review-ledger.py`, prevents an endless sequence of narrow
   patches to the same broken design.
 - **The review loop is bounded and converges.** Round 1 sweeps the whole diff
-  with full blocking authority. From round 2 the sweep stays full-diff but only
-  open ledger findings, regressions, and security issues may block, so the
+  with full blocking authority. From round 2 review follows the repair delta and
+  affected boundaries; only open ledger findings, regressions, and security
+  issues may block, so the
   blocking set shrinks. Findings split into blocking and advisory, and
-  `max_review_rounds` (default 3) ends the loop at a human rather than a
-  merge. See [docs/review-loop.md](docs/review-loop.md).
+  `max_design_rounds` (default 5) and `max_repair_cycles` (default 2) end their
+  respective loops at a human rather than a merge. Repairs are recorded against
+  stable finding IDs and re-reviewed on one exact head. See
+  [docs/review-loop.md](docs/review-loop.md).
 - **Enforcement is mechanical, not advisory.** The sanctioned merge script
   refuses stale or mismatched evidence even without hooks. A trusted merge-guard
   hook can also veto raw merge commands.
@@ -153,6 +156,8 @@ Legacy key blocks:
 | `security_required_when` | diff triggers that make the security gate mandatory |
 | `sprint_id` / `sprint_*` | configured Jira sprint, dependency/status mapping, and checkpoint location |
 | `concurrency_max` | how many ticket workflows or verification chains run at once |
+| `max_heavy_processes` | separate host-local limit for builds, full tests, and browser suites |
+| `max_design_rounds` / `max_repair_cycles` | independent caps for pre-code design and evidenced post-code repairs |
 | `worktree_cleanup` | `manual` (safe default) or `auto` for clean, unlocked worktrees |
 | `rules_docs` | the docs every gate agent reads (`CLAUDE.md`, `AGENTS.md`) |
 
@@ -221,9 +226,9 @@ drives one unit of work through the whole pipeline: scope/adversarial matrix ->
 design gate for security-sensitive infrastructure -> implement (worktree, TDD) ->
 code review (fresh agent) -> security review (when the diff warrants) -> optional
 verification -> record the all-green marker -> merge -> verify it landed. Any
-gate returning a structured FAIL result loops back with a complete batch of findings;
-the second failure in one component forces redesign instead of another narrow
-patch. Nothing merges red.
+gate returning a structured FAIL result loops back with a complete batch of
+findings; a finding that survives an evidenced repair forces scoped redesign
+before the final attempt. Nothing merges red.
 
 The slash command is the explicit, deterministic entry point. Natural language
 works too: asking to "orchestrate BL-90" or "run this ticket through the

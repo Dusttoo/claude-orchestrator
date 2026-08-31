@@ -27,7 +27,7 @@ eq "the [component: ...] wrapper and casing normalize to the same key" \
   "src/auth/session.ts:refreshtoken" \
   "$(led record 1 --gate code-review --verdict FAIL --blocking '[component: SRC/auth/Session.ts:RefreshToken]' | field open_blocking)"
 eq "the same defect named twice accumulates a second strike" \
-  "redesign" "$(led status 1 | field next_action)"
+  "2" "$(led status 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["components"]["src/auth/session.ts:refreshtoken"]["strikes"])')"
 
 # --- round 1 has full blocking authority --------------------------------------
 led open 2 >/dev/null
@@ -56,29 +56,41 @@ out="$(led record 4 --gate security-review --verdict FAIL --blocking 'src/rls/po
 eq "a late security finding is never demoted" "src/rls/policy.sql:tenantisolation" "$(printf '%s' "$out" | field accepted_blocking)"
 eq "a late security finding still fails the gate" "FAIL" "$(printf '%s' "$out" | field effective_verdict)"
 
-# --- two strikes, redesign, and the cap ---------------------------------------
-led open 5 --max-rounds 3 >/dev/null
-led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/null
-eq "a second strike on one component demands a redesign" \
-  "redesign" "$(led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' | field next_action)"
+# --- explicit repairs, redesign, and the cap ----------------------------------
+led open 5 --max-rounds 2 >/dev/null
+led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef1 >/dev/null
+led repair-brief 5 | grep -q 'stable finding ID' && ok "repair brief carries stable IDs" || bad "repair brief carries stable IDs"
+cat > "$TMP/repair-1.json" <<'JSON'
+{"schema_version":1,"head":"abcdef1","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"wrong branch","change":"corrected branch","verification":"named regression passes"}]}
+JSON
+eq "recording a repair starts a pending review" "True" "$(led record-repair 5 --report "$TMP/repair-1.json" | field repair_pending_review)"
+if led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef2 >/dev/null 2>&1; then
+  bad "a reviewer cannot record against the wrong repaired head"
+else ok "a reviewer cannot record against the wrong repaired head"; fi
+led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef1 >/dev/null
+eq "a repaired head must complete its required gate set" \
+  "redesign" "$(led complete-repair-review 5 | field next_action)"
 eq "a passing design gate releases the component for another fix" \
   "review" "$(led redesign 5 --key 'src/a.ts:foo' --verdict PASS | field next_action)"
+cat > "$TMP/repair-2.json" <<'JSON'
+{"schema_version":1,"head":"abcdef2","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"boundary missed","change":"fixed boundary","verification":"boundary regression passes"}]}
+JSON
+led record-repair 5 --report "$TMP/repair-2.json" >/dev/null
+led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef2 >/dev/null
 eq "spending the round cap with findings open stops the loop" \
-  "escalate-human" "$(led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' | field next_action)"
+  "escalate-human" "$(led complete-repair-review 5 | field next_action)"
 if led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/null 2>&1; then
   bad "an escalated ledger must refuse further rounds"
 else ok "an escalated ledger refuses further rounds"; fi
 led handoff 5 2>/dev/null | grep -q "Still blocking" && ok "handoff renders the human report" || bad "handoff renders the human report"
 
-# --- the cap counts fix cycles, not review passes -----------------------------
-# A PR running both gates records two passes per cycle. Counting raw passes would
-# spend the budget of exactly the security-sensitive PRs that need it most.
+# --- the cap counts explicit repairs, not review passes ------------------------
 led open 9 --max-rounds 2 >/dev/null
 led record 9 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/null
 led record 9 --gate security-review --verdict PASS >/dev/null
 led record 9 --gate code-review --verdict PASS >/dev/null
-eq "a passing gate does not spend a fix cycle" "1" "$(led status 9 | field fix_cycles)"
-eq "three passes with one failure still clears" "gates-clear" "$(led status 9 | field next_action)"
+eq "review passes do not spend a repair cycle" "0" "$(led status 9 | field fix_cycles)"
+eq "three passes without a repair can still clear" "gates-clear" "$(led status 9 | field next_action)"
 
 # --- the clean path -----------------------------------------------------------
 led open 6 >/dev/null
@@ -106,16 +118,33 @@ else ok "a PASS listing blocking findings is rejected"; fi
 # --- round-aware guidance -----------------------------------------------------
 led open 7 >/dev/null
 led brief 7 | grep -q "block-on-doubt\|treat it as BLOCKING" && ok "round 1 briefs block-on-doubt" || bad "round 1 briefs block-on-doubt"
-led record 7 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/null
-led record 7 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/null
+led record 7 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef7 >/dev/null
+cat > "$TMP/repair-7.json" <<'JSON'
+{"schema_version":1,"head":"abcdef7","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"bad condition","change":"fixed condition","verification":"regression passes"}]}
+JSON
+led record-repair 7 --report "$TMP/repair-7.json" >/dev/null
+led record 7 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef7 >/dev/null
+led complete-repair-review 7 >/dev/null
 led brief 7 | grep -q "ADVISORY and name the exact evidence" && ok "round 3 briefs advisory-on-doubt" || bad "round 3 briefs advisory-on-doubt"
 led brief 7 | grep -q "REDESIGN REQUIRED" && ok "the brief flags a component needing redesign" || bad "the brief flags a component needing redesign"
+
+# --- pre-code design rounds have their own durable cap -------------------------
+led design-open BL-1 --max-design-rounds 2 >/dev/null
+eq "a failed design returns to redesign" "redesign" "$(led design-record BL-1 --verdict FAIL --evidence 'boundary incomplete' | field next_action)"
+eq "the independent design cap escalates" "escalate-human" "$(led design-record BL-1 --verdict FAIL --evidence 'boundary still incomplete' | field next_action)"
+led design-handoff BL-1 | grep -q 'No production implementation is authorized' && ok "design handoff blocks implementation" || bad "design handoff blocks implementation"
 
 # --- aliasing merges a drifted key --------------------------------------------
 led open 8 >/dev/null
 led record 8 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/null
 led record 8 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --blocking 'src/a.ts:fooHelper' --regression 'src/a.ts:fooHelper' >/dev/null
 eq "aliasing a drifted key merges its strikes" "3" "$(led alias 8 --from 'src/a.ts:fooHelper' --to 'src/a.ts:foo' | field strikes)"
+
+# --- v0.7 ledgers preserve their already-spent budget -------------------------
+cat > "$TMP/.orchestration/.review-ledger/pr-legacy.json" <<'JSON'
+{"schema_version":1,"pr":"legacy","created_at":"2026-01-01T00:00:00+00:00","updated_at":"2026-01-01T00:00:00+00:00","max_rounds":2,"rounds":[{"round":1,"gate":"code-review","scope_mode":"full-authority","claimed_verdict":"FAIL","effective_verdict":"FAIL","recorded_at":"2026-01-01T00:00:00+00:00","blocking":["src/a.ts:foo"],"advisory":[],"resolved":[]}],"components":{"src/a.ts:foo":{"key":"src/a.ts:foo","display":"src/a.ts:foo","strikes":1,"status":"open","first_round":1,"last_round":1,"rounds":[1],"gates":["code-review"],"redesigned_at_strike":0}},"escalated":false}
+JSON
+eq "v0.7 failed passes retain their spent repair budget" "1" "$(led status legacy | field fix_cycles)"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "review ledger tests passed"; else echo "$fails FAILED"; fi

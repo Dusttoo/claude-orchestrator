@@ -105,10 +105,14 @@ working directory.
    inspection commands, partial execution, cleanup/recovery, permissions,
    concurrency, retries, and hostile inputs; mark a category N/A only with a
    reason. If the planned change touches security-sensitive infrastructure, run
-   a fresh pre-code design review with `orchestration-design-reviewer.md`. It must
+   a fresh pre-code design review with `orchestration-design-reviewer.md`. Open
+   its durable counter with `review-ledger.py design-open <ticket-or-change>` and
+   record every result with `design-record --verdict <PASS|FAIL> --evidence
+   <artifact>`. It must
    define the trust boundary and impossible guarantees, reject fragile designs,
-   audit the matrix, and end `VERDICT: PASS`. A FAIL returns to design. Pass the
-   approved artifacts to the implementer.
+   audit the matrix, and end `VERDICT: PASS`. A FAIL returns to design until
+   `max_design_rounds`; then stop with `design-handoff`. Pass the approved
+   artifacts to the implementer.
 
 3. **Implement.** Run the implementer role from
    `orchestration-implementer.md`, passing the ticket body and the click-path. If
@@ -119,8 +123,8 @@ working directory.
    configured source branch, one PR to the legacy configured target branch. Wait for its structured report
    (PR number, branch, worktree, SELF_CHECK).
 
-4. **Gate.** Run the review gates on the PR: a fresh code-review role using
-   `orchestration-code-reviewer.md` (no implementer context), then a fresh
+4. **Gate.** Run the review gates on the PR concurrently against one exact head:
+   a fresh code-review role using `orchestration-code-reviewer.md` (no implementer context), and a fresh
    security-review role using `orchestration-security-reviewer.md` when the diff
    hits a `security_required_when` trigger. Both must return validated structured
    PASS results with no blocking findings. On
@@ -138,10 +142,14 @@ working directory.
    `[component: <path>:<symbol>]` key so a repeated defect actually accumulates
    strikes, freezes blocking scope after round 1, and returns `next_action`:
 
-   - `review` -- return the blocking findings to a fresh implementer on the same
-     branch. Advisory findings go to the PR body, never the implementer's brief.
-   - `redesign` -- the second failure in that component, across any gate or
-     round. Return to the design gate for a root-cause redesign scoped to that
+   - `review` -- after all gates record, generate one `repair-brief`; return its
+     deduplicated stable IDs to a fresh implementer on the same branch. Require
+     root cause, change, affected boundaries, closure condition, and verification
+     for every ID. Record the strict report with `record-repair`, concurrently
+     re-run code and required security review on that exact head, then call
+     `record ... --head <exact-sha>` for each result and
+     `complete-repair-review`. Advisory findings never enter the repair brief.
+   - `redesign` -- a component survived a completed repair. Return to the design gate for a root-cause redesign scoped to that
      component with a revised adversarial matrix before any more code is changed;
      do not authorize another narrow patch. Record its PASS with
      `review-ledger.py redesign <pr> --key <key> --verdict PASS`.
@@ -151,7 +159,8 @@ working directory.
    - `gates-clear` -- necessary, not sufficient; confirm the security gate ran if
      the diff triggers it.
 
-   Re-run the complete gates after every fix or redesign. Never merge on a FAIL.
+   On later rounds, code review covers the repair delta and affected boundaries;
+   security still audits every relevant trust boundary. Never merge on a FAIL.
 
 5. **Verify (when configured).** For each `verification:` entry whose `when:`
    matches the configured target, run the resolved `run-verification.sh <name>`
@@ -177,6 +186,9 @@ working directory.
    `manual`, preserve the worktree and report its path. Report what merged and
    the click path. Do not assume a lifecycle hook ran.
 
-Respect `concurrency_max`: at most that many heavy verification chains at once,
-on non-conflicting areas. Dual gates on ONE PR run sequentially. CI-green alone
+Respect `concurrency_max` for ticket lanes and `max_heavy_processes` for local
+build/test/browser chains. When the API ledger shows sustained rate-limit wait,
+stop admitting work to that provider until it recovers; preserve reservations and
+let safe work routed elsewhere continue. Dual gates on ONE PR run concurrently
+against one immutable head. CI-green alone
 is NOT the gate; the independent VERDICTs are mandatory.

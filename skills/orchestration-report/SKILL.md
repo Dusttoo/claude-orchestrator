@@ -59,6 +59,12 @@ Work through these in order and report only what the data supports:
 Re-run grouped by `ticket` to find which work is expensive, by `day` for a
 trend, by `model` to compare routes, or with `--role <role>` to isolate a lane.
 
+For throughput and repair quality, enumerate the applicable durable PR ledgers
+and run `../../scripts/review-ledger.py metrics <pr>` from the target repository.
+Report first-attempt and cumulative finding closure, no-op repairs, design/review
+rounds, and repair-review elapsed time beside the API role/model figures. Do not
+infer repair quality from token spend alone.
+
 ## 4. Recommend
 
 Name the config key and the value in `.orchestration/config.yaml`: a role's
