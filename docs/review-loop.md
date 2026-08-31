@@ -13,8 +13,8 @@ four properties that kept pushing it away from that exit:
 1. **A fresh reviewer every round.** No memory of what was already adjudicated,
    by design, so the author's narrative can never contaminate the gate. The cost
    is that each round is an independent draw from the space of possible findings.
-2. **A full re-sweep every round**, over a diff that grows with each fix. More
-   surface to find something new in, every time.
+2. **A fresh broad hunt every round**, over a diff that grows with each fix. More
+   unrelated surface to find something new in, every time.
 3. **No severity floor.** "There is no minor, merge anyway" made a note about
    premature abstraction as load-bearing as an IDOR.
 4. **A doubt rule calibrated for round 1**, applied identically at round 8: *a
@@ -25,7 +25,7 @@ Together those make P(some blocking finding) roughly constant round over round.
 That is a process with no absorbing state, and 10+ rounds is its expected tail,
 not an anomaly.
 
-The two-strikes redesign escalation was supposed to break exactly this cycle, and
+The old strike-based redesign escalation was supposed to break exactly this cycle, and
 it almost never fired. It counted failures per `[component: ...]` key -- a
 free-text string each fresh reviewer invented. `auth/sessionStore` in round 1 and
 `session-refresh` in round 4 are the same defect wearing two names, so the strike
@@ -40,10 +40,9 @@ else serves.
 - **Round 1 -- full authority.** Sweep the whole diff; every defect class may
   block. Thoroughness is free here, and a defect not raised now loses blocking
   authority later, so there is pressure to be exhaustive exactly once.
-- **Round 2+ -- scope freeze.** Still sweep the whole diff (a fix in one round
-  routinely breaks something from another; that safety net stays). What narrows
-  is not what the reviewer *looks at*, it is what may *block*: open ledger
-  components, regressions in the delta, and security or data-loss findings.
+- **Round 2+ -- scope freeze.** Inspect the repair delta, every open component,
+  and affected callers/trust boundaries. What may block is also narrow: open
+  ledger components, regressions in the delta, and security or data-loss findings.
   Anything else newly noticed becomes advisory.
 - **Blocking vs advisory.** Correctness, security, uncovered acceptance criteria,
   disabled tests, cross-surface disagreement, and root-cause suppression block.
@@ -55,13 +54,16 @@ else serves.
   them.
 - **Keys that are derived, not invented.** `[component: <path>:<symbol>]`, with
   line numbers stripped (they drift on rebase) and free-text subsystem names
-  rejected. `review-ledger.py` normalizes them, so the same defect accumulates
-  strikes and the second one actually triggers a scoped redesign.
-- **A cap that ends the loop at a human.** `max_review_rounds` (default 3)
-  counts *fix cycles* -- rounds that sent the PR back -- not review passes, so a
-  PR running both gates is not penalized for the extra pass. This is not a merge:
-  blocking findings still block. It stops the loop and hands over a report
-  instead of running round eleven.
+  rejected. `review-ledger.py` normalizes them so one repair brief cannot split a
+  repeated defect into multiple identities.
+- **Separate caps end both loops.** `max_design_rounds` (default 5) counts
+  pre-code design verdicts. `max_repair_cycles` (default 2) counts explicit
+  repair reports, not review passes, so concurrent code and security gates
+  consume one attempt together. Neither cap permits a merge with blockers.
+- **A repair is a checkable artifact.** `repair-brief` emits one deduplicated set
+  of finding IDs. `record-repair` requires root cause, change, and verification
+  for every ID. `complete-repair-review` closes an attempt only after every
+  required gate reviews that exact head.
 
 ## The ledger
 
@@ -74,9 +76,21 @@ review-ledger.py open <pr>                    # once per PR
 review-ledger.py brief <pr>                   # paste into every reviewer brief
 review-ledger.py record <pr> --gate code-review \
   --result .orchestration/.review-results/code-review.json
+review-ledger.py repair-brief <pr>
+review-ledger.py record-repair <pr> --report .orchestration/.review-results/repair.json
+review-ledger.py complete-repair-review <pr>
+review-ledger.py metrics <pr>
 review-ledger.py status <pr>                  # strikes, open set, next action
 review-ledger.py redesign <pr> --key <key> --verdict PASS
 review-ledger.py handoff <pr>                 # the human escalation report
+```
+
+Pre-code design uses the same durable store keyed by ticket/change identifier:
+
+```bash
+review-ledger.py design-open <ticket>
+review-ledger.py design-record <ticket> --verdict FAIL --evidence <artifact>
+review-ledger.py design-handoff <ticket>
 ```
 
 `record` is where the mechanics live. It increments strikes, auto-resolves any
@@ -86,15 +100,14 @@ and returns `next_action`:
 
 | `next_action` | meaning |
 |---|---|
-| `review` | relay blocking findings to a fresh implementer, re-run the gate |
-| `redesign` | second strike on one component -- scoped design gate, not another patch |
+| `review` | generate one repair brief, record the repair, re-run all required gates |
+| `redesign` | a finding survived a completed repair -- scoped design gate |
 | `escalate-human` | cap spent with findings open -- stop, hand over `handoff` |
 | `gates-clear` | necessary, not sufficient; confirm the security gate ran |
 
-Two guardrails are enforced rather than requested. `record` refuses a round once
-the fix-cycle budget is spent, so the cap cannot be ignored by an orchestrator
-that keeps going; raise it deliberately with `open <pr> --max-rounds N` if that is
-the call.
+The repair report must cover the exact open finding set. A repaired head cannot
+complete until every required gate records, and no third repair starts after the
+configured cap.
 And the ledger's `effective_verdict` governs, not the reviewer's claimed one --
 a round whose findings were all demoted is a PASS with advisories attached.
 
@@ -107,8 +120,8 @@ Convergence is a scheduling concern; it is not a reason to ship a data leak.
 
 ## Tuning
 
-`max_review_rounds: 3` suits most tickets. Raise it for large or exploratory
-changes. `2` gives a strict, fast-failing loop for small well-specified work.
+`max_design_rounds: 5` lets architecture converge before implementation. Keep
+`max_repair_cycles: 2` unless measured closure data proves another value safer.
 
 Resist raising it as a reflex. A ticket that repeatedly burns the cap is usually
 telling you the acceptance criteria are too vague to test against -- the same

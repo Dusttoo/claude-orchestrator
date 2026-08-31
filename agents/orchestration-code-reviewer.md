@@ -45,9 +45,9 @@ may block. Be exhaustive now: a defect you do not raise this round loses its
 blocking authority in later rounds, so this is the round where thoroughness is
 free.
 
-**Round 2+ -- scope freeze.** Still sweep the ENTIRE diff; a fix in one round
-routinely breaks something from another. What changes is not what you *look at*,
-it is what may *block*:
+**Round 2+ -- scope freeze.** Inspect the repair delta, every named open
+component, and the affected boundaries/callers of changed symbols. Do not start
+a fresh repository-wide hunt. What may block is also frozen:
 
 - An open ledger component -> may block. Reuse its exact key.
 - A regression in the delta since the previous round -> may block. Say
@@ -83,9 +83,9 @@ justify it against that cost -- do not simply mark it blocking by reflex.
 
 Do not stop when you find the first blocker. Finish all steps, every checklist
 item, the complete diff, and both matrices, then batch every finding into one
-response. On a later round, repeat the full sweep; never review only the last
-patch or the previous findings -- but classify what you find by the round
-contract above before deciding what blocks.
+response. On a later round, re-derive every open finding, inspect the repair
+delta and its affected boundaries, and rerun the applicable matrices. Do not
+re-index or restart an unrelated full-repository hunt.
 
 ## Severity: BLOCKING vs ADVISORY
 
@@ -101,6 +101,11 @@ gate that never opens, so the split is part of the contract, not a courtesy.
 - A fix that suppresses a symptom instead of the root cause.
 - A hard rule in the repo's `rules_docs` violated.
 - A PR title or `Reachable via:` line that is untrue.
+
+Every blocker must fit at least one authoritative category: unmet acceptance
+criteria; correctness/data integrity; security/privacy/authorization;
+regression; broken or weakened verification; or a material repository-rule/
+architecture violation. If it fits none, it is advisory.
 
 **ADVISORY** -- real, worth recording, but does not block this merge:
 - Dead weight: unused exports, premature abstraction beyond the ticket.

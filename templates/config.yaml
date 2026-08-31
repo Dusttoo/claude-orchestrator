@@ -179,23 +179,20 @@ gates:
   - code-review
   - security-review
 
-# --- Review loop bounds -------------------------------------------------- agent
-# A review loop with no termination condition runs until something external stops
-# it. These two keys bound it.
+# --- Design and repair bounds -------------------------------------------- agent
+# Pre-code design iteration and post-code repair are different loops. Design may
+# converge through several architecture revisions without wasting implementation;
+# a repair that leaves agreed findings open is expensive and must fail fast.
 #
-# `max_review_rounds` is how many FIX CYCLES one PR may spend -- rounds that sent
-# it back for changes -- before the loop STOPS and hands the PR to a human. A
-# passing gate costs nothing, so a PR running both the code and security gates is
-# not penalized for it. Hitting the cap is not a merge: blocking findings still
-# block. It ends the loop instead of letting it run indefinitely.
+# `max_design_rounds` counts pre-implementation design verdicts. Production code
+# remains unauthorized until PASS. `max_repair_cycles` counts explicit repair
+# reports, not reviewer passes; concurrent code and security reviews therefore
+# consume one repair attempt together. Hitting either cap escalates, never merges.
 # Round 1 sweeps the whole diff with full blocking authority; from round 2 the
 # scope freezes, and only open ledger components, regressions in the delta, and
 # security findings can block. That is what makes the blocking set shrink.
-#
-# Raise it for large or exploratory changes; 2 makes a strict, fast-failing loop.
-# A ticket that repeatedly hits the cap is usually underspecified, not badly
-# implemented -- scope it harder rather than raising this.
-max_review_rounds: 3
+max_design_rounds: 5
+max_repair_cycles: 2
 review_ledger_dir: .orchestration/.review-ledger
 
 # --- Security-gate trigger ------------------------------------------------ agent
@@ -254,6 +251,9 @@ sprint_checkpoint_dir: .orchestration/.sprint-state
 # Max concurrent per-ticket sprint workflows and heavy verification chains. Drop
 # to 1 under CI contention or when agents would collide on a shared test branch.
 concurrency_max: 2
+# Host-local heavy commands (builds, full test suites, browser suites) use this
+# smaller admission limit even when more model lanes are active.
+max_heavy_processes: 2
 
 # --- Worktrees ------------------------------------------------------------ both
 worktree_base: .claude/worktrees   # where isolated agent worktrees are created

@@ -57,7 +57,10 @@ instead of duplicated.
    reviewer pass this round: it carries the round number, the scope mode, the
    round-aware uncertainty rule, and the open component keys to reuse. Without it
    a reviewer assumes round 1 and reviews with full blocking authority.
-3. Run the code-review gate as a fresh review pass. If the host supports
+3. Launch the code-review gate and any required security-review gate concurrently
+   against the same exact PR head, raw diff, and round brief. Do not let one
+   reviewer's findings contaminate the other's independent pass. Run code review
+   as a fresh pass. If the host supports
    subagents, launch one with `orchestration-code-reviewer.md`; otherwise apply
    that brief yourself without using the implementer's reasoning as evidence.
    Generate and pass the raw unified base-to-head git diff as the default and
@@ -67,36 +70,40 @@ instead of duplicated.
    The reviewer must finish the full checklist, diff, and adversarial matrix even
    after finding a blocker, then return only concise structured review JSON.
    Explanations belong only to findings; each finding has a stable component key.
-4. Inspect the PR diff against `security_required_when`. If any trigger matches,
-   run a fresh security-review pass using `orchestration-security-reviewer.md`
+4. Inspect the PR diff against `security_required_when` before launching the
+   pair. If any trigger matches, run a fresh security-review pass using
+   `orchestration-security-reviewer.md`
    with the same raw unified diff and diff-isolated context.
    If nothing matches, record that the security gate was skipped because the diff
    has no configured security surface.
-5. Record every completed gate through the ledger, blocking and advisory findings
+5. Wait for both launched reviewers, then record every completed gate through the
+   ledger, blocking and advisory findings
    alike: `review-ledger.py record <pr> --gate code-review --result
    .orchestration/.review-results/code-review.json`. The validated JSON carries
    disposition, severity, regression, and explanation. The ledger increments strikes, auto-resolves components this gate
    no longer reports, demotes out-of-scope new findings in a frozen round, and
    returns `next_action`. Its `effective_verdict` governs, not the claimed one.
 6. Act on `next_action`. Never merge while a blocking component is open.
-   - `review` -- relay the reviewer's exact wording of each blocking finding to a
-     fresh implementer to fix on the same branch, then re-run the failed gate.
-     Relay by grep target or symbol, not by copying the reviewer's `file:line`
-     (it drifts once the branch moves); label each finding as reviewer-reported
-     so the implementer re-derives it rather than trusting it. Advisory findings
-     go to the PR body, never into the implementer's brief -- widening the fix
-     widens the next sweep. Then re-run each complete gate, not only the prior
-     finding.
-   - `redesign` -- the second failure in one component. Run
+   - `review` -- run `review-ledger.py repair-brief <pr>` once after all gates
+     record. Give that single deduplicated brief to one fresh implementer on the
+     same branch. The implementer must map every stable finding ID to root cause,
+     planned change, affected boundaries, objective closure condition, and named
+     verification before editing. After editing it writes the strict repair JSON
+     named by the brief; record it with `review-ledger.py record-repair <pr>
+     --report <file>`. A claimed closure is not proof. Re-run code and required
+     security reviewers concurrently against that exact repaired head, record
+     both with `record ... --head <exact-sha>`, then call `review-ledger.py
+     complete-repair-review <pr>`. Advisory
+     findings go to the PR body and never widen the repair.
+   - `redesign` -- an agreed finding survived a completed repair. Run
      `orchestration-design-reviewer.md` scoped to the named component against the
      root design and a revised adversarial matrix; no further implementation
      starts until it returns `VERDICT: PASS`, then record
      `review-ledger.py redesign <pr> --key <key> --verdict PASS`.
-   - `escalate-human` -- the round cap is spent with blocking findings still open.
+   - `escalate-human` -- the repair cap is spent with blocking findings still open.
      STOP: do not merge and do not run another round. Give the user
      `review-ledger.py handoff <pr>` with the PR link. A component that survives
-     this many strikes is usually underspecified acceptance criteria, not
-     stubborn code.
+     two evidenced repairs needs human diagnosis, not another autonomous patch.
    - `gates-clear` -- necessary, not sufficient. Confirm the security gate
      actually ran if the diff triggers it, then continue.
 7. For each configured `verification:` entry whose `when:` applies to the target,

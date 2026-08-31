@@ -23,6 +23,7 @@ The controller atomically writes under `sprint_checkpoint_dir` (default
 `.orchestration/.sprint-state`) and reads these top-level config keys:
 
 - `concurrency_max`
+- `max_heavy_processes`
 - `sprint_checkpoint_dir`
 - `sprint_ready_statuses`
 - `sprint_done_statuses`
@@ -194,6 +195,13 @@ Before launching, resolve the executable because non-interactive SSH shells may 
    the sprint controller. If configuration was lowered below the number of
    already-running workers, `over_capacity` reports the excess and no new lane
    is admitted until enough workers finish.
+
+   `concurrency_max` limits ticket workflows, not the builds and browser suites
+   those workflows spawn. Admit at most `max_heavy_processes` simultaneous local
+   heavy commands across the host. When the API usage ledger shows sustained
+   rate-limit waiting for one provider, stop admitting new work routed there;
+   preserve reservations and allow independent work on healthy routes to
+   continue. Bounded retries remain owned by `api_agent.py`.
 
 8. **Return the exact terminal report.** Run `summary --sprint <id>`. Present
    separate completed, blocked, and user-action sections, retaining PR/branch,

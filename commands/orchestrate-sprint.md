@@ -108,6 +108,11 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    config reduction, launch nothing until existing workers finish. Never bypass
    the single-ticket gates or narrow-patch a ticket from this controller.
 
+   Limit host-local builds, full tests, and browser suites separately with
+   `max_heavy_processes`. If the API ledger shows sustained throttling for one
+   provider, pause new admissions to that provider while preserving reservations
+   and letting healthy routes continue; `api_agent.py` owns bounded retries.
+
 8. Run `summary --sprint <id>` and return separate completed, blocked, and
    user-action sections with their reasons, PR/branch, and run references. Report
    any still-running entries. Do not call the Jira sprint complete merely because

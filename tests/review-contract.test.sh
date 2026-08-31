@@ -46,7 +46,8 @@ done
 
 for file in skills/orchestrate-ticket/SKILL.md skills/gate-pr/SKILL.md commands/orchestrate.md commands/gate.md; do
   require_text "$file" "failure ledger" "orchestrator tracks repeated component failures"
-  require_text "$file" "second failure" "second component failure triggers redesign"
+  require_text "$file" "record-repair" "repairs are durable artifacts"
+  require_text "$file" "complete-repair-review" "all required gates close one repair attempt"
 done
 
 # --- review-loop convergence contracts ----------------------------------------
@@ -66,10 +67,11 @@ require_text agents/orchestration-code-reviewer.md "ADVISORY -- report it, do no
   "dead weight is advisory, not a merge blocker"
 require_text agents/orchestration-security-reviewer.md "exempt from the review loop's scope freeze" \
   "security findings keep blocking authority in every round"
-require_text agents/orchestration-design-reviewer.md "Second strike on one component" \
-  "second-strike redesign is scoped to the failing component"
-require_text templates/config.yaml "max_review_rounds" "the round cap is configurable"
-require_text templates/ORCHESTRATION.md "max_review_rounds" "the round cap is documented"
+require_text agents/orchestration-design-reviewer.md "Finding survived a completed repair" \
+  "failed-repair redesign is scoped to the failing component"
+require_text templates/config.yaml "max_design_rounds" "the design cap is configurable"
+require_text templates/config.yaml "max_repair_cycles" "the repair cap is configurable"
+require_text templates/ORCHESTRATION.md "max_repair_cycles" "the repair cap is documented"
 
 for file in skills/orchestrate-ticket/SKILL.md skills/gate-pr/SKILL.md commands/orchestrate.md commands/gate.md; do
   require_text "$file" "review-ledger.py" "orchestrator drives the durable review ledger"

@@ -16,6 +16,10 @@ ok()   { echo "  ok: $*"; }
 BASE_ROLE="${PREFLIGHT_BRANCH_ROLE:-integration}"
 BASE_BRANCH="$(orch_branch_name "$BASE_ROLE")"
 CONCURRENCY="$(orch_get concurrency_max 2)"
+MAX_HEAVY="$(orch_get max_heavy_processes 2)"
+case "$CONCURRENCY:$MAX_HEAVY" in
+  *[!0-9:]*|0:*|*:0) fail "concurrency_max and max_heavy_processes must be positive integers" ;;
+esac
 
 echo "== orchestration preflight =="
 
@@ -61,4 +65,4 @@ if [ -f playwright.config.ts ] || [ -f playwright.config.js ]; then
 fi
 
 echo "== preflight PASSED =="
-echo "Next: dispatch up to ${CONCURRENCY} Ready ticket(s), one implementer per ticket (Agent, isolation: worktree)."
+echo "Next: dispatch up to ${CONCURRENCY} Ready ticket(s), with at most ${MAX_HEAVY} simultaneous heavy local checks."
