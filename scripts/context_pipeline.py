@@ -44,7 +44,7 @@ DROP_JIRA_KEYS = {
 ROUTE_FIELDS = {"execution", "provider", "fallback", "model", "effort", "allowed_tools"}
 LLM_POLICY_BLOCKS = {"budgets", "pricing"}
 EXECUTIONS = {"desktop", "api"}
-PROVIDERS = {"anthropic", "openai", "azure_adm"}
+PROVIDERS = {"anthropic", "openai", "azure_adm", "bedrock"}
 FALLBACKS = {"desktop", "none"}
 EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 REVIEW_MODES = {"code-review", "security-review"}
@@ -245,7 +245,7 @@ def _validate_route(route: dict[str, Any], role: str) -> dict[str, Any]:
         raise ContextError(f"llm route {role} execution must be desktop or api")
     if provider not in PROVIDERS:
         raise ContextError(
-            f"llm route {role} provider must be anthropic, openai, or azure_adm"
+            f"llm route {role} provider must be anthropic, openai, azure_adm, or bedrock"
         )
     if fallback not in FALLBACKS:
         raise ContextError(f"llm route {role} fallback must be desktop or none")
@@ -582,6 +582,38 @@ def azure_adm_payload(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def bedrock_payload(args: argparse.Namespace) -> dict[str, Any]:
+    """Return a native Amazon Bedrock Converse request with a stable cache prefix."""
+    stable, dynamic = ordered_context(args)
+    boundary = args.cache_boundary
+    if boundary == "auto":
+        boundary = "repo-map"
+    index = 1 if boundary == "rules" else 2
+    system: list[dict[str, Any]] = []
+    for position, value in enumerate(stable):
+        system.append({"text": value})
+        if position == index:
+            system.append({"cachePoint": {"type": "default", "ttl": "1h"}})
+    additional: dict[str, Any] = {}
+    if args.effort:
+        additional["thinking"] = {"type": "adaptive"}
+        additional["output_config"] = {"effort": args.effort}
+    if args.mode in REVIEW_MODES:
+        additional.setdefault("output_config", {})["format"] = {
+            "type": "json_schema",
+            "schema": review_output_schema(args.mode),
+        }
+    result: dict[str, Any] = {
+        "modelId": args.model,
+        "inferenceConfig": {"maxTokens": args.max_tokens},
+        "system": system,
+        "messages": [{"role": "user", "content": [{"text": dynamic}]}],
+    }
+    if additional:
+        result["additionalModelRequestFields"] = additional
+    return result
+
+
 def provider_payload(args: argparse.Namespace) -> dict[str, Any]:
     if args.config:
         if not args.role:
@@ -602,12 +634,16 @@ def provider_payload(args: argparse.Namespace) -> dict[str, Any]:
         return anthropic_payload(args)
     if args.provider == "azure_adm":
         return azure_adm_payload(args)
+    if args.provider == "bedrock":
+        return bedrock_payload(args)
     return openai_payload(args)
 
 
 def add_payload_arguments(command: argparse.ArgumentParser, provider: bool = True) -> None:
     if provider:
-        command.add_argument("--provider", choices=["anthropic", "openai", "azure_adm"])
+        command.add_argument(
+            "--provider", choices=["anthropic", "openai", "azure_adm", "bedrock"]
+        )
     command.add_argument("--config", help="resolve provider/model/effort from an API role route")
     command.add_argument("--role", help="role to resolve when --config is used")
     command.add_argument("--role-file", action="append", default=[], required=True)

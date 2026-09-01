@@ -48,6 +48,25 @@ class FakeTransport:
         return response
 
 
+class FakeBedrockClient:
+    def __init__(self, *, response=None, error=None):
+        self.response = response or {}
+        self.error = error
+        self.calls = []
+
+    def count_tokens(self, **payload):
+        self.calls.append(("count_tokens", payload))
+        if self.error:
+            raise self.error
+        return self.response
+
+    def converse(self, **payload):
+        self.calls.append(("converse", payload))
+        if self.error:
+            raise self.error
+        return self.response
+
+
 class ApiAgentTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -130,6 +149,60 @@ self_check:
             self.assertEqual(
                 os.environ["AZURE_ADM_BASE_URL"],
                 "https://resource.openai.azure.com/openai/v1",
+            )
+
+    @unittest.skipUnless(importlib.util.find_spec("botocore"), "optional Bedrock SDK absent")
+    def test_bedrock_transport_uses_request_metadata_and_aws_request_id(self):
+        client = FakeBedrockClient(
+            response={
+                "ResponseMetadata": {"RequestId": "aws-request-123"},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+                "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+            }
+        )
+        transport = api_agent.HttpTransport(bedrock_client=client)
+        response = transport.request(
+            "bedrock",
+            "converse",
+            {
+                "modelId": "global.anthropic.claude-sonnet-5",
+                "messages": [{"role": "user", "content": [{"text": "hello"}]}],
+                "inferenceConfig": {"maxTokens": 100},
+            },
+            idempotency_key="resv_123",
+        )
+        self.assertEqual(response["id"], "aws-request-123")
+        self.assertEqual(
+            client.calls[0][1]["requestMetadata"]["orchestrationReservation"],
+            "resv_123",
+        )
+
+    @unittest.skipUnless(importlib.util.find_spec("botocore"), "optional Bedrock SDK absent")
+    def test_bedrock_transport_retries_only_explicit_rejections(self):
+        from botocore.exceptions import ClientError
+
+        throttled = ClientError(
+            {
+                "Error": {"Code": "ThrottlingException", "Message": "slow down"},
+                "ResponseMetadata": {"HTTPStatusCode": 429},
+            },
+            "Converse",
+        )
+        with self.assertRaisesRegex(api_agent.ProviderHTTPError, "HTTP 429"):
+            api_agent.HttpTransport(bedrock_client=FakeBedrockClient(error=throttled)).request(
+                "bedrock", "converse", {}
+            )
+        uncertain = ClientError(
+            {
+                "Error": {"Code": "InternalServerException", "Message": "unknown"},
+                "ResponseMetadata": {"HTTPStatusCode": 500},
+            },
+            "Converse",
+        )
+        with self.assertRaises(api_agent.ProviderAmbiguous):
+            api_agent.HttpTransport(bedrock_client=FakeBedrockClient(error=uncertain)).request(
+                "bedrock", "converse", {}
             )
             self.assertNotEqual(os.environ.get("PATH"), "/untrusted/path")
             self.assertEqual(
@@ -582,6 +655,108 @@ self_check:
         self.assertEqual(summary["input_tokens"], 110)
         self.assertEqual(summary["cache_read_tokens"], 40)
         self.assertEqual(summary["output_tokens"], 12)
+
+    def test_bedrock_converse_tool_loop_and_usage(self):
+        transport = FakeTransport(
+            [
+                {
+                    "id": "aws-request-1",
+                    "stopReason": "tool_use",
+                    "usage": {
+                        "inputTokens": 40,
+                        "cacheReadInputTokens": 60,
+                        "cacheWriteInputTokens": 10,
+                        "outputTokens": 8,
+                    },
+                    "output": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "toolUse": {
+                                        "toolUseId": "tool-1",
+                                        "name": "git_status",
+                                        "input": {},
+                                    }
+                                }
+                            ],
+                        }
+                    },
+                },
+                {
+                    "id": "aws-request-2",
+                    "stopReason": "end_turn",
+                    "usage": {
+                        "inputTokens": 30,
+                        "cacheReadInputTokens": 70,
+                        "outputTokens": 4,
+                    },
+                    "output": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"text": "done"}],
+                        }
+                    },
+                },
+            ]
+        )
+        config = self.config(
+            provider="bedrock",
+            extra="    implementer:\n      allowed_tools: [read_file, search, git_diff, git_status, run_check, apply_patch]",
+        )
+        agent = api_agent.ApiAgent(
+            root=self.root,
+            config_path=config,
+            role="implementer",
+            ticket="PROJ-4",
+            sprint=None,
+            run_id="bedrock-run",
+            transport=transport,
+        )
+        result = agent.run(
+            {
+                "modelId": "test-model",
+                "inferenceConfig": {"maxTokens": 100},
+                "system": [{"text": "system"}],
+                "messages": [{"role": "user", "content": [{"text": "work"}]}],
+            }
+        )
+        converse_calls = [call for call in transport.calls if call[1] == "converse"]
+        count_calls = [call for call in transport.calls if call[1] == "count_tokens"]
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["output_text"], "done")
+        self.assertEqual(len(converse_calls), 2)
+        self.assertEqual(len(count_calls), 2)
+        self.assertEqual(count_calls[0][2]["modelId"], "test-model")
+        self.assertNotIn("inferenceConfig", count_calls[0][2]["input"]["converse"])
+        self.assertIn(
+            "apply_patch",
+            {
+                tool["toolSpec"]["name"]
+                for tool in converse_calls[0][2]["toolConfig"]["tools"]
+                if "toolSpec" in tool
+            },
+        )
+        tool_result = converse_calls[1][2]["messages"][-1]["content"][0]["toolResult"]
+        self.assertEqual(tool_result["toolUseId"], "tool-1")
+        self.assertEqual(tool_result["status"], "success")
+        summary = agent.ledger.summary()
+        self.assertEqual(summary["input_tokens"], 70)
+        self.assertEqual(summary["cache_read_tokens"], 130)
+        self.assertEqual(summary["cache_write_tokens"], 10)
+        self.assertEqual(summary["output_tokens"], 12)
+
+    def test_bedrock_cache_breakpoint_rolls_without_mutating_response(self):
+        original = [
+            {"role": "assistant", "content": [{"text": "before"}]},
+            {"role": "user", "content": [{"text": "after"}]},
+        ]
+        rolled = api_agent.roll_bedrock_cache_breakpoint(original)
+        self.assertEqual(original[-1]["content"], [{"text": "after"}])
+        self.assertEqual(
+            rolled[-1]["content"][-1],
+            {"cachePoint": {"type": "default", "ttl": "1h"}},
+        )
 
     def test_budget_blocks_before_provider_submission(self):
         transport = FakeTransport([], count=2_000_000)

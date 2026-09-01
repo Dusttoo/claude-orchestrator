@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Run one constrained orchestration agent through Anthropic, OpenAI, or Azure ADM.
+"""Run one constrained orchestration agent through a configured API provider.
 
-The runner is intentionally SDK-free. It owns provider submission, client tool
-loops, durable request markers, worst-case budget reservations, and actual usage
-accounting. Credentials come from the process environment or the configured
-repository's gitignored `.orchestration/.env` file.
+The runner owns provider submission, client tool loops, durable request markers,
+worst-case budget reservations, and actual usage accounting. HTTP providers use
+the standard library; Bedrock uses boto3 and the ambient AWS credential chain.
 """
 
 from __future__ import annotations
@@ -248,6 +247,31 @@ def roll_conversation_cache_breakpoint(
         content = message.get("content")
         if isinstance(content, list) and content and isinstance(content[-1], dict):
             content[-1] = dict(content[-1], cache_control={"type": "ephemeral"})
+            break
+    return result
+
+
+def roll_bedrock_cache_breakpoint(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Move one Bedrock cache point to the end of the reusable transcript."""
+    result: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            blocks = [
+                block
+                for block in content
+                if not (isinstance(block, dict) and "cachePoint" in block)
+            ]
+            message = dict(message, content=blocks)
+        result.append(message)
+    for message in reversed(result):
+        content = message.get("content")
+        if isinstance(content, list) and content:
+            message["content"] = list(content) + [
+                {"cachePoint": {"type": "default", "ttl": "1h"}}
+            ]
             break
     return result
 
@@ -617,8 +641,101 @@ class UsageLedger:
 
 
 class HttpTransport:
-    def __init__(self, timeout: int = 120):
+    def __init__(self, timeout: int = 120, bedrock_client: Any | None = None):
         self.timeout = timeout
+        self._bedrock_client = bedrock_client
+
+    def _get_bedrock_client(self) -> Any:
+        if self._bedrock_client is not None:
+            return self._bedrock_client
+        try:
+            import boto3
+            from botocore.config import Config
+        except ImportError as exc:
+            raise AgentError(
+                "Bedrock API execution requires boto3; install requirements-bedrock.txt "
+                "in the controller's Python environment"
+            ) from exc
+        # The runner owns safe retries. Keeping one SDK attempt prevents a read
+        # timeout from being invisibly resubmitted after Bedrock may have begun
+        # model work, while adaptive mode still supplies client-side rate control.
+        config = Config(
+            retries={"total_max_attempts": 1, "mode": "adaptive"},
+            connect_timeout=min(10, self.timeout),
+            read_timeout=self.timeout,
+            max_pool_connections=20,
+            user_agent_appid="claude-orchestrator/0.9.0",
+        )
+        session = boto3.Session()
+        self._bedrock_client = session.client(
+            "bedrock-runtime",
+            region_name=os.environ.get("AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION")
+            or session.region_name,
+            config=config,
+        )
+        return self._bedrock_client
+
+    def _bedrock_request(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        idempotency_key: str | None,
+    ) -> dict[str, Any]:
+        try:
+            from botocore.exceptions import (
+                BotoCoreError,
+                ClientError,
+                ConnectTimeoutError,
+                EndpointConnectionError,
+                ReadTimeoutError,
+            )
+        except ImportError as exc:
+            raise AgentError(
+                "Bedrock API execution requires boto3; install requirements-bedrock.txt "
+                "in the controller's Python environment"
+            ) from exc
+        client = self._get_bedrock_client()
+        try:
+            if path == "count_tokens":
+                result = client.count_tokens(**payload)
+            elif path == "converse":
+                body = dict(payload)
+                if idempotency_key:
+                    metadata = dict(body.get("requestMetadata") or {})
+                    metadata["orchestrationReservation"] = idempotency_key
+                    body["requestMetadata"] = metadata
+                result = client.converse(**body)
+            else:
+                raise AgentError(f"unsupported Bedrock runtime operation: {path}")
+        except ClientError as exc:
+            error = exc.response.get("Error") or {}
+            code = str(error.get("Code") or "")
+            status = int((exc.response.get("ResponseMetadata") or {}).get("HTTPStatusCode") or 500)
+            message = str(error.get("Message") or exc)
+            if code == "ThrottlingException":
+                raise ProviderHTTPError(429, message) from exc
+            if code in {"ServiceUnavailableException", "ModelNotReadyException"}:
+                raise ProviderHTTPError(529, message) from exc
+            if code in {"AccessDeniedException", "ResourceNotFoundException"}:
+                raise ProviderHTTPError(403 if code == "AccessDeniedException" else 404, message) from exc
+            if code == "ValidationException":
+                raise ProviderHTTPError(400, message) from exc
+            # A server/model timeout or internal error can occur after work has
+            # started. Preserve the reservation for explicit reconciliation.
+            raise ProviderAmbiguous(
+                f"Bedrock submission outcome is unknown ({code or status}): {message}"
+            ) from exc
+        except (ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError, BotoCoreError) as exc:
+            raise ProviderAmbiguous(f"Bedrock submission outcome is unknown: {exc}") from exc
+        if not isinstance(result, dict):
+            raise ProviderAmbiguous("Bedrock returned an invalid response object")
+        if path == "count_tokens":
+            return {"input_tokens": int(result.get("inputTokens") or 0)}
+        response = dict(result)
+        metadata = response.get("ResponseMetadata") or {}
+        response["id"] = str(metadata.get("RequestId") or "")
+        return response
 
     def request(
         self,
@@ -628,6 +745,8 @@ class HttpTransport:
         *,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        if provider == "bedrock":
+            return self._bedrock_request(path, payload, idempotency_key)
         if provider == "anthropic":
             key = os.environ.get("ANTHROPIC_API_KEY")
             base = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
@@ -649,7 +768,7 @@ class HttpTransport:
                 f"{provider.upper()}_API_KEY is required for {provider} API execution"
             )
         headers["Content-Type"] = "application/json"
-        headers["User-Agent"] = "claude-orchestrator-api-agent/0.6.0"
+        headers["User-Agent"] = "claude-orchestrator-api-agent/0.9.0"
         if idempotency_key:
             if provider == "azure_adm":
                 headers["x-ms-client-request-id"] = idempotency_key
@@ -875,6 +994,17 @@ def tools_for_role(role: str, configured: list[str] | None, provider: str) -> li
             result.append(
                 {"name": name, "description": description, "input_schema": schema, "strict": True}
             )
+        elif provider == "bedrock":
+            result.append(
+                {
+                    "toolSpec": {
+                        "name": name,
+                        "description": description,
+                        "inputSchema": {"json": schema},
+                        "strict": True,
+                    }
+                }
+            )
         elif provider == "azure_adm":
             result.append(
                 {
@@ -901,6 +1031,8 @@ def tools_for_role(role: str, configured: list[str] | None, provider: str) -> li
             )
     if provider == "anthropic" and result:
         result[-1]["cache_control"] = {"type": "ephemeral"}
+    if provider == "bedrock" and result:
+        result.append({"cachePoint": {"type": "default", "ttl": "1h"}})
     return result
 
 
@@ -913,6 +1045,14 @@ def normalize_usage(provider: str, response: dict[str, Any]) -> dict[str, int]:
             "cache_read_tokens": int(usage.get("cache_read_input_tokens") or 0),
             "output_tokens": int(usage.get("output_tokens") or 0),
             "reasoning_tokens": int((usage.get("output_tokens_details") or {}).get("thinking_tokens") or 0),
+        }
+    if provider == "bedrock":
+        return {
+            "input_tokens": int(usage.get("inputTokens") or 0),
+            "cache_write_tokens": int(usage.get("cacheWriteInputTokens") or 0),
+            "cache_read_tokens": int(usage.get("cacheReadInputTokens") or 0),
+            "output_tokens": int(usage.get("outputTokens") or 0),
+            "reasoning_tokens": 0,
         }
     if provider == "azure_adm":
         prompt_details = usage.get("prompt_tokens_details") or {}
@@ -951,6 +1091,13 @@ def response_text(provider: str, response: dict[str, Any]) -> str:
             for block in response.get("content", [])
             if block.get("type") == "text"
         ).strip()
+    if provider == "bedrock":
+        message = (response.get("output") or {}).get("message") or {}
+        return "\n".join(
+            str(block.get("text") or "")
+            for block in message.get("content", [])
+            if "text" in block
+        ).strip()
     if provider == "azure_adm":
         choices = response.get("choices") or []
         if not choices:
@@ -969,6 +1116,22 @@ def response_text(provider: str, response: dict[str, Any]) -> str:
 
 
 def tool_calls(provider: str, response: dict[str, Any]) -> list[dict[str, Any]]:
+    if provider == "bedrock":
+        message = (response.get("output") or {}).get("message") or {}
+        calls = []
+        for block in message.get("content", []):
+            tool = block.get("toolUse") if isinstance(block, dict) else None
+            if not isinstance(tool, dict):
+                continue
+            calls.append(
+                {
+                    "type": "tool_use",
+                    "id": str(tool.get("toolUseId") or ""),
+                    "name": str(tool.get("name") or ""),
+                    "input": tool.get("input") or {},
+                }
+            )
+        return calls
     if provider == "azure_adm":
         choices = response.get("choices") or []
         if not choices:
@@ -1069,6 +1232,35 @@ class ApiAgent:
                 len(json.dumps(count_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")),
             )
         count_body = dict(body)
+        if self.provider == "bedrock":
+            model_id = str(count_body.pop("modelId", ""))
+            count_body.pop("inferenceConfig", None)
+            count_body.pop("requestMetadata", None)
+            attempts = self.budgets["max_pre_ack_retries"] + 1
+            for attempt in range(attempts):
+                try:
+                    result = self.transport.request(
+                        self.provider,
+                        "count_tokens",
+                        {"modelId": model_id, "input": {"converse": count_body}},
+                    )
+                    break
+                except (ProviderAmbiguous, ProviderHTTPError) as exc:
+                    retryable = isinstance(exc, ProviderAmbiguous) or exc.status in {
+                        429,
+                        500,
+                        502,
+                        503,
+                        504,
+                        529,
+                    }
+                    if not retryable or attempt + 1 >= attempts:
+                        raise
+                    time.sleep(self.budgets["retry_backoff_seconds"] * (attempt + 1))
+            count = int(result.get("input_tokens") or 0)
+            if count <= 0:
+                raise AgentError("provider token counter returned no input token count")
+            return count
         if self.provider == "anthropic":
             count_body.pop("max_tokens", None)
             endpoint = "messages/count_tokens"
@@ -1102,6 +1294,8 @@ class ApiAgent:
         output_cap = (
             int(body.get("max_tokens") or 0)
             if self.provider == "anthropic"
+            else int((body.get("inferenceConfig") or {}).get("maxTokens") or 0)
+            if self.provider == "bedrock"
             else int(body.get("max_completion_tokens") or 0)
             if self.provider == "azure_adm"
             else int(body.get("max_output_tokens") or 0)
@@ -1127,6 +1321,7 @@ class ApiAgent:
         endpoint = {
             "anthropic": "messages",
             "azure_adm": "chat/completions",
+            "bedrock": "converse",
         }.get(self.provider, "responses")
         response = None
         latency_ms = None
@@ -1241,13 +1436,15 @@ class ApiAgent:
         allowed = {
             str((tool.get("function") or {}).get("name") or "")
             if self.provider == "azure_adm"
+            else str((tool.get("toolSpec") or {}).get("name") or "")
+            if self.provider == "bedrock"
             else str(tool.get("name") or "")
             for tool in self.tools
         }
         for call in calls:
             name = str(call.get("name") or "")
             call_id = str(call.get("id") or call.get("call_id") or "")
-            if self.provider == "anthropic":
+            if self.provider in {"anthropic", "bedrock"}:
                 arguments = call.get("input") or {}
             else:
                 try:
@@ -1268,6 +1465,16 @@ class ApiAgent:
                 results.append(
                     {"type": "tool_result", "tool_use_id": call_id, "content": output, "is_error": is_error}
                 )
+            elif self.provider == "bedrock":
+                results.append(
+                    {
+                        "toolResult": {
+                            "toolUseId": call_id,
+                            "content": [{"text": output}],
+                            "status": "error" if is_error else "success",
+                        }
+                    }
+                )
             elif self.provider == "azure_adm":
                 results.append(
                     {"role": "tool", "tool_call_id": call_id, "content": output}
@@ -1279,24 +1486,37 @@ class ApiAgent:
         return results
 
     def run(self, request: dict[str, Any]) -> dict[str, Any]:
-        if str(request.get("model") or "") != self.model:
+        request_model = request.get("modelId") if self.provider == "bedrock" else request.get("model")
+        if str(request_model or "") != self.model:
             raise AgentError("request model does not match the resolved role route")
         cap_key = (
             "max_tokens"
             if self.provider == "anthropic"
+            else "maxTokens"
+            if self.provider == "bedrock"
             else "max_completion_tokens"
             if self.provider == "azure_adm"
             else "max_output_tokens"
         )
-        requested_cap = int(request.get(cap_key) or 0)
+        requested_cap = int(
+            ((request.get("inferenceConfig") or {}).get(cap_key) or 0)
+            if self.provider == "bedrock"
+            else request.get(cap_key) or 0
+        )
         if requested_cap <= 0:
             raise AgentError(f"request requires a positive {cap_key}")
-        request[cap_key] = min(requested_cap, self.budgets["max_output_tokens_per_turn"])
-        request["tools"] = self.tools
+        if self.provider == "bedrock":
+            request.setdefault("inferenceConfig", {})[cap_key] = min(
+                requested_cap, self.budgets["max_output_tokens_per_turn"]
+            )
+            request["toolConfig"] = {"tools": self.tools, "toolChoice": {"auto": {}}}
+        else:
+            request[cap_key] = min(requested_cap, self.budgets["max_output_tokens_per_turn"])
+            request["tools"] = self.tools
         if self.provider == "anthropic":
             request["tool_choice"] = {"type": "auto", "disable_parallel_tool_use": True}
             request.pop("parallel_tool_calls", None)
-        else:
+        elif self.provider != "bedrock":
             request["tool_choice"] = "auto"
             request["parallel_tool_calls"] = False
         self._save(status="ready", request=request)
@@ -1316,6 +1536,8 @@ class ApiAgent:
                     "stop_reason": (
                         ((response.get("choices") or [{}])[0].get("finish_reason"))
                         if self.provider == "azure_adm"
+                        else response.get("stopReason")
+                        if self.provider == "bedrock"
                         else response.get("stop_reason") or response.get("status")
                     ),
                     "text": text,
@@ -1329,6 +1551,11 @@ class ApiAgent:
             if not calls:
                 status = "completed"
                 if self.provider == "anthropic" and response.get("stop_reason") not in {"end_turn", "stop_sequence"}:
+                    status = "incomplete"
+                if self.provider == "bedrock" and response.get("stopReason") not in {
+                    "end_turn",
+                    "stop_sequence",
+                }:
                     status = "incomplete"
                 if self.provider == "openai" and response.get("status") != "completed":
                     status = "incomplete"
@@ -1375,6 +1602,23 @@ class ApiAgent:
                 messages.append({"role": "user", "content": results})
                 body = dict(body)
                 body["messages"] = roll_conversation_cache_breakpoint(messages)
+            elif self.provider == "bedrock":
+                message = (response.get("output") or {}).get("message") or {}
+                messages = list(body.get("messages") or [])
+                messages.append(message)
+                messages.append({"role": "user", "content": results})
+                body = {
+                    key: body[key]
+                    for key in (
+                        "modelId",
+                        "inferenceConfig",
+                        "system",
+                        "toolConfig",
+                        "additionalModelRequestFields",
+                    )
+                    if key in body
+                }
+                body["messages"] = roll_bedrock_cache_breakpoint(messages)
             elif self.provider == "azure_adm":
                 choices = response.get("choices") or []
                 assistant = dict((choices[0].get("message") or {}) if choices else {})

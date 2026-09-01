@@ -4,7 +4,7 @@
 route. Claude Code or Codex Desktop can remain the interactive controller: it
 builds the role payload, launches this runner as a child process, reports its
 state, and asks the user for any required approval. The worker model traffic is
-billed to the configured Anthropic, OpenAI, or Azure Direct Model account rather
+billed to the configured Anthropic, OpenAI, Azure Direct Model, or Amazon Bedrock account rather
 than the desktop agent surface.
 
 ## Run one role
@@ -43,6 +43,20 @@ the highest-priority source.
 
 Always gitignore `.orchestration/.env`. Keys are never copied into
 `config.yaml`, run state, logs, or the usage ledger.
+
+Bedrock does not use a repository credential. Install its optional runtime
+dependency into the Python environment that launches the controller:
+
+```text
+python3 -m pip install -r /path/to/plugin/requirements-bedrock.txt
+```
+
+The adapter uses the default AWS credential chain and reuses one
+`bedrock-runtime` client. EC2 deployments should receive `bedrock:Converse` and
+`bedrock:CountTokens` through the instance role. The repository `.env` parser
+does not accept AWS profile, region, or credential variables, preventing a repo
+from selecting a different AWS identity. Set `AWS_REGION` at the host/session
+level instead.
 
 The runner retries explicit provider rate-limit rejections independently from
 other pre-ack failures. For HTTP 429 it honors Azure's `retry-after-ms` or

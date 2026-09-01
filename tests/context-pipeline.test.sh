@@ -64,6 +64,14 @@ run_fail "no execution mode can silently disable prompt caching" "$PIPELINE" ant
 check "Azure ADM payload uses Chat Completions messages" 'data["model"] == "grok-eval" and data["messages"][0]["role"] == "system" and data["messages"][1]["role"] == "user" and data["max_completion_tokens"] == 8192' "$TMP/azure-adm.json"
 check "Azure ADM reviewer contract brackets dynamic context for MAI compatibility" '"Your entire final response must be exactly one JSON object" in data["messages"][0]["content"] and "Your entire final response must be exactly one JSON object" in data["messages"][1]["content"] and data["messages"][1]["content"].rstrip().endswith("}") and "code-review" in data["messages"][0]["content"]' "$TMP/azure-adm.json"
 
+"$PIPELINE" payload --provider bedrock --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
+  --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" \
+  --mode code-review --execution gate --model global.anthropic.claude-opus-5 \
+  --effort high > "$TMP/bedrock.json"
+check "Bedrock payload uses native Converse fields and an explicit output cap" 'data["modelId"] == "global.anthropic.claude-opus-5" and data["inferenceConfig"]["maxTokens"] == 8192 and "<ticket>" in data["messages"][0]["content"][0]["text"]' "$TMP/bedrock.json"
+check "Bedrock caches the stable prefix for one hour" 'data["system"][3]["cachePoint"] == {"type":"default","ttl":"1h"} and data["system"][2]["text"].startswith("# Stable repository map")' "$TMP/bedrock.json"
+check "Bedrock carries adaptive effort and strict review output natively" 'data["additionalModelRequestFields"]["thinking"] == {"type":"adaptive"} and data["additionalModelRequestFields"]["output_config"]["effort"] == "high" and data["additionalModelRequestFields"]["output_config"]["format"]["type"] == "json_schema"' "$TMP/bedrock.json"
+
 cat > "$TMP/pass-review.json" <<'JSON'
 {"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[{"name":"acceptance coverage","status":"pass"}],"findings":[]}
 JSON
