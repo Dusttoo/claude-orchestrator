@@ -664,7 +664,7 @@ class HttpTransport:
             connect_timeout=min(10, self.timeout),
             read_timeout=self.timeout,
             max_pool_connections=20,
-            user_agent_appid="claude-orchestrator/0.9.0",
+            user_agent_appid="claude-orchestrator/0.10.0",
         )
         session = boto3.Session()
         self._bedrock_client = session.client(
@@ -747,7 +747,31 @@ class HttpTransport:
     ) -> dict[str, Any]:
         if provider == "bedrock":
             return self._bedrock_request(path, payload, idempotency_key)
-        if provider == "anthropic":
+        if provider == "bedrock_mantle":
+            try:
+                import boto3
+                from botocore.auth import SigV4Auth
+                from botocore.awsrequest import AWSRequest
+            except ImportError as exc:
+                raise AgentError(
+                    "Bedrock Mantle API execution requires boto3; install "
+                    "requirements-bedrock.txt in the controller's Python environment"
+                ) from exc
+            session = boto3.Session()
+            region = (
+                os.environ.get("AWS_REGION")
+                or os.environ.get("AWS_DEFAULT_REGION")
+                or session.region_name
+            )
+            if not region:
+                raise AgentError("AWS_REGION is required for Bedrock Mantle API execution")
+            base = os.environ.get(
+                "BEDROCK_MANTLE_BASE_URL",
+                f"https://bedrock-mantle.{region}.api.aws/v1",
+            )
+            headers: dict[str, str] = {}
+            key = "aws-sigv4"
+        elif provider == "anthropic":
             key = os.environ.get("ANTHROPIC_API_KEY")
             base = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
             headers = {"x-api-key": key or "", "anthropic-version": "2023-06-01"}
@@ -768,15 +792,31 @@ class HttpTransport:
                 f"{provider.upper()}_API_KEY is required for {provider} API execution"
             )
         headers["Content-Type"] = "application/json"
-        headers["User-Agent"] = "claude-orchestrator-api-agent/0.9.0"
+        headers["User-Agent"] = "claude-orchestrator-api-agent/0.10.0"
         if idempotency_key:
             if provider == "azure_adm":
                 headers["x-ms-client-request-id"] = idempotency_key
             else:
                 headers["Idempotency-Key"] = idempotency_key
+        url = base.rstrip("/") + "/" + path.lstrip("/")
+        request_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        if provider == "bedrock_mantle":
+            credentials = session.get_credentials()
+            if credentials is None:
+                raise AgentError("AWS credentials are required for Bedrock Mantle API execution")
+            aws_request = AWSRequest(
+                method="POST",
+                url=url,
+                data=request_body,
+                headers=headers,
+            )
+            SigV4Auth(
+                credentials.get_frozen_credentials(), "bedrock-mantle", region
+            ).add_auth(aws_request)
+            headers = dict(aws_request.prepare().headers.items())
         request = urllib.request.Request(
-            base.rstrip("/") + "/" + path.lstrip("/"),
-            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            url,
+            data=request_body,
             headers=headers,
             method="POST",
         )
@@ -1010,7 +1050,7 @@ def tools_for_role(
                     }
                 }
             )
-        elif provider == "azure_adm":
+        elif provider in {"azure_adm", "bedrock_mantle"}:
             result.append(
                 {
                     "type": "function",
@@ -1063,7 +1103,7 @@ def normalize_usage(provider: str, response: dict[str, Any]) -> dict[str, int]:
             "output_tokens": int(usage.get("outputTokens") or 0),
             "reasoning_tokens": 0,
         }
-    if provider == "azure_adm":
+    if provider in {"azure_adm", "bedrock_mantle"}:
         prompt_details = usage.get("prompt_tokens_details") or {}
         completion_details = usage.get("completion_tokens_details") or {}
         total = int(usage.get("prompt_tokens") or 0)
@@ -1107,7 +1147,7 @@ def response_text(provider: str, response: dict[str, Any]) -> str:
             for block in message.get("content", [])
             if "text" in block
         ).strip()
-    if provider == "azure_adm":
+    if provider in {"azure_adm", "bedrock_mantle"}:
         choices = response.get("choices") or []
         if not choices:
             return ""
@@ -1141,7 +1181,7 @@ def tool_calls(provider: str, response: dict[str, Any]) -> list[dict[str, Any]]:
                 }
             )
         return calls
-    if provider == "azure_adm":
+    if provider in {"azure_adm", "bedrock_mantle"}:
         choices = response.get("choices") or []
         if not choices:
             return []
@@ -1230,12 +1270,13 @@ class ApiAgent:
         atomic_json(self.state_path, self.state)
 
     def _count(self, body: dict[str, Any]) -> int:
-        if self.provider == "azure_adm":
-            # Azure Direct Model chat deployments do not expose a separate token
-            # counting endpoint. One UTF-8 byte per token is a deliberately
-            # conservative upper bound for pre-submit budget reservation.
+        if self.provider in {"azure_adm", "bedrock_mantle"}:
+            # Chat Completions routes do not expose a separate token-counting
+            # endpoint. One UTF-8 byte per token is a deliberately conservative
+            # upper bound for pre-submit budget reservation.
             count_body = dict(body)
             count_body.pop("max_completion_tokens", None)
+            count_body.pop("max_tokens", None)
             return max(
                 1,
                 len(json.dumps(count_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")),
@@ -1296,6 +1337,8 @@ class ApiAgent:
             if self.provider == "bedrock"
             else int(body.get("max_completion_tokens") or 0)
             if self.provider == "azure_adm"
+            else int(body.get("max_tokens") or 0)
+            if self.provider == "bedrock_mantle"
             else int(body.get("max_output_tokens") or 0)
         )
         projected = self.pricing.worst_case(input_tokens, output_cap)
@@ -1320,6 +1363,7 @@ class ApiAgent:
             "anthropic": "messages",
             "azure_adm": "chat/completions",
             "bedrock": "converse",
+            "bedrock_mantle": "chat/completions",
         }.get(self.provider, "responses")
         response = None
         latency_ms = None
@@ -1433,7 +1477,7 @@ class ApiAgent:
         results = []
         allowed = {
             str((tool.get("function") or {}).get("name") or "")
-            if self.provider == "azure_adm"
+            if self.provider in {"azure_adm", "bedrock_mantle"}
             else str((tool.get("toolSpec") or {}).get("name") or "")
             if self.provider == "bedrock"
             else str(tool.get("name") or "")
@@ -1473,7 +1517,7 @@ class ApiAgent:
                         }
                     }
                 )
-            elif self.provider == "azure_adm":
+            elif self.provider in {"azure_adm", "bedrock_mantle"}:
                 results.append(
                     {"role": "tool", "tool_call_id": call_id, "content": output}
                 )
@@ -1494,6 +1538,8 @@ class ApiAgent:
             if self.provider == "bedrock"
             else "max_completion_tokens"
             if self.provider == "azure_adm"
+            else "max_tokens"
+            if self.provider == "bedrock_mantle"
             else "max_output_tokens"
         )
         requested_cap = int(
@@ -1533,7 +1579,7 @@ class ApiAgent:
                     "response_id": response.get("id"),
                     "stop_reason": (
                         ((response.get("choices") or [{}])[0].get("finish_reason"))
-                        if self.provider == "azure_adm"
+                        if self.provider in {"azure_adm", "bedrock_mantle"}
                         else response.get("stopReason")
                         if self.provider == "bedrock"
                         else response.get("stop_reason") or response.get("status")
@@ -1557,7 +1603,7 @@ class ApiAgent:
                     status = "incomplete"
                 if self.provider == "openai" and response.get("status") != "completed":
                     status = "incomplete"
-                if self.provider == "azure_adm":
+                if self.provider in {"azure_adm", "bedrock_mantle"}:
                     choices = response.get("choices") or []
                     if not choices or choices[0].get("finish_reason") != "stop":
                         status = "incomplete"
@@ -1621,7 +1667,7 @@ class ApiAgent:
                     if context_pipeline.bedrock_model_family(self.model) == "anthropic"
                     else messages
                 )
-            elif self.provider == "azure_adm":
+            elif self.provider in {"azure_adm", "bedrock_mantle"}:
                 choices = response.get("choices") or []
                 assistant = dict((choices[0].get("message") or {}) if choices else {})
                 messages = list(body.get("messages") or [])
@@ -1638,6 +1684,7 @@ class ApiAgent:
                     for key in (
                         "model",
                         "max_completion_tokens",
+                        "max_tokens",
                         "tools",
                         "tool_choice",
                         "parallel_tool_calls",

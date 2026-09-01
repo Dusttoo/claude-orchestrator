@@ -64,6 +64,12 @@ run_fail "no execution mode can silently disable prompt caching" "$PIPELINE" ant
 check "Azure ADM payload uses Chat Completions messages" 'data["model"] == "grok-eval" and data["messages"][0]["role"] == "system" and data["messages"][1]["role"] == "user" and data["max_completion_tokens"] == 8192' "$TMP/azure-adm.json"
 check "Azure ADM reviewer contract brackets dynamic context for MAI compatibility" '"Your entire final response must be exactly one JSON object" in data["messages"][0]["content"] and "Your entire final response must be exactly one JSON object" in data["messages"][1]["content"] and data["messages"][1]["content"].rstrip().endswith("}") and "code-review" in data["messages"][0]["content"]' "$TMP/azure-adm.json"
 
+"$PIPELINE" payload --provider bedrock_mantle --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
+  --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" \
+  --mode code-review --execution gate --model moonshotai.kimi-k2-thinking > "$TMP/bedrock-mantle.json"
+check "Bedrock Mantle payload uses portable Chat Completions fields" 'data["model"] == "moonshotai.kimi-k2-thinking" and data["messages"][0]["role"] == "system" and data["messages"][1]["role"] == "user" and data["max_tokens"] == 8192 and "max_completion_tokens" not in data' "$TMP/bedrock-mantle.json"
+check "Bedrock Mantle reviewers retain the strict JSON contract" '"Your entire final response must be exactly one JSON object" in data["messages"][0]["content"] and "code-review" in data["messages"][0]["content"]' "$TMP/bedrock-mantle.json"
+
 "$PIPELINE" payload --provider bedrock --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
   --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" \
   --mode code-review --execution gate --model global.anthropic.claude-opus-5 \

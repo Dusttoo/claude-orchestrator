@@ -4,8 +4,8 @@
 route. Claude Code or Codex Desktop can remain the interactive controller: it
 builds the role payload, launches this runner as a child process, reports its
 state, and asks the user for any required approval. The worker model traffic is
-billed to the configured Anthropic, OpenAI, Azure Direct Model, or Amazon Bedrock account rather
-than the desktop agent surface.
+billed to the configured Anthropic, OpenAI, Azure Direct Model, Amazon Bedrock
+Runtime, or Amazon Bedrock Mantle account rather than the desktop agent surface.
 
 ## Run one role
 
@@ -60,6 +60,14 @@ require access to the account's default Bedrock project. The repository `.env` p
 does not accept AWS profile, region, or credential variables, preventing a repo
 from selecting a different AWS identity. Set `AWS_REGION` at the host/session
 level instead.
+
+Bedrock Mantle uses the same dependency and AWS credential rules. The adapter
+calls the regional `bedrock-mantle` OpenAI-compatible endpoint and signs every
+request with SigV4 using the EC2 instance role. The role needs
+`bedrock-mantle:CreateInference` for the configured model/project. Mantle Chat
+Completions has no separate token-count endpoint, so the runner reserves a
+conservative local estimate before submission and settles against exact response
+usage. Do not put a Mantle API key or AWS credentials in `.orchestration/.env`.
 
 The runner retries explicit provider rate-limit rejections independently from
 other pre-ack failures. For HTTP 429 it honors Azure's `retry-after-ms` or
