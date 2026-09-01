@@ -37,7 +37,7 @@ schema_version: 1
 # a desktop fallback then could duplicate writes, PRs, or billing.
 llm:
   execution: desktop             # desktop | api
-  provider: anthropic            # anthropic | openai | azure_adm | bedrock
+  provider: anthropic            # anthropic | openai | azure_adm | bedrock | bedrock_mantle
   model: ""                      # required when effective execution is api
   effort: ""                     # optional: low | medium | high | xhigh | max
   fallback: none                 # desktop | none; applies only to API launch
@@ -84,6 +84,29 @@ llm:
     #   cache_write_per_mtok: 2.50
     #   cache_read_per_mtok: 0.20
     #   output_per_mtok: 10.00
+    # Bedrock Mantle Standard-tier examples checked in us-east-1 on 2026-08-31.
+    # These models do not currently report prompt-cache usage, so the cache
+    # rates intentionally equal ordinary input for conservative budgeting.
+    # zai.glm-5:
+    #   input_per_mtok: 1.00
+    #   cache_write_per_mtok: 1.00
+    #   cache_read_per_mtok: 1.00
+    #   output_per_mtok: 3.20
+    # qwen.qwen3-coder-next:
+    #   input_per_mtok: 0.50
+    #   cache_write_per_mtok: 0.50
+    #   cache_read_per_mtok: 0.50
+    #   output_per_mtok: 1.20
+    # moonshotai.kimi-k2.5:
+    #   input_per_mtok: 0.60
+    #   cache_write_per_mtok: 0.60
+    #   cache_read_per_mtok: 0.60
+    #   output_per_mtok: 3.00
+    # moonshotai.kimi-k2-thinking:
+    #   input_per_mtok: 0.60
+    #   cache_write_per_mtok: 0.60
+    #   cache_read_per_mtok: 0.60
+    #   output_per_mtok: 2.50
   roles:
     # implementer:
     #   execution: api
@@ -108,6 +131,11 @@ llm:
     #   provider: bedrock
     #   model: global.anthropic.claude-opus-5
     #   effort: high
+    #   allowed_tools: [read_file, search, git_diff, git_status, run_check]
+    # code-reviewer:
+    #   execution: api
+    #   provider: bedrock_mantle
+    #   model: moonshotai.kimi-k2-thinking
     #   allowed_tools: [read_file, search, git_diff, git_status, run_check]
     # security-reviewer:
     #   execution: desktop

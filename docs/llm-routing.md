@@ -63,6 +63,13 @@ scripts/context_pipeline.py route --config .orchestration/config.yaml \
   `.orchestration/.env`. Set `AWS_REGION` in the host environment and use a
   global or geographic inference-profile ID as `model`. Install
   `requirements-bedrock.txt` in the controller's Python environment.
+- `provider: bedrock_mantle` uses Bedrock Mantle's OpenAI-compatible Chat
+  Completions API. It signs each request with the normal AWS credential chain,
+  so EC2 should use an instance role with `bedrock-mantle:CreateInference`; no
+  API key belongs in the repository. Set `AWS_REGION` at the host level. Use the
+  Mantle catalog model ID (for example `qwen.qwen3-coder-next`) as `model`.
+  Leave `effort` empty because reasoning controls are not portable across the
+  third-party Mantle model catalog.
 - Azure Direct Model review payloads repeat the strict JSON-only result contract
   as both a system instruction and the final user instruction. This supports
   deployments such as MAI-Thinking that do not enable structured

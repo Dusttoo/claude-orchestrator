@@ -67,6 +67,19 @@ class FakeBedrockClient:
         return self.response
 
 
+class FakeHTTPResponse:
+    def __init__(self, body):
+        self.body = json.dumps(body).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return self.body
+
 class ApiAgentTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -214,6 +227,49 @@ self_check:
                     "AZURE_ADM_BASE_URL",
                 ],
             )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("boto3") and importlib.util.find_spec("botocore"),
+        "optional Bedrock SDK absent",
+    )
+    def test_bedrock_mantle_transport_signs_with_aws_credentials(self):
+        from botocore.credentials import Credentials
+
+        session = mock.Mock()
+        session.region_name = "us-east-1"
+        session.get_credentials.return_value = Credentials(
+            "access-key", "secret-key", "session-token"
+        )
+        response = FakeHTTPResponse(
+            {
+                "id": "chat-1",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "ok"},
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+        )
+        with mock.patch("boto3.Session", return_value=session), mock.patch(
+            "urllib.request.urlopen", return_value=response
+        ) as urlopen:
+            result = api_agent.HttpTransport().request(
+                "bedrock_mantle",
+                "chat/completions",
+                {"model": "zai.glm-5", "messages": [], "max_tokens": 10},
+                idempotency_key="resv_123",
+            )
+        request = urlopen.call_args.args[0]
+        self.assertEqual(result["id"], "chat-1")
+        self.assertEqual(
+            request.full_url,
+            "https://bedrock-mantle.us-east-1.api.aws/v1/chat/completions",
+        )
+        self.assertTrue(request.headers["Authorization"].startswith("AWS4-HMAC-SHA256"))
+        self.assertEqual(request.headers["X-amz-security-token"], "session-token")
+        self.assertEqual(request.headers["Idempotency-key"], "resv_123")
 
     def test_repository_env_rejects_shell_syntax(self):
         config = self.config()
@@ -654,6 +710,79 @@ self_check:
         summary = agent.ledger.summary()
         self.assertEqual(summary["input_tokens"], 110)
         self.assertEqual(summary["cache_read_tokens"], 40)
+        self.assertEqual(summary["output_tokens"], 12)
+
+    def test_bedrock_mantle_chat_completion_tool_loop(self):
+        transport = FakeTransport(
+            [
+                {
+                    "id": "chat_1",
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "git_status",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 80, "completion_tokens": 8},
+                },
+                {
+                    "id": "chat_2",
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "done"},
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 70, "completion_tokens": 4},
+                },
+            ]
+        )
+        config = self.config(
+            provider="bedrock_mantle",
+            extra="    implementer:\n      allowed_tools: [read_file, search, git_diff, git_status, run_check, apply_patch]",
+        )
+        agent = api_agent.ApiAgent(
+            root=self.root,
+            config_path=config,
+            role="implementer",
+            ticket="PROJ-4",
+            sprint=None,
+            run_id="bedrock-mantle-run",
+            transport=transport,
+        )
+        result = agent.run(
+            {
+                "model": "test-model",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "work"}],
+            }
+        )
+        chat_calls = [call for call in transport.calls if call[1] == "chat/completions"]
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["output_text"], "done")
+        self.assertEqual(len(chat_calls), 2)
+        self.assertEqual(chat_calls[0][2]["max_tokens"], 100)
+        self.assertIn(
+            "apply_patch",
+            {tool["function"]["name"] for tool in chat_calls[0][2]["tools"]},
+        )
+        self.assertEqual(chat_calls[1][2]["messages"][-1]["role"], "tool")
+        self.assertEqual(chat_calls[1][2]["messages"][-1]["tool_call_id"], "call_1")
+        summary = agent.ledger.summary()
+        self.assertEqual(summary["input_tokens"], 150)
         self.assertEqual(summary["output_tokens"], 12)
 
     def test_bedrock_converse_tool_loop_and_usage(self):
