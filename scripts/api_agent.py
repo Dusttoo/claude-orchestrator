@@ -664,7 +664,7 @@ class HttpTransport:
             connect_timeout=min(10, self.timeout),
             read_timeout=self.timeout,
             max_pool_connections=20,
-            user_agent_appid="claude-orchestrator/0.10.0",
+            user_agent_appid="claude-orchestrator/0.10.1",
         )
         session = boto3.Session()
         self._bedrock_client = session.client(
@@ -792,7 +792,7 @@ class HttpTransport:
                 f"{provider.upper()}_API_KEY is required for {provider} API execution"
             )
         headers["Content-Type"] = "application/json"
-        headers["User-Agent"] = "claude-orchestrator-api-agent/0.10.0"
+        headers["User-Agent"] = "claude-orchestrator-api-agent/0.10.1"
         if idempotency_key:
             if provider == "azure_adm":
                 headers["x-ms-client-request-id"] = idempotency_key
@@ -1162,6 +1162,14 @@ def response_text(provider: str, response: dict[str, Any]) -> str:
             if block.get("type") == "output_text":
                 chunks.append(str(block.get("text") or ""))
     return "\n".join(chunks).strip()
+
+
+def review_text(provider: str, text: str) -> str:
+    """Remove only a complete provider reasoning wrapper before JSON validation."""
+    if provider != "bedrock_mantle":
+        return text
+    match = re.fullmatch(r"\s*<think>.*?</think>\s*(\{.*\})\s*", text, re.DOTALL)
+    return match.group(1) if match else text
 
 
 def tool_calls(provider: str, response: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1613,6 +1621,7 @@ class ApiAgent:
                     "security-reviewer": "security-review",
                 }.get(self.role)
                 if status == "completed" and review_gate:
+                    text = review_text(self.provider, text)
                     try:
                         review = context_pipeline.validate_review_output(json.loads(text), review_gate)
                     except (json.JSONDecodeError, context_pipeline.ContextError) as exc:

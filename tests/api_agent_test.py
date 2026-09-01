@@ -785,6 +785,42 @@ self_check:
         self.assertEqual(summary["input_tokens"], 150)
         self.assertEqual(summary["output_tokens"], 12)
 
+    def test_bedrock_mantle_review_accepts_only_complete_think_wrapper(self):
+        wrapped = "<think>private reasoning trace</think>\n" + CLEAN_REVIEW
+        agent = self.agent(
+            FakeTransport(
+                [
+                    {
+                        "id": "chat_1",
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "message": {"role": "assistant", "content": wrapped},
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 20, "completion_tokens": 10},
+                    }
+                ]
+            ),
+            provider="bedrock_mantle",
+            run_id="mantle-review-wrapper",
+        )
+        result = agent.run(
+            {
+                "model": "test-model",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "review"}],
+            }
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["output_text"], CLEAN_REVIEW)
+        self.assertEqual(result["review"]["verdict"], "PASS")
+        contaminated = "commentary before " + CLEAN_REVIEW
+        self.assertEqual(
+            api_agent.review_text("bedrock_mantle", contaminated),
+            contaminated,
+        )
+
     def test_bedrock_converse_tool_loop_and_usage(self):
         transport = FakeTransport(
             [
