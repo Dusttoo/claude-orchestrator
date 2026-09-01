@@ -68,14 +68,19 @@ scripts/context_pipeline.py route --config .orchestration/config.yaml \
   deployments such as MAI-Thinking that do not enable structured
   `response_format`; the runner still validates the object and fails closed on
   surrounding prose.
-- Prompt caching is unconditional. Every payload the pipeline emits carries a
-  breakpoint on its stable prefix, and Anthropic tool loops roll a single
-  further breakpoint to the end of the conversation each round so the
-  accumulated transcript is not re-billed at full input price. No execution
-  mode can turn caching off.
+- Prompt caching is unconditional when the selected provider/API supports it.
+  Anthropic tool loops roll a single further breakpoint to the end of the
+  conversation each round so the accumulated transcript is not re-billed at
+  full input price. Bedrock GPT-5.6 Converse routes omit cache points because
+  AWS supports GPT-5.6 prompt caching only through its Responses API.
 - Bedrock Claude routes use native one-hour cache points on stable tools,
   instructions, and the rolling tool transcript. The usage ledger records
   Bedrock's uncached, cache-write, cache-read, and output token fields separately.
+- Bedrock OpenAI routes use `reasoning_effort` and repeat the strict reviewer
+  response contract in the system and final user instructions. GPT-5.6 does not
+  support Bedrock CountTokens or structured outputs, so the runner reserves a
+  conservative one-UTF-8-byte-per-token estimate and validates review JSON after
+  the response.
 - Batch jobs use the same resolved provider/model route before
   `sprint-controller.py prepare-batch` persists the provider-native request.
 

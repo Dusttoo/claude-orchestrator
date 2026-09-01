@@ -976,7 +976,12 @@ TOOL_SPECS = {
 }
 
 
-def tools_for_role(role: str, configured: list[str] | None, provider: str) -> list[dict[str, Any]]:
+def tools_for_role(
+    role: str,
+    configured: list[str] | None,
+    provider: str,
+    model: str = "",
+) -> list[dict[str, Any]]:
     ceiling = ROLE_TOOL_CEILINGS.get(role)
     if ceiling is None:
         raise AgentError(f"no API tool policy is defined for role: {role}")
@@ -1031,7 +1036,11 @@ def tools_for_role(role: str, configured: list[str] | None, provider: str) -> li
             )
     if provider == "anthropic" and result:
         result[-1]["cache_control"] = {"type": "ephemeral"}
-    if provider == "bedrock" and result:
+    if (
+        provider == "bedrock"
+        and context_pipeline.bedrock_model_family(model) == "anthropic"
+        and result
+    ):
         result.append({"cachePoint": {"type": "default", "ttl": "1h"}})
     return result
 
@@ -1197,7 +1206,7 @@ class ApiAgent:
             self.budgets["tool_timeout_seconds"],
         )
         self.tools = tools_for_role(
-            self.role, self.route.get("allowed_tools") or None, self.provider
+            self.role, self.route.get("allowed_tools") or None, self.provider, self.model
         )
         self.state: dict[str, Any] = {
             "run_id": run_id,
@@ -1236,6 +1245,20 @@ class ApiAgent:
             model_id = str(count_body.pop("modelId", ""))
             count_body.pop("inferenceConfig", None)
             count_body.pop("requestMetadata", None)
+            if context_pipeline.bedrock_model_family(model_id) == "openai":
+                # GPT-5.6 on Bedrock explicitly does not support CountTokens.
+                # One UTF-8 byte per token is intentionally conservative so the
+                # budget reservation can still fail closed before submission.
+                return max(
+                    1,
+                    len(
+                        json.dumps(
+                            count_body,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                    ),
+                )
             attempts = self.budgets["max_pre_ack_retries"] + 1
             for attempt in range(attempts):
                 try:
@@ -1618,7 +1641,11 @@ class ApiAgent:
                     )
                     if key in body
                 }
-                body["messages"] = roll_bedrock_cache_breakpoint(messages)
+                body["messages"] = (
+                    roll_bedrock_cache_breakpoint(messages)
+                    if context_pipeline.bedrock_model_family(self.model) == "anthropic"
+                    else messages
+                )
             elif self.provider == "azure_adm":
                 choices = response.get("choices") or []
                 assistant = dict((choices[0].get("message") or {}) if choices else {})

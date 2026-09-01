@@ -72,6 +72,13 @@ check "Bedrock payload uses native Converse fields and an explicit output cap" '
 check "Bedrock caches the stable prefix for one hour" 'data["system"][3]["cachePoint"] == {"type":"default","ttl":"1h"} and data["system"][2]["text"].startswith("# Stable repository map")' "$TMP/bedrock.json"
 check "Bedrock carries adaptive effort and strict review output natively" 'data["additionalModelRequestFields"]["thinking"] == {"type":"adaptive"} and data["additionalModelRequestFields"]["output_config"]["effort"] == "high" and data["additionalModelRequestFields"]["output_config"]["format"]["type"] == "json_schema"' "$TMP/bedrock.json"
 
+"$PIPELINE" payload --provider bedrock --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
+  --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" \
+  --mode code-review --execution gate --model global.openai.gpt-5.6-sol \
+  --effort xhigh > "$TMP/bedrock-openai.json"
+check "Bedrock OpenAI uses its native reasoning field without Anthropic fields" 'data["additionalModelRequestFields"] == {"reasoning_effort":"xhigh"} and all("cachePoint" not in block for block in data["system"])' "$TMP/bedrock-openai.json"
+check "Bedrock OpenAI reviewers receive a duplicated strict JSON contract" '"Your entire final response must be exactly one JSON object" in data["system"][-1]["text"] and "Your entire final response must be exactly one JSON object" in data["messages"][0]["content"][0]["text"] and "output_config" not in data["additionalModelRequestFields"]' "$TMP/bedrock-openai.json"
+
 cat > "$TMP/pass-review.json" <<'JSON'
 {"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[{"name":"acceptance coverage","status":"pass"}],"findings":[]}
 JSON
