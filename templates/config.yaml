@@ -37,7 +37,7 @@ schema_version: 1
 # a desktop fallback then could duplicate writes, PRs, or billing.
 llm:
   execution: desktop             # desktop | api
-  provider: anthropic            # anthropic | openai | azure_adm
+  provider: anthropic            # anthropic | openai | azure_adm | bedrock
   model: ""                      # required when effective execution is api
   effort: ""                     # optional: low | medium | high | xhigh | max
   fallback: none                 # desktop | none; applies only to API launch
@@ -76,6 +76,14 @@ llm:
       long_context_threshold_tokens: 272000
       long_context_input_multiplier: 2.00
       long_context_output_multiplier: 1.50
+    # Bedrock route keys are inference-profile IDs. Verify the current AWS
+    # Standard-tier rates before enabling these examples; pricing is explicit so
+    # a model or routing-price change fails closed rather than weakening budgets.
+    # global.anthropic.claude-sonnet-5:
+    #   input_per_mtok: 2.00
+    #   cache_write_per_mtok: 2.50
+    #   cache_read_per_mtok: 0.20
+    #   output_per_mtok: 10.00
   roles:
     # implementer:
     #   execution: api
@@ -95,6 +103,12 @@ llm:
     #   provider: azure_adm
     #   model: grok-4-6-eval     # Azure deployment name, not catalog model name
     #   allowed_tools: [read_file, search, git_diff, git_status, run_check, apply_patch]
+    # design-reviewer:
+    #   execution: api
+    #   provider: bedrock
+    #   model: global.anthropic.claude-opus-5
+    #   effort: high
+    #   allowed_tools: [read_file, search, git_diff, git_status, run_check]
     # security-reviewer:
     #   execution: desktop
     # visual-qa:

@@ -33,6 +33,11 @@ llm:
       execution: api
       provider: azure_adm
       model: grok-4-6-eval
+    design-reviewer:
+      execution: api
+      provider: bedrock
+      model: global.anthropic.claude-opus-5
+      effort: high
 ```
 
 Role overrides inherit each omitted field from `llm`. Built-in role names are
@@ -53,6 +58,11 @@ scripts/context_pipeline.py route --config .orchestration/config.yaml \
 - `provider: azure_adm` uses Azure's OpenAI-compatible Chat Completions endpoint.
   Set `AZURE_ADM_API_KEY` and the resource-specific `AZURE_ADM_BASE_URL`; route
   `model` values to Azure deployment names.
+- `provider: bedrock` uses the native Converse API and the normal AWS credential
+  chain. On EC2, use an instance role; do not put AWS access keys or profiles in
+  `.orchestration/.env`. Set `AWS_REGION` in the host environment and use a
+  global or geographic inference-profile ID as `model`. Install
+  `requirements-bedrock.txt` in the controller's Python environment.
 - Azure Direct Model review payloads repeat the strict JSON-only result contract
   as both a system instruction and the final user instruction. This supports
   deployments such as MAI-Thinking that do not enable structured
@@ -63,6 +73,9 @@ scripts/context_pipeline.py route --config .orchestration/config.yaml \
   further breakpoint to the end of the conversation each round so the
   accumulated transcript is not re-billed at full input price. No execution
   mode can turn caching off.
+- Bedrock Claude routes use native one-hour cache points on stable tools,
+  instructions, and the rolling tool transcript. The usage ledger records
+  Bedrock's uncached, cache-write, cache-read, and output token fields separately.
 - Batch jobs use the same resolved provider/model route before
   `sprint-controller.py prepare-batch` persists the provider-native request.
 
