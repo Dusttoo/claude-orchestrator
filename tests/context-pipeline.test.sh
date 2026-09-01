@@ -70,7 +70,8 @@ check "Azure ADM reviewer contract brackets dynamic context for MAI compatibilit
   --effort high > "$TMP/bedrock.json"
 check "Bedrock payload uses native Converse fields and an explicit output cap" 'data["modelId"] == "global.anthropic.claude-opus-5" and data["inferenceConfig"]["maxTokens"] == 8192 and "<ticket>" in data["messages"][0]["content"][0]["text"]' "$TMP/bedrock.json"
 check "Bedrock caches the stable prefix for one hour" 'data["system"][3]["cachePoint"] == {"type":"default","ttl":"1h"} and data["system"][2]["text"].startswith("# Stable repository map")' "$TMP/bedrock.json"
-check "Bedrock carries adaptive effort and strict review output natively" 'data["additionalModelRequestFields"]["thinking"] == {"type":"adaptive"} and data["additionalModelRequestFields"]["output_config"]["effort"] == "high" and data["additionalModelRequestFields"]["output_config"]["format"]["type"] == "json_schema"' "$TMP/bedrock.json"
+check "Bedrock carries adaptive effort without an unsupported structured-output field" 'data["additionalModelRequestFields"]["thinking"] == {"type":"adaptive"} and data["additionalModelRequestFields"]["output_config"] == {"effort":"high"}' "$TMP/bedrock.json"
+check "Bedrock Claude reviewers receive the validated JSON contract" '"Your entire final response must be exactly one JSON object" in data["system"][-1]["text"] and "Your entire final response must be exactly one JSON object" in data["messages"][0]["content"][0]["text"]' "$TMP/bedrock.json"
 
 "$PIPELINE" payload --provider bedrock --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
   --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" \

@@ -1242,48 +1242,23 @@ class ApiAgent:
             )
         count_body = dict(body)
         if self.provider == "bedrock":
-            model_id = str(count_body.pop("modelId", ""))
+            count_body.pop("modelId", None)
             count_body.pop("inferenceConfig", None)
             count_body.pop("requestMetadata", None)
-            if context_pipeline.bedrock_model_family(model_id) == "openai":
-                # GPT-5.6 on Bedrock explicitly does not support CountTokens.
-                # One UTF-8 byte per token is intentionally conservative so the
-                # budget reservation can still fail closed before submission.
-                return max(
-                    1,
-                    len(
-                        json.dumps(
-                            count_body,
-                            separators=(",", ":"),
-                            ensure_ascii=False,
-                        ).encode("utf-8")
-                    ),
-                )
-            attempts = self.budgets["max_pre_ack_retries"] + 1
-            for attempt in range(attempts):
-                try:
-                    result = self.transport.request(
-                        self.provider,
-                        "count_tokens",
-                        {"modelId": model_id, "input": {"converse": count_body}},
-                    )
-                    break
-                except (ProviderAmbiguous, ProviderHTTPError) as exc:
-                    retryable = isinstance(exc, ProviderAmbiguous) or exc.status in {
-                        429,
-                        500,
-                        502,
-                        503,
-                        504,
-                        529,
-                    }
-                    if not retryable or attempt + 1 >= attempts:
-                        raise
-                    time.sleep(self.budgets["retry_backoff_seconds"] * (attempt + 1))
-            count = int(result.get("input_tokens") or 0)
-            if count <= 0:
-                raise AgentError("provider token counter returned no input token count")
-            return count
+            # Current Claude 5 and GPT-5.6 model cards both mark CountTokens
+            # unsupported on bedrock-runtime. One UTF-8 byte per token is a
+            # deliberately conservative pre-submit budget estimate; settlement
+            # still uses the provider's exact response usage.
+            return max(
+                1,
+                len(
+                    json.dumps(
+                        count_body,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                ),
+            )
         if self.provider == "anthropic":
             count_body.pop("max_tokens", None)
             endpoint = "messages/count_tokens"

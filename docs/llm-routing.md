@@ -76,11 +76,12 @@ scripts/context_pipeline.py route --config .orchestration/config.yaml \
 - Bedrock Claude routes use native one-hour cache points on stable tools,
   instructions, and the rolling tool transcript. The usage ledger records
   Bedrock's uncached, cache-write, cache-read, and output token fields separately.
-- Bedrock OpenAI routes use `reasoning_effort` and repeat the strict reviewer
-  response contract in the system and final user instructions. GPT-5.6 does not
-  support Bedrock CountTokens or structured outputs, so the runner reserves a
-  conservative one-UTF-8-byte-per-token estimate and validates review JSON after
-  the response.
+- Bedrock OpenAI routes use `reasoning_effort`. Every Bedrock reviewer repeats
+  the strict response contract in the system and final user instructions because
+  Claude 5 and GPT-5.6 do not support structured outputs on `bedrock-runtime`.
+  Those model families also do not support CountTokens there, so the runner
+  reserves a conservative one-UTF-8-byte-per-token estimate and validates review
+  JSON after the response.
 - Batch jobs use the same resolved provider/model route before
   `sprint-controller.py prepare-batch` persists the provider-native request.
 

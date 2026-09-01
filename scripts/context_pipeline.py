@@ -612,12 +612,7 @@ def bedrock_payload(args: argparse.Namespace) -> dict[str, Any]:
         raise ContextError(
             f"Bedrock effort is not mapped for model family in {args.model!r}"
         )
-    if args.mode in REVIEW_MODES and family == "anthropic":
-        additional.setdefault("output_config", {})["format"] = {
-            "type": "json_schema",
-            "schema": review_output_schema(args.mode),
-        }
-    elif args.mode in REVIEW_MODES:
+    if args.mode in REVIEW_MODES:
         contract = (
             "FINAL RESPONSE CONTRACT: Your entire final response must be exactly one JSON "
             "object beginning with { and ending with }. Do not emit analysis, Markdown, a "

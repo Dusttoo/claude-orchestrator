@@ -722,13 +722,10 @@ self_check:
             }
         )
         converse_calls = [call for call in transport.calls if call[1] == "converse"]
-        count_calls = [call for call in transport.calls if call[1] == "count_tokens"]
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["output_text"], "done")
         self.assertEqual(len(converse_calls), 2)
-        self.assertEqual(len(count_calls), 2)
-        self.assertEqual(count_calls[0][2]["modelId"], "test-model")
-        self.assertNotIn("inferenceConfig", count_calls[0][2]["input"]["converse"])
+        self.assertFalse(any(call[1] == "count_tokens" for call in transport.calls))
         self.assertIn(
             "apply_patch",
             {
