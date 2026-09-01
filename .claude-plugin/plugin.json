@@ -1,6 +1,6 @@
 {
   "name": "claude-orchestrator",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Multi-agent orchestration harness for Claude Code: resumable Jira sprint scheduling, pre-code design and adversarial-test gates, isolated implementation, batched independent reviews, and mechanical merge-on-green.",
   "author": {
     "name": "Dusty Mumphrey"

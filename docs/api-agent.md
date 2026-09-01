@@ -52,8 +52,10 @@ python3 -m pip install -r /path/to/plugin/requirements-bedrock.txt
 ```
 
 The adapter uses the default AWS credential chain and reuses one
-`bedrock-runtime` client. EC2 deployments should receive `bedrock:Converse` and
-`bedrock:CountTokens` through the instance role. The repository `.env` parser
+`bedrock-runtime` client. EC2 deployments should receive `bedrock:InvokeModel`
+and, for models that support exact preflight counting, `bedrock:CountTokens`
+through the instance role. GPT-5.6 routes also require access to the account's
+default Bedrock project. The repository `.env` parser
 does not accept AWS profile, region, or credential variables, preventing a repo
 from selecting a different AWS identity. Set `AWS_REGION` at the host/session
 level instead.

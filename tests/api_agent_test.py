@@ -758,6 +758,49 @@ self_check:
             {"cachePoint": {"type": "default", "ttl": "1h"}},
         )
 
+    def test_bedrock_openai_uses_local_count_and_no_claude_cache_points(self):
+        model = "global.openai.gpt-5.6-sol"
+        transport = FakeTransport(
+            [
+                {
+                    "id": "aws-openai-1",
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 20, "outputTokens": 4},
+                    "output": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"text": CLEAN_REVIEW}],
+                        }
+                    },
+                }
+            ]
+        )
+        agent = api_agent.ApiAgent(
+            root=self.root,
+            config_path=self.config(provider="bedrock", model=model),
+            role="code-reviewer",
+            ticket="PROJ-5",
+            sprint=None,
+            run_id="bedrock-openai-run",
+            transport=transport,
+        )
+        result = agent.run(
+            {
+                "modelId": model,
+                "inferenceConfig": {"maxTokens": 100},
+                "system": [{"text": "system"}],
+                "messages": [{"role": "user", "content": [{"text": "review"}]}],
+                "additionalModelRequestFields": {"reasoning_effort": "xhigh"},
+            }
+        )
+        converse = next(call for call in transport.calls if call[1] == "converse")
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(any(call[1] == "count_tokens" for call in transport.calls))
+        self.assertTrue(all("cachePoint" not in block for block in converse[2]["system"]))
+        self.assertTrue(
+            all("cachePoint" not in tool for tool in converse[2]["toolConfig"]["tools"])
+        )
+
     def test_budget_blocks_before_provider_submission(self):
         transport = FakeTransport([], count=2_000_000)
         agent = self.agent(transport, run_id="budget-run")

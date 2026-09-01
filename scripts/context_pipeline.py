@@ -55,6 +55,15 @@ class ContextError(RuntimeError):
     pass
 
 
+def bedrock_model_family(model: str) -> str:
+    """Return the provider family encoded in a Bedrock model/profile ID."""
+    if ".anthropic." in model or model.startswith("anthropic."):
+        return "anthropic"
+    if ".openai." in model or model.startswith("openai."):
+        return "openai"
+    return "other"
+
+
 def review_output_schema(gate: str) -> dict[str, Any]:
     """Return the stable, provider-neutral contract for a reviewer result."""
     if gate not in REVIEW_MODES:
@@ -585,24 +594,39 @@ def azure_adm_payload(args: argparse.Namespace) -> dict[str, Any]:
 def bedrock_payload(args: argparse.Namespace) -> dict[str, Any]:
     """Return a native Amazon Bedrock Converse request with a stable cache prefix."""
     stable, dynamic = ordered_context(args)
-    boundary = args.cache_boundary
-    if boundary == "auto":
-        boundary = "repo-map"
-    index = 1 if boundary == "rules" else 2
-    system: list[dict[str, Any]] = []
-    for position, value in enumerate(stable):
-        system.append({"text": value})
-        if position == index:
-            system.append({"cachePoint": {"type": "default", "ttl": "1h"}})
+    family = bedrock_model_family(args.model)
+    system: list[dict[str, Any]] = [{"text": value} for value in stable]
+    if family == "anthropic":
+        boundary = args.cache_boundary
+        if boundary == "auto":
+            boundary = "repo-map"
+        index = 1 if boundary == "rules" else 2
+        system.insert(index + 1, {"cachePoint": {"type": "default", "ttl": "1h"}})
     additional: dict[str, Any] = {}
-    if args.effort:
+    if args.effort and family == "anthropic":
         additional["thinking"] = {"type": "adaptive"}
         additional["output_config"] = {"effort": args.effort}
-    if args.mode in REVIEW_MODES:
+    elif args.effort and family == "openai":
+        additional["reasoning_effort"] = args.effort
+    elif args.effort:
+        raise ContextError(
+            f"Bedrock effort is not mapped for model family in {args.model!r}"
+        )
+    if args.mode in REVIEW_MODES and family == "anthropic":
         additional.setdefault("output_config", {})["format"] = {
             "type": "json_schema",
             "schema": review_output_schema(args.mode),
         }
+    elif args.mode in REVIEW_MODES:
+        contract = (
+            "FINAL RESPONSE CONTRACT: Your entire final response must be exactly one JSON "
+            "object beginning with { and ending with }. Do not emit analysis, Markdown, a "
+            "heading, commentary, or a code fence before or after the object. The object must "
+            "match this schema: "
+            + json.dumps(review_output_schema(args.mode), separators=(",", ":"))
+        )
+        system.append({"text": contract})
+        dynamic += "\n\n" + contract
     result: dict[str, Any] = {
         "modelId": args.model,
         "inferenceConfig": {"maxTokens": args.max_tokens},
