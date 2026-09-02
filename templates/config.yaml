@@ -288,6 +288,12 @@ sprint_done_statuses:
 sprint_blocked_statuses:
   - Blocked
 sprint_checkpoint_dir: .orchestration/.sprint-state
+# Captain messages are event-driven so an interactive control session does not
+# spend model tokens narrating unchanged polls. A compact heartbeat preserves
+# visibility during long-running lanes; set to 0 to disable periodic heartbeats
+# while retaining immediate event and user-action updates.
+sprint_status_update_mode: event       # event | verbose
+sprint_status_heartbeat_minutes: 30
 
 # --- Concurrency ---------------------------------------------------------- both
 # Max concurrent per-ticket sprint workflows and heavy verification chains. Drop

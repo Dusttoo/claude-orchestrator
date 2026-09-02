@@ -532,7 +532,7 @@ def anthropic_payload(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def openai_payload(args: argparse.Namespace) -> dict[str, Any]:
-    """Return an OpenAI Responses API body with the same stable prefix."""
+    """Return an OpenAI Responses API body with an implicitly cached stable prefix."""
     stable, dynamic = ordered_context(args)
     blocks = [{"type": "input_text", "text": text} for text in stable]
     boundary = args.cache_boundary
@@ -547,8 +547,6 @@ def openai_payload(args: argparse.Namespace) -> dict[str, Any]:
         ],
     }
     index = 1 if boundary == "rules" else 2
-    blocks[index]["prompt_cache_breakpoint"] = {"mode": "explicit"}
-    result["prompt_cache_options"] = {"mode": "explicit"}
     cache_source = "\n".join(stable[: index + 1]).encode("utf-8")
     result["prompt_cache_key"] = "orchestration-" + hashlib.sha256(cache_source).hexdigest()[:24]
     if args.effort:

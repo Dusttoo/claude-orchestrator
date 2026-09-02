@@ -40,6 +40,10 @@ check "template configures an active Jira sprint by default" \
   grep -Eq '^sprint_id:[[:space:]]*active([[:space:]]|$)' "$ROOT/templates/config.yaml"
 check "template keeps sprint checkpoints under orchestration runtime state" \
   grep -Eq '^sprint_checkpoint_dir:[[:space:]]*\.orchestration/\.sprint-state([[:space:]]|$)' "$ROOT/templates/config.yaml"
+check "template defaults captain updates to event-driven" \
+  grep -Eq '^sprint_status_update_mode:[[:space:]]*event([[:space:]]|$)' "$ROOT/templates/config.yaml"
+check "template keeps a bounded captain heartbeat" \
+  grep -Eq '^sprint_status_heartbeat_minutes:[[:space:]]*30([[:space:]]|$)' "$ROOT/templates/config.yaml"
 check "template declares directional Jira dependency mapping" \
   rg -q '^sprint_dependency_links:' "$ROOT/templates/config.yaml"
 check "Claude init command validates through shared engine" \
