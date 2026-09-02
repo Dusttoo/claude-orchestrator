@@ -625,8 +625,15 @@ self_check:
         result = agent.run(
             {
                 "model": "test-model", "max_output_tokens": 100,
-                "input": [{"role": "user", "content": "work"}],
+                "input": [{"role": "user", "content": [{
+                    "type": "input_text",
+                    "text": "work",
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                }]}],
                 "text": {"verbosity": "low"},
+                "prompt_cache_key": "stale-key",
+                "prompt_cache_options": {"mode": "explicit"},
+                "prompt_cache_retention": "24h",
             }
         )
         response_calls = [call for call in transport.calls if call[1] == "responses"]
@@ -635,6 +642,9 @@ self_check:
         self.assertEqual(response_calls[1][2]["input"][0]["type"], "function_call_output")
         self.assertEqual(response_calls[1][2]["text"], {"verbosity": "low"})
         self.assertIn("apply_patch", {tool["name"] for tool in response_calls[0][2]["tools"]})
+        serialized_calls = json.dumps(response_calls)
+        for field in api_agent.OPENAI_CACHE_REQUEST_FIELDS:
+            self.assertNotIn(field, serialized_calls)
 
     def test_azure_adm_chat_completion_tool_loop(self):
         transport = FakeTransport(

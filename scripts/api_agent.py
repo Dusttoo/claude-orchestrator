@@ -35,6 +35,27 @@ import context_pipeline
 MILLION = Decimal("1000000")
 TOOL_NAMES = {"read_file", "search", "git_diff", "git_status", "run_check", "apply_patch"}
 READ_TOOLS = {"read_file", "search", "git_diff", "git_status", "run_check"}
+OPENAI_CACHE_REQUEST_FIELDS = {
+    "prompt_cache_key",
+    "prompt_cache_options",
+    "prompt_cache_breakpoint",
+    "prompt_cache_retention",
+}
+
+
+def strip_openai_cache_request_fields(value: Any) -> None:
+    """Remove optional cache controls rejected by some OpenAI-compatible routes."""
+    if isinstance(value, dict):
+        for key in tuple(value):
+            if key in OPENAI_CACHE_REQUEST_FIELDS:
+                value.pop(key, None)
+            else:
+                strip_openai_cache_request_fields(value[key])
+    elif isinstance(value, list):
+        for item in value:
+            strip_openai_cache_request_fields(item)
+
+
 ROLE_TOOL_CEILINGS = {
     "design-reviewer": READ_TOOLS,
     "code-reviewer": READ_TOOLS,
@@ -1536,6 +1557,8 @@ class ApiAgent:
         return results
 
     def run(self, request: dict[str, Any]) -> dict[str, Any]:
+        if self.provider == "openai":
+            strip_openai_cache_request_fields(request)
         request_model = request.get("modelId") if self.provider == "bedrock" else request.get("model")
         if str(request_model or "") != self.model:
             raise AgentError("request model does not match the resolved role route")
@@ -1712,8 +1735,6 @@ class ApiAgent:
                         "parallel_tool_calls",
                         "reasoning",
                         "text",
-                        "prompt_cache_key",
-                        "prompt_cache_options",
                     )
                     if key in body
                 }
