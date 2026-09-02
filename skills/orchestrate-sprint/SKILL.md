@@ -28,6 +28,8 @@ The controller atomically writes under `sprint_checkpoint_dir` (default
 - `sprint_ready_statuses`
 - `sprint_done_statuses`
 - `sprint_blocked_statuses`
+- `sprint_status_update_mode` (default `event`)
+- `sprint_status_heartbeat_minutes` (default `30`; `0` disables heartbeats)
 
 The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
 `sprint_dependency_links` semantically from the same repository config.
@@ -202,6 +204,20 @@ Before launching, resolve the executable because non-interactive SSH shells may 
    rate-limit waiting for one provider, stop admitting new work routed there;
    preserve reservations and allow independent work on healthy routes to
    continue. Bounded retries remain owned by `api_agent.py`.
+
+   **Quiet captain contract.** When `sprint_status_update_mode` is `event`, do
+   not spend model turns polling, rereading full transcripts, or narrating
+   unchanged work. Use the host's blocking worker wait primitive with its
+   cursor and longest supported timeout. On detached CLI lanes, block on the
+   recorded process id and inspect only newly appended output after it exits or
+   signals attention; do not repeatedly reread the JSONL. An unchanged timeout
+   returns directly to waiting without a user update. Report only meaningful
+   events: lane launch, workflow/gate transition, provider degradation or
+   recovery, PR/CI state transition, terminal outcome, blocker, or requested
+   user action. Emit at most one compact running/queued/blocked heartbeat per
+   `sprint_status_heartbeat_minutes`; `0` disables periodic heartbeats. A direct
+   user status request always runs `summary` immediately. This changes
+   narration only, never checkpointing, review gates, retries, or safety.
 
 8. **Return the exact terminal report.** Run `summary --sprint <id>`. Present
    separate completed, blocked, and user-action sections, retaining PR/branch,

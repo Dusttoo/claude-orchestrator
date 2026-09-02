@@ -113,6 +113,14 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    provider, pause new admissions to that provider while preserving reservations
    and letting healthy routes continue; `api_agent.py` owns bounded retries.
 
+   In the default event-driven status mode, block on worker wait primitives or
+   detached process ids instead of spending model turns polling unchanged
+   state. Do not reread whole transcripts or narrate unchanged timeouts. Report
+   launches, workflow/gate transitions, provider health changes, PR/CI changes,
+   terminal outcomes, blockers, and user actions immediately. Otherwise emit at
+   most one compact heartbeat per `sprint_status_heartbeat_minutes` (30 by
+   default; 0 disables it). A direct status request always runs `summary`.
+
 8. Run `summary --sprint <id>` and return separate completed, blocked, and
    user-action sections with their reasons, PR/branch, and run references. Report
    any still-running entries. Do not call the Jira sprint complete merely because

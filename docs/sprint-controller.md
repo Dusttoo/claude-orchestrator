@@ -49,14 +49,24 @@ routes build requests with `context_pipeline.py payload --config ... --role
 ...` and foreground jobs execute through `api_agent.py run`, which enforces role
 tools and run/ticket/sprint budgets. Anthropic Messages and OpenAI Responses
 payloads, plus Azure Direct Model Chat Completions payloads, share the same stable order:
-role brief, repository rules, then the baseline repository map. Gate and
-on-demand payloads place the provider-native explicit cache breakpoint at the
-selected stable boundary; ticket data and the raw active-branch diff remain in
-the uncached user message. Optional `--effort` maps to OpenAI reasoning effort
+role brief, repository rules, then the baseline repository map. Ticket data and
+the raw active-branch diff remain in the uncached user message. Anthropic gate
+and on-demand payloads place a provider-native explicit cache breakpoint at the
+selected stable boundary. OpenAI payloads provide a stable `prompt_cache_key`
+and rely on implicit prompt caching, avoiding explicit-only request fields that
+are not accepted by every compatible OpenAI route. Optional `--effort` maps to OpenAI reasoning effort
 or Anthropic adaptive-thinking effort. Azure Direct Model routes omit the
 provider-specific effort field for cross-model compatibility; fixed
 `budget_tokens` is intentionally not assumed because support differs across
 model generations.
+
+Captain visibility is event-driven by default. The captain blocks on native
+worker wait primitives (or the detached process PID on CLI hosts) instead of
+spending model turns polling unchanged state. It reports launches, phase or gate
+transitions, provider degradation, PR/CI transitions, terminal outcomes,
+blockers, and user actions immediately. During an otherwise unchanged run it
+emits at most the configured heartbeat; the durable sprint checkpoint remains
+available for an on-demand summary at any time.
 
 Non-interactive background lanes can be prepared with `prepare-batch`. The
 controller accepts only current `plan.launch` tickets explicitly marked as
