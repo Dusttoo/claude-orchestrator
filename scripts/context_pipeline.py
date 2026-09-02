@@ -9,7 +9,6 @@ selection, and sanitization before untrusted ticket data reaches an LLM.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 import sys
@@ -532,12 +531,9 @@ def anthropic_payload(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def openai_payload(args: argparse.Namespace) -> dict[str, Any]:
-    """Return an OpenAI Responses API body with an implicitly cached stable prefix."""
+    """Return an OpenAI Responses API body relying on automatic implicit prompt caching."""
     stable, dynamic = ordered_context(args)
     blocks = [{"type": "input_text", "text": text} for text in stable]
-    boundary = args.cache_boundary
-    if boundary == "auto":
-        boundary = "repo-map"
     result: dict[str, Any] = {
         "model": args.model,
         "max_output_tokens": args.max_tokens,
@@ -546,9 +542,6 @@ def openai_payload(args: argparse.Namespace) -> dict[str, Any]:
             {"role": "user", "content": [{"type": "input_text", "text": dynamic}]},
         ],
     }
-    index = 1 if boundary == "rules" else 2
-    cache_source = "\n".join(stable[: index + 1]).encode("utf-8")
-    result["prompt_cache_key"] = "orchestration-" + hashlib.sha256(cache_source).hexdigest()[:24]
     if args.effort:
         result["reasoning"] = {"effort": args.effort}
     if args.mode in REVIEW_MODES:
