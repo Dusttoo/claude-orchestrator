@@ -2,6 +2,9 @@
 .gate-status/
 .orchestration/.gate-status/
 
+# Caller-owned run-context mirrors written by ticket-branch.sh
+.orchestration/runs/
+
 # Visual-QA capture artifacts
 .orchestration/screens/
 

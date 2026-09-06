@@ -145,6 +145,11 @@ llm:
 # --- Branch model --------------------------------------------------------- both
 integration_branch: ""          # fill for schema v1, e.g. the branch feature work targets
 production_branch: ""           # fill for schema v1, e.g. the protected release/history target
+# Optional. When set, the root orchestration run resolves every ticket branch
+# once through scripts/ticket-branch.sh. `{run_id}` comes from caller-provided
+# ORCH_RUN_ID; `{ticket_id}` and `{ticket_slug}` come from the canonical ticket.
+# Keep this unset to preserve existing agent-chosen feature-branch behavior.
+# ticket_branch_template: "run/{run_id}/feat/{ticket_id}-{ticket_slug}"
 
 # --- Merge strategy per target -------------------------------------------- both
 merge_to_integration: merge     # merge | squash. `merge` preserves per-PR history
