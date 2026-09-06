@@ -94,6 +94,15 @@ contains_contract "explicit cleanup policy" 'worktree_cleanup' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md
 contains_contract "hooks are optional" 'defense in depth' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md
+contains_contract "run-scoped ticket branch resolution" 'ticket_branch_template' \
+  commands/orchestrate.md skills/orchestrate-ticket/SKILL.md
+
+if rg -q '`\.\./\.\./scripts/ticket-branch\.sh`' "$ROOT/skills/orchestrate-ticket/SKILL.md" \
+  && rg -q '\$\{CLAUDE_PLUGIN_ROOT\}/scripts/ticket-branch\.sh' "$ROOT/commands/orchestrate.md"; then
+  ok "ticket branch resolver uses plugin-relative paths in both entry points"
+else
+  fail_case "ticket branch resolver path is incomplete or target-relative"
+fi
 
 contains_contract "usage reporting entry point" 'api_agent\.py report' \
   commands/orchestration-report.md skills/orchestration-report/SKILL.md

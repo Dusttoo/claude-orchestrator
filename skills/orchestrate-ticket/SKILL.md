@@ -79,6 +79,7 @@ reading them:
 - `../../scripts/merge-guard.sh`
 - `../../scripts/merge-on-green.sh`
 - `../../scripts/cleanup-worktree.sh`
+- `../../scripts/ticket-branch.sh`
 - `../../scripts/context_pipeline.py`
 - `../../scripts/api_agent.py`
 - `../../scripts/orchestration-engine.py`
@@ -97,12 +98,14 @@ working directory.
    With no tracker, treat the request as the spec.
 
    If `.orchestration/config.yaml` sets `ticket_branch_template`, resolve the
-   feature branch now with `scripts/ticket-branch.sh`, using the canonical ticket
-   id/title and the exact configured source ref/SHA. `ORCH_RUN_ID` must come from
-   durable caller/root-run context and is opaque to this skill; never have a
-   subagent invent it. Persist and relay the returned exact branch to every role.
-   The local `.orchestration/runs/<run-id>/ticket-branch.json` is only a mirror
-   that detects disagreement, not the source of run identity. Refuse a mismatch.
+   feature branch now with `../../scripts/ticket-branch.sh` resolved to an
+   absolute plugin path, while the target repository remains the working
+   directory. Supply the canonical ticket id/title and exact configured source
+   ref/SHA. `ORCH_RUN_ID` must come from durable caller/root-run context and is
+   opaque to this skill; never have a subagent invent it. Persist and relay the
+   returned exact branch to every role. The local
+   `.orchestration/runs/<run-id>/ticket-branch.json` is only a mirror that
+   detects disagreement, not the source of run identity. Refuse a mismatch.
 
 2. **Pre-implementation gates.** Before cutting a branch or editing production
    code, build an adversarial test matrix from the acceptance criteria and the
