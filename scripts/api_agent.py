@@ -795,6 +795,8 @@ class HttpTransport:
         elif provider == "anthropic":
             key = os.environ.get("ANTHROPIC_API_KEY")
             base = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
+            if not base.rstrip("/").endswith("/v1"):
+                base = base.rstrip("/") + "/v1"
             headers = {"x-api-key": key or "", "anthropic-version": "2023-06-01"}
         elif provider == "azure_adm":
             key = os.environ.get("AZURE_ADM_API_KEY")
@@ -813,7 +815,7 @@ class HttpTransport:
                 f"{provider.upper()}_API_KEY is required for {provider} API execution"
             )
         headers["Content-Type"] = "application/json"
-        headers["User-Agent"] = "claude-orchestrator-api-agent/0.10.1"
+        headers["User-Agent"] = "claude-orchestrator-api-agent/0.10.3"
         if idempotency_key:
             if provider == "azure_adm":
                 headers["x-ms-client-request-id"] = idempotency_key
@@ -1057,9 +1059,10 @@ def tools_for_role(
     for name in sorted(selected):
         description, schema = TOOL_SPECS[name]
         if provider == "anthropic":
-            result.append(
-                {"name": name, "description": description, "input_schema": schema, "strict": True}
-            )
+            # Anthropic strict tool use accepts a narrower JSON Schema subset
+            # than these bounded tool specs use. The executor independently
+            # enforces every path, range, collection, and size constraint.
+            result.append({"name": name, "description": description, "input_schema": schema})
         elif provider == "bedrock":
             result.append(
                 {
