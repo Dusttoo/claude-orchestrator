@@ -23,7 +23,7 @@ done
 
 for file in agents/orchestration-code-reviewer.md agents/orchestration-security-reviewer.md agents/orchestration-visual-qa.md; do
   require_text "$file" "full" "reviewer completes the full sweep"
-  require_text "$file" "[component:" "review findings identify a stable component"
+  require_text "$file" "component" "review findings identify a stable component"
 done
 
 for file in agents/orchestration-code-reviewer.md agents/orchestration-security-reviewer.md; do
@@ -59,8 +59,10 @@ require_text agents/orchestration-code-reviewer.md "Round 2+ -- scope freeze" \
   "later rounds freeze what may block"
 require_text agents/orchestration-code-reviewer.md "Severity: BLOCKING vs ADVISORY" \
   "reviewer splits blocking from advisory findings"
-require_text agents/orchestration-code-reviewer.md "[component: <path>:<symbol>]" \
-  "component keys are path plus symbol, not free text"
+require_text agents/orchestration-code-reviewer.md '"component":"src/auth/session.ts:refreshToken"' \
+  "structured component values are bare path-plus-symbol keys"
+require_text agents/orchestration-code-reviewer.md 'Do not include a `[component: ...]`' \
+  "structured component values exclude the prose wrapper"
 require_text agents/orchestration-code-reviewer.md "Round 3 or later" \
   "reviewer doubt rule is round-aware"
 require_text agents/orchestration-code-reviewer.md "ADVISORY -- report it, do not block" \

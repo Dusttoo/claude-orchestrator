@@ -104,10 +104,12 @@ passing checks. Every finding has exactly: `component`, `disposition`
 (`blocking` or `advisory`), `severity` (`critical`, `high`, `medium`, or `low`),
 a short `title`, the actionable `explanation`, and boolean `regression`.
 
-Key every finding `[component: <path>:<symbol>]` -- the repo-relative file path
-plus the enclosing symbol, never a line number (it drifts on rebase) and never a
+Set every finding's JSON `component` value to the bare `<path>:<symbol>` key --
+the repo-relative file path plus the enclosing symbol. For example:
+`"component":"src/auth/session.ts:refreshToken"`. Do not include a
+`[component: ...]` Markdown wrapper, a line number (it drifts on rebase), or a
 free-text subsystem name. If the orchestrator's round brief lists an open
-component that is this same defect, reuse its key verbatim.
+component that is this same defect, reuse its bare key verbatim.
 
 Rules:
 - **The security gate is exempt from the review loop's scope freeze.** Later

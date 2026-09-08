@@ -95,6 +95,14 @@ cat > "$TMP/fail-review.json" <<'JSON'
 {"schema_version":1,"gate":"code-review","verdict":"FAIL","checks":[{"name":"tests","status":"fail"}],"findings":[{"component":"src/a.py:parse","disposition":"blocking","severity":"high","title":"Parser accepts invalid input","explanation":"Input X reaches parse and returns Y; reject it and add the named regression assertion.","regression":true}]}
 JSON
 "$PIPELINE" validate-review --gate code-review --input "$TMP/fail-review.json" >/dev/null && ok "finding explanations validate only inside findings" || fail_case "finding explanations validate only inside findings"
+python3 - "$TMP/fail-review.json" "$TMP/wrapped-review.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1]))
+value["findings"][0]["component"] = "[component: src/a.py:parse]"
+json.dump(value, open(sys.argv[2], "w"))
+PY
+"$PIPELINE" validate-review --gate code-review --input "$TMP/wrapped-review.json" > "$TMP/normalized-review.json"
+check "legacy wrapped component keys normalize without discarding the review" 'data["findings"][0]["component"] == "src/a.py:parse"' "$TMP/normalized-review.json"
 python3 - "$TMP/pass-review.json" "$TMP/invalid-review.json" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1]))

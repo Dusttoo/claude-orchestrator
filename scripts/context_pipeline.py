@@ -92,7 +92,15 @@ def review_output_schema(gate: str) -> dict[str, Any]:
                     "type": "object", "additionalProperties": False,
                     "required": ["component", "disposition", "severity", "title", "explanation", "regression"],
                     "properties": {
-                        "component": {"type": "string", "minLength": 3, "maxLength": 240},
+                        "component": {
+                            "type": "string",
+                            "minLength": 3,
+                            "maxLength": 240,
+                            "description": (
+                                "Bare repo-relative <path>:<symbol> key; do not include "
+                                "a [component: ...] wrapper or a line number"
+                            ),
+                        },
                         "disposition": {"type": "string", "enum": ["blocking", "advisory"]},
                         "severity": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
                         "title": {"type": "string", "minLength": 1, "maxLength": 120},
@@ -147,13 +155,19 @@ def validate_review_output(value: Any, expected_gate: str) -> dict[str, Any]:
     if not isinstance(findings, list) or len(findings) > 20:
         raise ContextError("review findings must be an array of at most 20 items")
     blocking = 0
+    normalized_findings: list[dict[str, Any]] = []
     required = {"component", "disposition", "severity", "title", "explanation", "regression"}
-    for finding in findings:
-        if not isinstance(finding, dict) or set(finding) != required:
+    for raw_finding in findings:
+        if not isinstance(raw_finding, dict) or set(raw_finding) != required:
             raise ContextError("each finding must contain only the six documented fields")
+        finding = dict(raw_finding)
         component = finding["component"]
         if not isinstance(component, str) or len(component) > 240:
             raise ContextError("finding component must be a string of at most 240 characters")
+        legacy_wrapper = re.fullmatch(r"\[\s*component\s*:\s*(.*?)\s*\]", component, re.IGNORECASE)
+        if legacy_wrapper:
+            component = legacy_wrapper.group(1)
+            finding["component"] = component
         if not re.fullmatch(r"[^\s:][^\s]*:[^\s:][^\s]*", component):
             raise ContextError(f"finding component must be <path>:<symbol>: {component!r}")
         if re.search(r":\d+(?::\d+)?$", component):
@@ -169,13 +183,16 @@ def validate_review_output(value: Any, expected_gate: str) -> dict[str, Any]:
         if not isinstance(finding["regression"], bool):
             raise ContextError("finding regression must be a boolean")
         blocking += finding["disposition"] == "blocking"
+        normalized_findings.append(finding)
     if value["verdict"] == "PASS" and blocking:
         raise ContextError("PASS review cannot contain blocking findings")
     if value["verdict"] == "FAIL" and not blocking:
         raise ContextError("FAIL review requires at least one blocking finding")
     if failing_check and not blocking:
         raise ContextError("failed or unrun checks require a blocking finding with the explanation")
-    return value
+    result = dict(value)
+    result["findings"] = normalized_findings
+    return result
 
 
 def _unquote(value: str) -> str:

@@ -198,7 +198,9 @@ ADVISORY -- report it, do not block the merge on it.
 
 Every finding -- blocking or advisory -- starts with a component key so the
 orchestrator can count repeated failures on the same defect across gates and
-rounds. The key format is `[component: <path>:<symbol>]`:
+rounds. In structured output, the `component` field value is the bare
+`<path>:<symbol>` key. For example: `"component":"src/auth/session.ts:refreshToken"`.
+Do not include a `[component: ...]` Markdown wrapper in the JSON value.
 
 - `<path>` is the repo-relative file path the defect lives in.
 - `<symbol>` is the enclosing function, class, component, test, or export.

@@ -117,6 +117,10 @@ else ok "a PASS listing blocking findings is rejected"; fi
 
 # --- round-aware guidance -----------------------------------------------------
 led open 7 >/dev/null
+led brief 7 | grep -q 'JSON `component` field to the bare `<path>:<symbol>` key' && ok "review brief requests a bare JSON component key" || bad "review brief requests a bare JSON component key"
+if led brief 7 | grep -q 'Key every finding as `\[component:'; then
+  bad "review brief does not instruct reviewers to wrap JSON component keys"
+else ok "review brief does not instruct reviewers to wrap JSON component keys"; fi
 led brief 7 | grep -q "block-on-doubt\|treat it as BLOCKING" && ok "round 1 briefs block-on-doubt" || bad "round 1 briefs block-on-doubt"
 led record 7 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef7 >/dev/null
 cat > "$TMP/repair-7.json" <<'JSON'

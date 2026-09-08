@@ -58,7 +58,7 @@ You are invoked in two situations, and they have different scopes.
 any code exists. Review everything.
 
 **Finding survived a completed repair.** The orchestrator's ledger recorded that
-an evidenced repair did not close `[component: <path>:<symbol>]`. The
+an evidenced repair did not close the bare `<path>:<symbol>` component key. The
 orchestrator names that component. Your job is the
 root-cause design of **that component and everything it depends on** -- not a
 re-litigation of the whole ticket. Ask why the first fix did not hold: a wrong
@@ -83,7 +83,7 @@ or
 
 ```
 VERDICT: FAIL
-- [component: <stable subsystem/symbol>] <fragile assumption or missing proof> -- <required redesign>
+- `<path>:<symbol>` <fragile assumption or missing proof> -- <required redesign>
 - ...
 ```
 
