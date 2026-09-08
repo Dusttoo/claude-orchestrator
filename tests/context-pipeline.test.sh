@@ -41,14 +41,14 @@ check "Anthropic reviewers use a native strict output shape" 'data["output_confi
   --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" \
   --mode code-review --execution gate --model test-model --effort low > "$TMP/openai.json"
 check "OpenAI Responses payload preserves the same stable-prefix order" '[x["text"].splitlines()[0] for x in data["input"][0]["content"]] == ["# Global role briefs", "# Repository rules and conventions", "# Stable repository map"]' "$TMP/openai.json"
-check "OpenAI payload uses portable implicit caching for the stable prefix" 'data["prompt_cache_key"].startswith("orchestration-") and "prompt_cache_options" not in data and all("prompt_cache_breakpoint" not in block for block in data["input"][0]["content"]) and data["reasoning"]["effort"] == "low"' "$TMP/openai.json"
+check "OpenAI payload omits every optional cache request field" 'all(field not in str(data) for field in ["prompt_cache_key", "prompt_cache_options", "prompt_cache_breakpoint", "prompt_cache_retention"]) and data["reasoning"]["effort"] == "low"' "$TMP/openai.json"
 check "OpenAI reviewers use low-verbosity strict structured output" 'data["text"]["verbosity"] == "low" and data["text"]["format"]["type"] == "json_schema" and data["text"]["format"]["strict"] is True' "$TMP/openai.json"
 
 "$PIPELINE" payload --provider openai --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
   --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --mode implement \
   --execution on-demand --model test-model > "$TMP/implement.json"
 check "implementers are not forced into the reviewer schema" '"text" not in data' "$TMP/implement.json"
-check "implement payloads retain implicit cache routing without explicit-only fields" 'data["prompt_cache_key"].startswith("orchestration-") and "prompt_cache_options" not in data and all("prompt_cache_breakpoint" not in block for block in data["input"][0]["content"])' "$TMP/implement.json"
+check "implement payloads omit every optional cache request field" 'all(field not in str(data) for field in ["prompt_cache_key", "prompt_cache_options", "prompt_cache_breakpoint", "prompt_cache_retention"])' "$TMP/implement.json"
 
 "$PIPELINE" anthropic --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
   --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --mode implement \

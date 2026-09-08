@@ -35,6 +35,27 @@ import context_pipeline
 MILLION = Decimal("1000000")
 TOOL_NAMES = {"read_file", "search", "git_diff", "git_status", "run_check", "apply_patch"}
 READ_TOOLS = {"read_file", "search", "git_diff", "git_status", "run_check"}
+OPENAI_CACHE_REQUEST_FIELDS = {
+    "prompt_cache_key",
+    "prompt_cache_options",
+    "prompt_cache_breakpoint",
+    "prompt_cache_retention",
+}
+
+
+def strip_openai_cache_request_fields(value: Any) -> None:
+    """Remove optional cache controls rejected by some OpenAI-compatible routes."""
+    if isinstance(value, dict):
+        for key in tuple(value):
+            if key in OPENAI_CACHE_REQUEST_FIELDS:
+                value.pop(key, None)
+            else:
+                strip_openai_cache_request_fields(value[key])
+    elif isinstance(value, list):
+        for item in value:
+            strip_openai_cache_request_fields(item)
+
+
 ROLE_TOOL_CEILINGS = {
     "design-reviewer": READ_TOOLS,
     "code-reviewer": READ_TOOLS,
@@ -774,6 +795,8 @@ class HttpTransport:
         elif provider == "anthropic":
             key = os.environ.get("ANTHROPIC_API_KEY")
             base = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
+            if not base.rstrip("/").endswith("/v1"):
+                base = base.rstrip("/") + "/v1"
             headers = {"x-api-key": key or "", "anthropic-version": "2023-06-01"}
         elif provider == "azure_adm":
             key = os.environ.get("AZURE_ADM_API_KEY")
@@ -792,7 +815,7 @@ class HttpTransport:
                 f"{provider.upper()}_API_KEY is required for {provider} API execution"
             )
         headers["Content-Type"] = "application/json"
-        headers["User-Agent"] = "claude-orchestrator-api-agent/0.10.1"
+        headers["User-Agent"] = "claude-orchestrator-api-agent/0.10.3"
         if idempotency_key:
             if provider == "azure_adm":
                 headers["x-ms-client-request-id"] = idempotency_key
@@ -1036,9 +1059,10 @@ def tools_for_role(
     for name in sorted(selected):
         description, schema = TOOL_SPECS[name]
         if provider == "anthropic":
-            result.append(
-                {"name": name, "description": description, "input_schema": schema, "strict": True}
-            )
+            # Anthropic strict tool use accepts a narrower JSON Schema subset
+            # than these bounded tool specs use. The executor independently
+            # enforces every path, range, collection, and size constraint.
+            result.append({"name": name, "description": description, "input_schema": schema})
         elif provider == "bedrock":
             result.append(
                 {
@@ -1536,6 +1560,8 @@ class ApiAgent:
         return results
 
     def run(self, request: dict[str, Any]) -> dict[str, Any]:
+        if self.provider == "openai":
+            strip_openai_cache_request_fields(request)
         request_model = request.get("modelId") if self.provider == "bedrock" else request.get("model")
         if str(request_model or "") != self.model:
             raise AgentError("request model does not match the resolved role route")
@@ -1712,8 +1738,6 @@ class ApiAgent:
                         "parallel_tool_calls",
                         "reasoning",
                         "text",
-                        "prompt_cache_key",
-                        "prompt_cache_options",
                     )
                     if key in body
                 }

@@ -52,9 +52,10 @@ payloads, plus Azure Direct Model Chat Completions payloads, share the same stab
 role brief, repository rules, then the baseline repository map. Ticket data and
 the raw active-branch diff remain in the uncached user message. Anthropic gate
 and on-demand payloads place a provider-native explicit cache breakpoint at the
-selected stable boundary. OpenAI payloads provide a stable `prompt_cache_key`
-and rely on implicit prompt caching, avoiding explicit-only request fields that
-are not accepted by every compatible OpenAI route. Optional `--effort` maps to OpenAI reasoning effort
+selected stable boundary. OpenAI payloads keep the same stable prefix order but
+omit all optional cache-control request fields because supported fields differ
+across live OpenAI-compatible routes. A compatible route may still apply its
+own automatic caching without request metadata. Optional `--effort` maps to OpenAI reasoning effort
 or Anthropic adaptive-thinking effort. Azure Direct Model routes omit the
 provider-specific effort field for cross-model compatibility; fixed
 `budget_tokens` is intentionally not assumed because support differs across

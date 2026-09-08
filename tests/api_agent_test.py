@@ -277,6 +277,18 @@ self_check:
         with self.assertRaisesRegex(api_agent.AgentError, "expected KEY=value"):
             api_agent.load_orchestration_env(config)
 
+    def test_anthropic_base_url_accepts_host_or_v1_form(self):
+        response = FakeHTTPResponse({"id": "msg_1"})
+        for base in ("https://api.anthropic.com", "https://api.anthropic.com/v1/"):
+            with self.subTest(base=base), mock.patch.dict(
+                os.environ,
+                {"ANTHROPIC_API_KEY": "test-key", "ANTHROPIC_BASE_URL": base},
+                clear=False,
+            ), mock.patch("urllib.request.urlopen", return_value=response) as urlopen:
+                api_agent.HttpTransport().request("anthropic", "messages", {})
+                request = urlopen.call_args.args[0]
+                self.assertEqual(request.full_url, "https://api.anthropic.com/v1/messages")
+
     def test_anthropic_tool_loop_and_usage(self):
         transport = FakeTransport(
             [
@@ -309,6 +321,10 @@ self_check:
         self.assertEqual(message_calls[0][2]["max_tokens"], 100)
         tool_names = {tool["name"] for tool in message_calls[0][2]["tools"]}
         self.assertNotIn("apply_patch", tool_names)
+        tool_payload = json.dumps(message_calls[0][2]["tools"])
+        self.assertNotIn('"strict"', tool_payload)
+        self.assertIn('"maxItems"', tool_payload)
+        self.assertIn('"minimum"', tool_payload)
         self.assertEqual(message_calls[1][2]["messages"][-1]["content"][0]["type"], "tool_result")
         summary = agent.ledger.summary()
         self.assertEqual(summary["input_tokens"], 120)
@@ -625,8 +641,15 @@ self_check:
         result = agent.run(
             {
                 "model": "test-model", "max_output_tokens": 100,
-                "input": [{"role": "user", "content": "work"}],
+                "input": [{"role": "user", "content": [{
+                    "type": "input_text",
+                    "text": "work",
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                }]}],
                 "text": {"verbosity": "low"},
+                "prompt_cache_key": "stale-key",
+                "prompt_cache_options": {"mode": "explicit"},
+                "prompt_cache_retention": "24h",
             }
         )
         response_calls = [call for call in transport.calls if call[1] == "responses"]
@@ -635,6 +658,9 @@ self_check:
         self.assertEqual(response_calls[1][2]["input"][0]["type"], "function_call_output")
         self.assertEqual(response_calls[1][2]["text"], {"verbosity": "low"})
         self.assertIn("apply_patch", {tool["name"] for tool in response_calls[0][2]["tools"]})
+        serialized_calls = json.dumps(response_calls)
+        for field in api_agent.OPENAI_CACHE_REQUEST_FIELDS:
+            self.assertNotIn(field, serialized_calls)
 
     def test_azure_adm_chat_completion_tool_loop(self):
         transport = FakeTransport(

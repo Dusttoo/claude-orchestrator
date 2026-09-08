@@ -35,7 +35,9 @@ AZURE_ADM_BASE_URL=https://your-resource.openai.azure.com/openai/v1
 
 Only define the provider the repository uses. Optional custom endpoints are
 `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`; `AZURE_ADM_BASE_URL` is required for
-Azure Direct Models. The Azure `model` route value is the deployment name. The
+Azure Direct Models. `ANTHROPIC_BASE_URL` accepts either a host URL or a URL
+already ending in `/v1`; the runner normalizes both to the versioned Messages
+API path. The Azure `model` route value is the deployment name. The
 runner parses this file as data; it does not execute shell syntax or expand
 variables. Only the documented provider names are loaded. Variables already
 supplied by a cloud container or host environment take precedence, making platform secret injection
@@ -94,6 +96,12 @@ bounded.
 
 `llm.roles.<role>.allowed_tools` may narrow that role's built-in ceiling. It
 cannot grant a reviewer write access or name an unknown tool.
+
+Anthropic tools intentionally omit the provider's `strict` flag because the
+tool schemas use standard constraints outside Anthropic strict mode's accepted
+subset. The tool executor remains the security boundary and independently
+enforces path containment, numeric ranges, list sizes, patch size, allowed
+checks, timeouts, and output limits.
 
 The runner is intentionally text/code-only. Keep `visual-qa` on a desktop route
 until a separately sandboxed image/browser adapter is configured; an API visual
