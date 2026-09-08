@@ -26,7 +26,7 @@ That is a process with no absorbing state, and 10+ rounds is its expected tail,
 not an anomaly.
 
 The old strike-based redesign escalation was supposed to break exactly this cycle, and
-it almost never fired. It counted failures per `[component: ...]` key -- a
+it almost never fired. It counted failures per component key -- a
 free-text string each fresh reviewer invented. `auth/sessionStore` in round 1 and
 `session-refresh` in round 4 are the same defect wearing two names, so the strike
 never landed. The ledger holding those counts also lived in the orchestrator's
@@ -52,10 +52,11 @@ else serves.
   FAIL no longer costs one loop, it costs every remaining one, so the reviewer
   files uncertain findings as advisory and names the evidence that would settle
   them.
-- **Keys that are derived, not invented.** `[component: <path>:<symbol>]`, with
-  line numbers stripped (they drift on rebase) and free-text subsystem names
-  rejected. `review-ledger.py` normalizes them so one repair brief cannot split a
-  repeated defect into multiple identities.
+- **Keys that are derived, not invented.** The structured `component` value is
+  the bare `<path>:<symbol>` key, with no `[component: ...]` wrapper. Line
+  numbers are stripped (they drift on rebase) and free-text subsystem names are
+  rejected. `review-ledger.py` normalizes keys so one repair brief cannot split
+  a repeated defect into multiple identities.
 - **Separate caps end both loops.** `max_design_rounds` (default 5) counts
   pre-code design verdicts. `max_repair_cycles` (default 2) counts explicit
   repair reports, not review passes, so concurrent code and security gates

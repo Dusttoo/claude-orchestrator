@@ -139,7 +139,7 @@ working directory.
    `review-ledger.py brief <pr>` into every reviewer brief, and record every
    completed gate with `review-ledger.py record <pr> --gate <gate> --result
    .orchestration/.review-results/<gate>.json`. It normalizes each finding's
-   `[component: <path>:<symbol>]` key so a repeated defect actually accumulates
+   bare `<path>:<symbol>` component key so a repeated defect actually accumulates
    strikes, freezes blocking scope after round 1, and returns `next_action`:
 
    - `review` -- after all gates record, generate one `repair-brief`; return its

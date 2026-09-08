@@ -572,7 +572,7 @@ def cmd_repair_brief(args: argparse.Namespace) -> None:
         "OPEN BLOCKING FINDINGS:",
     ]
     for component in sorted(open_components(state), key=lambda item: item["key"]):
-        lines.append(f"- [component: {component['key']}]")
+        lines.append(f"- `{component['key']}`")
         finding = component.get("finding")
         if finding:
             lines.append(f"  {finding['title']}: {finding['explanation']}")
@@ -580,7 +580,7 @@ def cmd_repair_brief(args: argparse.Namespace) -> None:
     lines += [
         "",
         "The report schema is:",
-        '{"schema_version":1,"head":"<commit>","findings":[{"component":"<stable ID>",',
+        '{"schema_version":1,"head":"<commit>","findings":[{"component":"<path>:<symbol>",',
         '"status":"closed|unresolved","root_cause":"...","change":"...","verification":"..."}]}',
         "Every open ID must appear exactly once. Reviewer re-execution, not the implementer's",
         "self-assessment, determines whether a finding is actually closed.",
@@ -834,15 +834,16 @@ def cmd_brief(args: argparse.Namespace) -> None:
         for component in sorted(open_list, key=lambda c: c["key"]):
             mark = "  [REDESIGN REQUIRED]" if component in redesign_pending(state) else ""
             lines.append(
-                f"  - [component: {component['key']}] strikes={component['strikes']}"
+                f"  - `{component['key']}` strikes={component['strikes']}"
                 f" gates={','.join(component['gates'])}{mark}"
             )
     else:
         lines.append("OPEN LEDGER COMPONENTS: none.")
     lines += [
         "",
-        "Key every finding as `[component: <path>:<symbol>]` -- the file path plus the",
-        "enclosing symbol, never a line number and never a free-text subsystem name.",
+        "Set every finding's JSON `component` field to the bare `<path>:<symbol>` key --",
+        "the file path plus the enclosing symbol. Do not include `[component: ...]` or",
+        "any other wrapper; never use a line number or a free-text subsystem name.",
         "If your finding is the same defect as an open component above, reuse its key",
         "verbatim so the strike lands on it.",
     ]
