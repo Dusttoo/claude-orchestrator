@@ -85,6 +85,14 @@ supports them.
 - **Design before security-sensitive infrastructure.** A pre-code gate records
   trust boundaries, impossible guarantees, failure recovery, rejected fragile
   alternatives, and the adversarial tests that falsify its invariants.
+- **Architecture must fit the authorized boundary.** The design gate identifies
+  invariants that require a root-owned installation, distinct UID, daemon,
+  container, cloud resource, or operational rollout before code starts; those
+  become separately scoped work instead of late review discoveries.
+- **Worker trust is explicit and portable.** `cooperative-worker` covers mistakes,
+  crashes, loops, duplicate execution, and accidental misuse. `isolated-worker`
+  opts into independently owned process and credential isolation. Neither profile
+  relaxes application, tenant, or external-input security.
 - **Reviews batch the whole sweep.** Finding one blocker never ends a review;
   reviewers finish the diff, checklist, and matrix and report all findings once.
 - **A failed repair triggers scoped redesign.** A stable component-key ledger,
@@ -147,6 +155,7 @@ Legacy key blocks:
 | Key | Purpose |
 |---|---|
 | `integration_branch` / `production_branch` | the branch model |
+| `worker_trust_profile` | worker-versus-host assumptions: `cooperative-worker` (portable default) or `isolated-worker` |
 | `llm` / `llm.roles` | global desktop/API route, per-role provider/model/tool overrides, hard budgets, and explicit model pricing |
 | `merge_to_integration` / `merge_to_production` | `merge` or `squash` per target |
 | `ci_checks_integration` / `ci_checks_production` | exact GitHub check-run names that define "CI green" |

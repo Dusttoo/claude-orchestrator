@@ -200,7 +200,7 @@ led brief 7 | grep -q 'JSON `component` field to the bare `<path>:<symbol>` key'
 if led brief 7 | grep -q 'Key every finding as `\[component:'; then
   bad "review brief does not instruct reviewers to wrap JSON component keys"
 else ok "review brief does not instruct reviewers to wrap JSON component keys"; fi
-led brief 7 | grep -q "block-on-doubt\|treat it as BLOCKING" && ok "round 1 briefs block-on-doubt" || bad "round 1 briefs block-on-doubt"
+led brief 7 | grep -q "Investigate uncertainty before the verdict" && ok "round 1 briefs require evidence before blocking" || bad "round 1 briefs require evidence before blocking"
 led record 7 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef7 >/dev/null
 cat > "$TMP/repair-7.json" <<'JSON'
 {"schema_version":1,"head":"abcdef7","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"bad condition","change":"fixed condition","verification":"regression passes"}]}

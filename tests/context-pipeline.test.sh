@@ -33,6 +33,7 @@ check "sanitizer drops render, edit, changelog, schemas, and avatar links" '"ren
   --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" \
   --mode code-review --execution gate --model test-model > "$TMP/payload.json"
 check "static Anthropic context is ordered role, rules, repository map" '[x["text"].splitlines()[0] for x in data["system"]] == ["# Global role briefs", "# Repository rules and conventions", "# Stable repository map"]' "$TMP/payload.json"
+check "default worker trust profile is injected into role context" '"Selected profile: cooperative-worker" in data["system"][0]["text"] and "never weakens" in data["system"][0]["text"]' "$TMP/payload.json"
 check "gate payload caches the final stable block" 'data["system"][2]["cache_control"] == {"type":"ephemeral"} and "cache_control" not in data["system"][0]' "$TMP/payload.json"
 check "dynamic ticket and raw diff stay after the cached prefix" '"<ticket>" in data["messages"][0]["content"] and "<active_branch_unified_diff>" in data["messages"][0]["content"] and "Do not index" in data["messages"][0]["content"]' "$TMP/payload.json"
 check "Anthropic reviewers use a native strict output shape" 'data["output_config"]["format"]["type"] == "json_schema" and data["output_config"]["format"]["schema"]["properties"]["gate"]["enum"] == ["code-review"]' "$TMP/payload.json"
@@ -126,6 +127,7 @@ printf 'llm_provider: openai\n' > "$TMP/legacy-route.yaml"
 check "legacy flat provider config remains desktop-compatible" 'data["execution"] == "desktop" and data["provider"] == "openai"' "$TMP/legacy-route.json"
 
 cat > "$TMP/routes.yaml" <<'YAML'
+worker_trust_profile: isolated-worker
 llm:
   execution: api
   provider: anthropic
@@ -151,6 +153,7 @@ check "desktop role override disables an inherited API fallback" 'data["executio
   --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" --mode code-review \
   --execution gate > "$TMP/routed-payload.json"
 check "payload construction consumes the resolved API role route" 'data["model"] == "gpt-review" and data["reasoning"]["effort"] == "low" and "input" in data' "$TMP/routed-payload.json"
+check "configured isolated worker profile reaches API reviewers" '"Selected profile: isolated-worker" in data["input"][0]["content"][0]["text"]' "$TMP/routed-payload.json"
 run_fail "desktop routes refuse API payload construction" "$PIPELINE" payload \
   --config "$TMP/routes.yaml" --role security-reviewer --role-file "$TMP/role.md" \
   --rules-file "$TMP/AGENTS.md" --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json"
@@ -171,6 +174,18 @@ llm:
       provider: unknown
 YAML
 run_fail "invalid unused role overrides fail the whole routing policy closed" "$PIPELINE" route --config "$TMP/invalid-unused-override.yaml" --role implementer
+
+cat > "$TMP/invalid-trust-profile.yaml" <<'YAML'
+worker_trust_profile: omnipotent-worker
+llm:
+  execution: api
+  provider: openai
+  model: test-model
+YAML
+run_fail "invalid worker trust profile fails payload construction" "$PIPELINE" payload \
+  --config "$TMP/invalid-trust-profile.yaml" --role implementer \
+  --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
+  --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --mode implement
 
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi

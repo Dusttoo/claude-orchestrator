@@ -65,6 +65,15 @@ scope/matrix -> design* -> implement -> code-review -> security-review -> verify
 - **A finding is reproduced, not trusted.** "tsc clean / tests green" from the
   author is a claim; the gate re-runs it. A "stale" or flaky test is treated as
   a real signal until proven otherwise -- it has more than once been a real bug.
+- **The worker threat model is explicit.** `worker_trust_profile` defaults to
+  `cooperative-worker`: protect against mistakes, crashes, loops, duplicate work,
+  and accidental misuse without pretending same-UID code is adversarially
+  isolated. `isolated-worker` requires a separately owned UID/container and
+  credential boundary. This setting never weakens application or tenant security.
+- **Architecture feasibility precedes code.** If an invariant needs a root-owned
+  installation, daemon, container, cloud resource, or rollout outside the ticket,
+  split or defer it before implementation. A repository-local approximation is
+  not a repair.
 - **The orchestrator is a lossy relay.** Summarizing agent reports into briefs
   into docs drops the uncertainty marker at each hop. So: never put a `file:line`
   or an unrun code snippet in a brief -- hand over a grep target and let the
@@ -96,6 +105,13 @@ scope/matrix -> design* -> implement -> code-review -> security-review -> verify
   acceptance criteria, disabled tests, and cross-surface disagreement block.
   Dead weight, naming, and "while I was in here" are advisory: recorded on the
   ledger, carried into the PR body, never a FAIL.
+- **A blocker carries closure evidence.** It names the failing input or
+  precondition, production path, wrong outcome and impact, plus a reproduction or
+  exact falsifying assertion under the configured profile. Stronger-profile
+  hypotheticals remain advisory instead of expanding the PR mid-review.
+- **Implementers preflight once.** Before review they re-run the criterion map
+  and adversarial tests, preserve before-fix evidence, inspect affected callers,
+  and return any unproven criterion unresolved rather than starting a review loop.
 - **Both loops have an end.** `max_design_rounds` (default 5) bounds pre-code
   design iteration. `max_repair_cycles` (default 2) counts durable repair
   reports, not reviewer passes. Hitting either cap stops and hands the human

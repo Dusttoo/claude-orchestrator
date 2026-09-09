@@ -59,14 +59,22 @@ Steps:
    or push back BEFORE cutting a branch. If `ticket.kind == none`, treat
    `$ARGUMENTS` as the spec.
 
+   Resolve `worker_trust_profile` now. It applies only to orchestration workers
+   versus the host and never narrows application security. Keep that profile
+   fixed through design, implementation, and review.
+
 2. **Pre-implementation gates.** Before cutting a branch or editing production
    code, create an adversarial test matrix. Every row names the attack/failure
    mode, setup/input, invariant, test layer, and falsifying assertion. Cover all
    relevant parser/interpreter syntax (including shell wrappers, substitutions,
    heredocs, redirections, and pipelines), ignored/untracked files, failed Git
    or other inspection, partial execution, cleanup recovery, permissions,
-   concurrency, retries, and hostile input. N/A requires a reason. For planned
-   security-sensitive infrastructure, launch a fresh
+   concurrency, retries, and hostile input. N/A requires a reason. First perform
+   an architecture-feasibility check: if an invariant requires a root-owned
+   installation, distinct UID, daemon, container, cloud resource, or rollout
+   outside the authorized scope, split or defer it instead of approving a local
+   approximation. For planned security-sensitive infrastructure or an external
+   boundary crossing, launch a fresh
    `orchestration-design-reviewer`. Open `review-ledger.py design-open
    <ticket-or-change>`, record FAIL with explicit evidence, and record PASS only
    through `design-record --result <json>` bound to the exact source SHA. Stop with
@@ -90,6 +98,9 @@ Steps:
    full-codebase index; only a named verification or regression may expand scope.
    - Reviewers finish the entire checklist and adversarial sweep and batch all
      findings, even after the first blocker.
+   - A blocker names a concrete failing input/precondition, production path,
+     wrong outcome/impact, and reproduction or exact falsifying assertion under
+     the configured profile. Stronger-profile hypotheticals are advisory.
    - The durable failure ledger owns the loop. Open it once
      (`${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py open <pr>`), paste
      `review-ledger.py brief <pr>` into every reviewer brief, save the JSON under
