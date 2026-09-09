@@ -278,9 +278,9 @@ led brief 7 | grep -q "ADVISORY and name the exact evidence" && ok "round 3 brie
 led brief 7 | grep -q "REDESIGN REQUIRED" && ok "the brief flags a component needing redesign" || bad "the brief flags a component needing redesign"
 
 # --- pre-code design rounds have their own durable cap -------------------------
-led design-open BL-1 --max-design-rounds 2 >/dev/null
-eq "a failed design returns to redesign" "redesign" "$(led design-record BL-1 --verdict FAIL --evidence 'boundary incomplete' | field next_action)"
-eq "the independent design cap escalates" "escalate-human" "$(led design-record BL-1 --verdict FAIL --evidence 'boundary still incomplete' | field next_action)"
+led design-open PROJ-1 --max-design-rounds 2 >/dev/null
+eq "a failed design returns to redesign" "redesign" "$(led design-record PROJ-1 --verdict FAIL --evidence 'boundary incomplete' | field next_action)"
+eq "the independent design cap escalates" "escalate-human" "$(led design-record PROJ-1 --verdict FAIL --evidence 'boundary still incomplete' | field next_action)"
 
 DESIGN_ID='free form architecture'
 led design-open "$DESIGN_ID" >/dev/null
@@ -314,7 +314,7 @@ eq "free-form design PASS completes end to end" "implement" "$(led design-record
 if led permit-review "$DESIGN_ID" --role design-reviewer --head "$HEAD_SHA" >/dev/null 2>&1; then
   bad "passed design phase must not mint another reviewer permit"
 else ok "passed design phase cannot mint another reviewer permit"; fi
-led design-handoff BL-1 | grep -q 'No production implementation is authorized' && ok "design handoff blocks implementation" || bad "design handoff blocks implementation"
+led design-handoff PROJ-1 | grep -q 'No production implementation is authorized' && ok "design handoff blocks implementation" || bad "design handoff blocks implementation"
 
 # --- aliasing merges a drifted key --------------------------------------------
 led open 8 >/dev/null

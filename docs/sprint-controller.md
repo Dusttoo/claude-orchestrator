@@ -170,10 +170,46 @@ before attach.
 
 Exceptional recovery is delegated to
 `/usr/local/libexec/orchestration-recovery-authority`, which must be owned by a
-different host principal, set-user-ID, and not group/other writable. It
-atomically consumes a scope-bound token. If that helper is absent or unsafe,
-override is disabled;
+root, be non-writable by group/other, and be exposed to the runtime user only
+through the narrow sudo policy installed by
+`scripts/install-operator-authority.sh`. It atomically consumes a
+scope-bound token. If that helper is absent or unsafe, override is disabled;
 there is deliberately no repository, home-directory, or same-UID secret.
+
+## Operator continuations
+
+Repository settings can tighten the built-in `$20` ticket pause but cannot
+relax it. When a reviewed ticket should receive a bounded continuation, root
+issues an expiring capability for an **absolute** total ceiling and pipes it
+directly into the controller so it does not appear in shell history:
+
+```text
+sudo /usr/local/libexec/orchestration-recovery-authority issue-budget \
+  --repository /absolute/repo --ticket PROJ-123 --ceiling-usd 35.08 \
+| python3 /absolute/plugin/scripts/sprint-controller.py grant-budget \
+  --sprint 65 --ticket PROJ-123 --operator-capability-stdin
+```
+
+The active grant changes only the ticket pause and ticket dollar ceiling. It
+does not relax per-run or sprint budgets, run-count/reviewer-count breakers,
+concurrency, review gates, or merge policy. `revoke-budget` removes it early;
+otherwise it expires automatically.
+
+A terminal checkpoint that lost its attempt token or execution-unit identity
+also requires a separate one-shot, attempt-bound capability:
+
+```text
+sudo /usr/local/libexec/orchestration-recovery-authority issue-recovery \
+  --repository /absolute/repo --ticket PROJ-123 --attempt 2 \
+| python3 /absolute/plugin/scripts/sprint-controller.py recover-terminal \
+  --sprint 65 --ticket PROJ-123 --reason 'verified stopped; preserved worktree' \
+  --operator-capability-stdin
+```
+
+Only `blocked` and `user_action` entries can use terminal recovery. The command
+records the reason, consumes the capability exactly once, clears stale launch
+identity, and returns the ticket to `pending`; the next normal `plan`/`reserve`
+creates a fresh fenced attempt.
 
 `concurrency_max` is a ticket-lane limit. The host separately admits local
 builds, full test suites, and browser runs under `max_heavy_processes`; model

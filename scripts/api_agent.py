@@ -31,6 +31,7 @@ from typing import Any
 
 import context_pipeline
 from attempt_capability import AttemptCapabilityError, validate as validate_attempt_capability
+from operator_authority import AuthorityError, budget_ceiling as authorized_budget_ceiling
 from review_permit import (
     ReviewPermitError,
     cancel_started as cancel_review_permit,
@@ -496,6 +497,7 @@ def self_checks(config: dict[str, Any]) -> dict[str, str]:
 
 class UsageLedger:
     def __init__(self, root: Path):
+        self.root = root.resolve()
         self.directory = runtime_path(root, ".orchestration/.llm-usage")
         self.path = self.directory / "usage.jsonl"
         self.lock_path = self.directory / ".lock"
@@ -545,6 +547,12 @@ class UsageLedger:
             os.chmod(self.lock_path, 0o600)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             events = self._events()
+            authority_ceiling: Decimal | None = None
+            if ticket:
+                try:
+                    authority_ceiling = authorized_budget_ceiling(self.root, ticket)
+                except AuthorityError as exc:
+                    raise BudgetError(str(exc)) from exc
             if ticket:
                 last_pause = max(
                     (index for index, event in enumerate(events)
@@ -558,7 +566,7 @@ class UsageLedger:
                      and self._matches(event, "ticket", ticket)),
                     default=-1,
                 )
-                if last_pause > last_reset:
+                if last_pause > last_reset and authority_ceiling is None:
                     raise BudgetError(f"ticket_budget_pause is active for {ticket}; operator reset required")
                 run_ids = {
                     str(event.get("run_id"))
@@ -606,6 +614,8 @@ class UsageLedger:
             ]
             for field, value, limit_key in scopes:
                 limit = limits[limit_key]
+                if field == "ticket" and authority_ceiling is not None:
+                    limit = max(limit, authority_ceiling)
                 if not value or limit <= 0:
                     continue
                 used = sum(
@@ -650,6 +660,8 @@ class UsageLedger:
                 )
                 projected_total = used + reserved + projected
                 pause = limits["pause_usd_per_ticket"]
+                if authority_ceiling is not None:
+                    pause = max(pause, authority_ceiling)
                 if pause and projected_total > pause:
                     if not any(
                         event.get("kind") == "ticket_budget_pause"
@@ -962,7 +974,7 @@ class HttpTransport:
                 f"{provider.upper()}_API_KEY is required for {provider} API execution"
             )
         headers["Content-Type"] = "application/json"
-        headers["User-Agent"] = "claude-orchestrator-api-agent/0.10.4"
+        headers["User-Agent"] = "claude-orchestrator-api-agent/0.11.2"
         if idempotency_key:
             if provider == "azure_adm":
                 headers["x-ms-client-request-id"] = idempotency_key

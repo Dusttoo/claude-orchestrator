@@ -1124,6 +1124,29 @@ self_check:
         self.assertTrue(any(event.get("kind") == "ticket_budget_pause" for event in events))
         self.assertFalse(hasattr(ledger, "approve_ticket_budget"))
 
+    def test_external_budget_authority_extends_only_the_ticket_cost_ceiling(self):
+        ledger = api_agent.UsageLedger(self.root)
+        limits = dict(api_agent.DEFAULT_BUDGETS)
+        limits["max_usd_per_ticket"] = api_agent.Decimal("0.15")
+        limits["pause_usd_per_ticket"] = api_agent.Decimal("0.10")
+        with self.assertRaises(api_agent.BudgetError):
+            ledger.reserve(
+                projected=api_agent.Decimal("0.11"), limits=limits, run_id="before-grant",
+                ticket="PROJ-9", sprint="S-1", provider="openai", model="m", role="implementer",
+            )
+        with mock.patch.object(
+            api_agent, "authorized_budget_ceiling", return_value=api_agent.Decimal("0.20")
+        ):
+            ledger.reserve(
+                projected=api_agent.Decimal("0.05"), limits=limits, run_id="after-grant",
+                ticket="PROJ-9", sprint="S-1", provider="openai", model="m", role="implementer",
+            )
+            with self.assertRaisesRegex(api_agent.BudgetError, "max_usd_per_ticket"):
+                ledger.reserve(
+                    projected=api_agent.Decimal("0.16"), limits=limits, run_id="over-grant",
+                    ticket="PROJ-9", sprint="S-1", provider="openai", model="m", role="implementer",
+                )
+
     def test_incident_breakers_are_active_and_config_can_only_tighten(self):
         legacy = api_agent.budgets_from_config({"llm": {"budgets": {}}})
         self.assertEqual(legacy["max_model_runs_per_ticket"], 12)

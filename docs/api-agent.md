@@ -125,6 +125,14 @@ inside one run do not consume extra run slots. Repository configuration may
 tighten the compiled incident ceilings but cannot raise or disable them. There
 is deliberately no same-user CLI approval bypass.
 
+A host operator may authorize one ticket to continue to an exact absolute
+ceiling with the separately installed root authority. This raises only that
+ticket's cost pause and hard ticket-cost ceiling; run-count, reviewer-count,
+per-run, sprint, and provider breakers remain unchanged. The grant expires and
+cannot be created from repository configuration or by the runtime user. The
+sprint controller activates it with `grant-budget`; API reservations query the
+active grant before every request and stop again at the granted ceiling.
+
 API reviewer runs require a review-ledger phase permit bound to the ledger's
 immutable repository work subject, role, PR/design ledger, and full exact commit:
 

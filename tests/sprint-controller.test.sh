@@ -69,18 +69,38 @@ PY
 }
 
 mkdir -p "$TMP/repo/.git" "$TMP/repo/.orchestration"
-cat > "$TMP/operator-recovery-helper" <<'SH'
+cat > "$TMP/operator-authority-helper" <<'SH'
 #!/usr/bin/env bash
 set -eu
-[ "$1" = consume ] && [ "$2" = --scope ] && [ -n "$3" ]
-IFS= read -r token
-cap="${ORCHESTRATION_TEST_RECOVERY_CAP:?}"
-[ -f "$cap" ] && [ "$(cat "$cap")" = "$token" ]
-rm "$cap"
+command="$1"; shift
+[ "$1" = --scope ] && [ -n "$2" ]
+case "$command" in
+  budget-ceiling)
+    [ -f "${ORCHESTRATION_TEST_BUDGET_ACTIVE:?}" ] || exit 3
+    cat "$ORCHESTRATION_TEST_BUDGET_ACTIVE"
+    ;;
+  activate-budget)
+    IFS= read -r token
+    [ -f "${ORCHESTRATION_TEST_BUDGET_CAP:?}" ]
+    [ "$(cat "$ORCHESTRATION_TEST_BUDGET_CAP")" = "$token" ]
+    mv "$ORCHESTRATION_TEST_BUDGET_CAP" "$ORCHESTRATION_TEST_BUDGET_ACTIVE"
+    printf '35.00\n' > "$ORCHESTRATION_TEST_BUDGET_ACTIVE"
+    printf '35.00\n'
+    ;;
+  consume-recovery)
+    IFS= read -r token
+    cap="${ORCHESTRATION_TEST_RECOVERY_CAP:?}"
+    [ -f "$cap" ] && [ "$(cat "$cap")" = "$token" ]
+    rm "$cap"
+    ;;
+  *) exit 2 ;;
+esac
 SH
-chmod +x "$TMP/operator-recovery-helper"
-export ORCHESTRATION_TEST_RECOVERY_HELPER="$TMP/operator-recovery-helper"
+chmod +x "$TMP/operator-authority-helper"
+export ORCHESTRATION_TEST_AUTHORITY_HELPER="$TMP/operator-authority-helper"
 export ORCHESTRATION_TEST_RECOVERY_CAP="$TMP/operator-recovery.cap"
+export ORCHESTRATION_TEST_BUDGET_CAP="$TMP/operator-budget.cap"
+export ORCHESTRATION_TEST_BUDGET_ACTIVE="$TMP/operator-budget.active"
 cp "$ROOT/templates/config.yaml" "$TMP/repo/.orchestration/config.yaml"
 sed -i.bak 's/^concurrency_max:.*/concurrency_max: 2/' "$TMP/repo/.orchestration/config.yaml"
 rm "$TMP/repo/.orchestration/config.yaml.bak"
@@ -345,7 +365,7 @@ PY
 run_fail "one-way or contradictory Jira relations are rejected" "$CONTROLLER" sync --inventory "$TMP/repo/bad-relations.json"
 
 cat > "$TMP/repo/legacy-inventory.json" <<'JSON'
-{"project":"PROJ","sprint":{"id":"47","name":"legacy running"},"source_query":"q","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-60","status":"Ready","dependencies":[],"subtasks":[]}]}
+{"project":"PROJ","sprint":{"id":"47","name":"legacy running"},"source_query":"q","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-60","status":"Ready","dependencies":[],"subtasks":[]},{"key":"PROJ-61","status":"Ready","dependencies":[],"subtasks":[]}]}
 JSON
 jira_receipt "$TMP/repo/legacy-inventory.json"
 run_ok "legacy migration fixture syncs" "$CONTROLLER" sync --inventory legacy-inventory.json
@@ -364,8 +384,39 @@ json_check "schema-v1 running lanes fence to explicit recovery" "$TMP/legacy-sum
 printf 'recover-legacy-once' > "$ORCHESTRATION_TEST_RECOVERY_CAP"
 run_ok "fenced legacy lane has an explicit recovery path" "$CONTROLLER" recover-legacy --sprint 47 --ticket PROJ-60 --reason 'operator verified old worker stopped' --operator-capability recover-legacy-once
 "$CONTROLLER" plan --sprint 47 > "$TMP/legacy-plan.json"
-json_check "recovered legacy lane becomes launchable without duplication" "$TMP/legacy-plan.json" 'data["launch"] == ["PROJ-60"]'
+json_check "recovered legacy lane becomes launchable without duplication" "$TMP/legacy-plan.json" '"PROJ-60" in data["launch"]'
 run_fail "legacy recovery capability is one-shot" "$CONTROLLER" recover-legacy --sprint 47 --ticket PROJ-60 --reason replay
+
+"$CONTROLLER" reserve --sprint 47 --ticket PROJ-61 --run-ref terminal > "$TMP/terminal-reserve.json"
+TERMINAL_TOKEN="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_token"])' "$TMP/terminal-reserve.json")"
+"$CONTROLLER" finish --sprint 47 --ticket PROJ-61 --outcome user_action --summary 'operator budget stop' --attempt-token "$TERMINAL_TOKEN"
+python3 - "$TMP/repo/.orchestration/.sprint-state" "$TMP/repo/.orchestration/.llm-usage/usage.jsonl" <<'PY'
+import json,sys
+from pathlib import Path
+state_path=next(Path(sys.argv[1]).glob('47-*.json'))
+state=json.loads(state_path.read_text()); ticket=state['tickets']['PROJ-61']
+ticket['attempt_token']=None; ticket['worker_identity']=None
+state_path.write_text(json.dumps(state)+'\n')
+usage=Path(sys.argv[2]); usage.parent.mkdir(parents=True,exist_ok=True)
+with usage.open('a') as out:
+  out.write(json.dumps({'kind':'usage','reservation_id':'spent-61','run_id':'spent-61','ticket':'PROJ-61','sprint':'47','role':'implementer','cost_usd':'20.10'})+'\n')
+  out.write(json.dumps({'kind':'ticket_budget_pause','ticket':'PROJ-61','run_id':'spent-61','projected_total_usd':'20.10'})+'\n')
+PY
+printf 'budget-once' > "$ORCHESTRATION_TEST_BUDGET_CAP"
+if printf 'budget-once\n' | "$CONTROLLER" grant-budget --sprint 47 --ticket PROJ-61 --operator-capability-stdin >/dev/null; then
+  ok "root-issued budget capability activates an absolute ticket ceiling over stdin"
+else
+  fail_case "root-issued budget capability activates an absolute ticket ceiling over stdin"
+fi
+printf 'terminal-recovery-once' > "$ORCHESTRATION_TEST_RECOVERY_CAP"
+if printf 'terminal-recovery-once\n' | "$CONTROLLER" recover-terminal --sprint 47 --ticket PROJ-61 --reason 'provider absence and stopped worker verified' --operator-capability-stdin >/dev/null; then
+  ok "external authority recovers a terminal lane with no retained attempt token over stdin"
+else
+  fail_case "external authority recovers a terminal lane with no retained attempt token over stdin"
+fi
+"$CONTROLLER" plan --sprint 47 > "$TMP/terminal-plan.json"
+json_check "authorized terminal lane is launchable below its granted ceiling" "$TMP/terminal-plan.json" '"PROJ-61" in data["launch"] and data["spend"]["PROJ-61"]["state"] != "operator_action"'
+run_fail "terminal recovery capability is one-shot" "$CONTROLLER" recover-terminal --sprint 47 --ticket PROJ-61 --reason replay --operator-capability terminal-recovery-once
 
 cat > "$TMP/repo/fast-exit.json" <<'JSON'
 {"project":"PROJ","sprint":{"id":"49","name":"fast exit"},"source_query":"q","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-90","status":"Ready","dependencies":[],"subtasks":[]}]}

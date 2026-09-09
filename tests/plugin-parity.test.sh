@@ -78,6 +78,12 @@ contains_contract "budgeted API sprint runner" 'api_agent\.py run' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "event-driven quiet captain" 'sprint_status_heartbeat_minutes' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "root-authorized bounded ticket continuation" 'grant-budget' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "root-authorized terminal recovery" 'recover-terminal' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "operator capability stdin hygiene" 'operator-capability-stdin' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 
 contains_contract "durable review ledger" 'review-ledger\.py' \
   commands/orchestrate.md skills/orchestrate-ticket/SKILL.md \
