@@ -52,6 +52,10 @@ contains_contract "controller-owned local launch" 'launch-local --sprint <id> --
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "launch evidence attach" 'attach --sprint <id> --ticket <key> --launch-evidence <launch_evidence>' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "Codex worker prompt uses controller stdin" '--stdin-file <checkpoint-dir>/<run-ref>\.prompt' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "Codex stdin sentinel" '--cd <repository> -' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "adapter-owned Jira fetch" 'sync --inventory-template' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "adapter-owned terminal batch reconciliation" 'reconcile-batch.*--provider-batch-id' \

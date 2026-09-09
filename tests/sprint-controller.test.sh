@@ -46,6 +46,18 @@ PY
 }
 
 mkdir -p "$TMP/repo/.git" "$TMP/repo/.orchestration"
+cat > "$TMP/operator-recovery-helper" <<'SH'
+#!/usr/bin/env bash
+set -eu
+[ "$1" = consume ] && [ "$2" = --scope ] && [ -n "$3" ]
+IFS= read -r token
+cap="${ORCHESTRATION_TEST_RECOVERY_CAP:?}"
+[ -f "$cap" ] && [ "$(cat "$cap")" = "$token" ]
+rm "$cap"
+SH
+chmod +x "$TMP/operator-recovery-helper"
+export ORCHESTRATION_TEST_RECOVERY_HELPER="$TMP/operator-recovery-helper"
+export ORCHESTRATION_TEST_RECOVERY_CAP="$TMP/operator-recovery.cap"
 cp "$ROOT/templates/config.yaml" "$TMP/repo/.orchestration/config.yaml"
 sed -i.bak 's/^concurrency_max:.*/concurrency_max: 2/' "$TMP/repo/.orchestration/config.yaml"
 rm "$TMP/repo/.orchestration/config.yaml.bak"
@@ -159,28 +171,47 @@ run_fail "live attached worker blocks requeue despite dead provisional identity"
 kill "$PID2" 2>/dev/null || true
 wait "$PID2" 2>/dev/null || true
 run_ok "confirmed process absence permits automatic requeue" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker exited' --attempt-token "$TOKEN2"
-python3 - "$CONTROLLER" "$TMP/repo" <<'PY' && ok "unknown process inspection and PID reuse fail closed" || fail_case "unknown process inspection and PID reuse fail closed"
+python3 - "$CONTROLLER" "$TMP/repo" <<'PY' && ok "unknown unit inspection, descendant liveness, and identity reuse fail closed" || fail_case "unknown unit inspection, descendant liveness, and identity reuse fail closed"
 import importlib.util,sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]).parent))
 spec=importlib.util.spec_from_file_location("sprint_controller", sys.argv[1])
 module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
 cfg={"shared_root": Path(sys.argv[2])}
-ticket={"worker_identity":{"kind":"process","pid":123,"start_fingerprint":"original"}}
-for failure in (
-    module.SprintError("permission denied while inspecting worker"),
-    module.SprintError("ps returned malformed output"),
-):
-    module.process_identity=lambda _pid, failure=failure: (_ for _ in ()).throw(failure)
+ticket={"worker_identity":{"kind":"execution_unit","pid":123,"containment":"cgroup-v2-systemd-scope"}}
+for status in ("unknown", "live"):
+    module.execution_unit_status=lambda _identity, status=status: status
     try: module.require_worker_stopped(ticket, "", cfg)
     except module.SprintError: pass
-    else: raise AssertionError("unknown inspection was treated as confirmed absence")
-module.process_identity=lambda _pid: {"kind":"process","pid":123,"start_fingerprint":"replacement"}
+    else: raise AssertionError(f"{status} execution unit was treated as absent")
+module.execution_unit_status=lambda _identity: "absent"
+module.require_worker_stopped(ticket, "", cfg)
+ticket["worker_identity"]["containment"]="cooperative-session"
 try: module.require_worker_stopped(ticket, "", cfg)
 except module.SprintError: pass
-else: raise AssertionError("PID reuse was treated as confirmed worker absence")
-module.process_identity=lambda _pid: (_ for _ in ()).throw(module.ProcessAbsent("gone"))
-module.require_worker_stopped(ticket, "", cfg)
+else: raise AssertionError("cooperative containment claimed mechanical absence")
+ticket["worker_identity"]={"kind":"process","pid":123,"start_fingerprint":"legacy"}
+try: module.require_worker_stopped(ticket, "", cfg)
+except module.SprintError: pass
+else: raise AssertionError("legacy leader-PID identity was treated as descendant proof")
+PY
+python3 - "$CONTROLLER" <<'PY' && ok "macOS process identity uses exact proc_pidinfo birth time" || fail_case "macOS process identity uses exact proc_pidinfo birth time"
+import importlib.util,sys
+from unittest import mock
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).parent))
+spec=importlib.util.spec_from_file_location("sprint_controller_darwin", sys.argv[1])
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+class Lib:
+    def __init__(self,usec): self.usec=usec
+    def proc_pidinfo(self,pid,flavor,arg,ptr,size):
+        ptr._obj.pid=pid; ptr._obj.start_tvsec=100; ptr._obj.start_tvusec=self.usec
+        return size
+with mock.patch.object(module.sys,"platform","darwin"), mock.patch.object(module.os,"kill"):
+    with mock.patch.object(module.ctypes,"CDLL",return_value=Lib(1)): first=module.process_identity("123")
+    with mock.patch.object(module.ctypes,"CDLL",return_value=Lib(2)): second=module.process_identity("123")
+assert first["start_identity"] == "darwin:100:1"
+assert first["start_fingerprint"] != second["start_fingerprint"]
 PY
 run_ok "pending attempt history survives Jira resync" "$CONTROLLER" sync --inventory inventory.json
 "$CONTROLLER" reserve --sprint 42 --ticket PROJ-2 --run-ref codex-task-two > "$TMP/reserve2b.json" && ok "requeued ticket can reserve again" || bad "requeued ticket can reserve again"
@@ -292,11 +323,26 @@ path.write_text(json.dumps(state) + '\n')
 PY
 "$CONTROLLER" summary --sprint 47 > "$TMP/legacy-summary.json"
 json_check "schema-v1 running lanes fence to explicit recovery" "$TMP/legacy-summary.json" 'data["user_action"][0]["key"] == "PROJ-60" and "legacy running lane" in data["user_action"][0]["reason"]'
-printf 'recover-legacy-once' > .orchestration/operator-recovery.cap
+printf 'recover-legacy-once' > "$ORCHESTRATION_TEST_RECOVERY_CAP"
 run_ok "fenced legacy lane has an explicit recovery path" "$CONTROLLER" recover-legacy --sprint 47 --ticket PROJ-60 --reason 'operator verified old worker stopped' --operator-capability recover-legacy-once
 "$CONTROLLER" plan --sprint 47 > "$TMP/legacy-plan.json"
 json_check "recovered legacy lane becomes launchable without duplication" "$TMP/legacy-plan.json" 'data["launch"] == ["PROJ-60"]'
 run_fail "legacy recovery capability is one-shot" "$CONTROLLER" recover-legacy --sprint 47 --ticket PROJ-60 --reason replay
+
+cat > "$TMP/repo/fast-exit.json" <<'JSON'
+{"project":"PROJ","sprint":{"id":"49","name":"fast exit"},"source_query":"q","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-90","status":"Ready","dependencies":[],"subtasks":[]}]}
+JSON
+jira_receipt "$TMP/repo/fast-exit.json"
+run_ok "fast-exit inventory syncs" "$CONTROLLER" sync --inventory fast-exit.json
+printf 'prompt-from-stdin\n' > "$TMP/repo/.orchestration/fast.prompt"
+"$CONTROLLER" reserve --sprint 49 --ticket PROJ-90 --run-ref fast > "$TMP/fast-reserve.json"
+FAST_TOKEN="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_token"])' "$TMP/fast-reserve.json")"
+FAST_ATTACH="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attach_capability"])' "$TMP/fast-reserve.json")"
+"$CONTROLLER" launch-local --sprint 49 --ticket PROJ-90 --attach-capability "$FAST_ATTACH" --output .orchestration/fast.log --stdin-file .orchestration/fast.prompt -- /bin/sh -c 'IFS= read -r prompt; printf "%s\n" "$prompt"' > "$TMP/fast-launch.json"
+FAST_EVIDENCE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["launch_evidence"])' "$TMP/fast-launch.json")"
+if [ "$(cat "$TMP/repo/.orchestration/fast.log")" = prompt-from-stdin ]; then ok "launch-local sends prompt file contents to worker stdin"; else fail_case "launch-local sends prompt file contents to worker stdin"; fi
+run_ok "fast worker terminal tombstone remains attachable" "$CONTROLLER" attach --sprint 49 --ticket PROJ-90 --launch-evidence "$FAST_EVIDENCE"
+run_ok "fast worker tombstone permits confirmed recovery" "$CONTROLLER" requeue --sprint 49 --ticket PROJ-90 --reason 'fast worker exited' --attempt-token "$FAST_TOKEN"
 
 cat > "$TMP/repo/limit-inventory.json" <<'JSON'
 {"project":"PROJ","sprint":{"id":"48","name":"run limit"},"source_query":"q","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-70","status":"Ready","dependencies":[],"subtasks":[]},{"key":"PROJ-71","status":"Ready","dependencies":[],"subtasks":[]}]}

@@ -138,9 +138,11 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    If a previously blocked or user-action ticket becomes safe to retry, requeue
    it explicitly with the evidence in `--reason`; completed tickets cannot be
    requeued. A running ticket additionally requires proof that no worker remains.
-   Requeue requires its current `--attempt-token` plus a mechanically dead
-   PID-and-process-start identity, or a separately provisioned
-   single-use operator recovery capability. After
+   Requeue requires its current `--attempt-token` plus a mechanically empty
+   controller-owned execution unit, or a separately provisioned single-use
+   operator recovery capability consumed by the distinct host authority. A
+   repository file, home-directory secret, or same-UID helper is never recovery
+   authority. After
    `max_lane_relaunches`, stop for operator policy action; there is no same-user
    approval flag.
 
@@ -176,8 +178,13 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
 
    Attach accepts only controller-owned evidence for the exact repository,
    sprint, ticket, and attempt. It never accepts a caller PID. The evidence
-   binds Linux `/proc` start ticks or the macOS process start time; PID reuse and
-   unknown inspection errors remain fenced. `run_ref` is display metadata only.
+   binds the boot, controller invocation, exact process birth, and execution-unit
+   identity. Linux uses a cgroup-v2 systemd scope when available and checks all
+   descendants. macOS uses exact `proc_pidinfo` birth data and a controller
+   supervisor/session, explicitly as cooperative containment; possible escape,
+   unsupported containment, and unknown inspection require external operator
+   recovery. Fast exits retain a terminal tombstone that attach can consume.
+   `run_ref` is display metadata only.
    When a native task has no verified adapter, keep the reservation and require
    explicit operator recovery.
 
@@ -190,8 +197,9 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    ```text
    sprint-controller.py launch-local --sprint <id> --ticket <key> \
      --attach-capability <attach_capability> --output <checkpoint-dir>/<run-ref>.jsonl \
+     --stdin-file <checkpoint-dir>/<run-ref>.prompt \
      -- <codex-bin> exec --ephemeral --json --sandbox danger-full-access \
-     --model <configured-model> --cd <repository> <prompt-file>
+     --model <configured-model> --cd <repository> -
    ```
 
    Pass the ticket body through a temporary file or stdin; never interpolate

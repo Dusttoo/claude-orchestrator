@@ -99,7 +99,15 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    reservation for reconciliation. Launch and attach local work with
    `launch-local --sprint <id> --ticket <key> --attach-capability <attach_capability> --output <repository-output> [--stdin-file <repository-input>] -- <worker-command>`
    followed by `attach --sprint <id> --ticket <key> --launch-evidence <launch_evidence>`.
-   The controller records stable kernel process-start identity while preserving `run_ref` separately.
+   The controller records a controller-owned execution unit separately from `run_ref`.
+   Linux uses a cgroup-v2 systemd scope when available so descendant liveness is
+   checked. macOS supervision is cooperative and possible escape requires the
+   distinct host operator recovery authority; repository and same-UID secrets
+   are not authority. Fast exits retain an attachable terminal tombstone.
+   For Codex CLI, pass `--stdin-file <prompt-file>` to `launch-local` and use `-`
+   as the `codex exec` prompt so the file contents, not its pathname, reach stdin.
+   The complete input-bearing form is
+   `launch-local --sprint <id> --ticket <key> --attach-capability <attach_capability> --output <checkpoint-dir>/<run-ref>.jsonl --stdin-file <checkpoint-dir>/<run-ref>.prompt -- <codex-bin> exec --ephemeral --json --sandbox danger-full-access --model <configured-model> --cd <repository> -`.
    A native task reference is display metadata, not liveness evidence; if no
    supported adapter exposes its process identity, leave it reserved for
    explicit operator recovery.

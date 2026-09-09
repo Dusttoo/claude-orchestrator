@@ -134,6 +134,23 @@ metadata and tickets, but never overwrites a terminal or running local result.
 Tickets removed from a refreshed query become user action instead of silently
 launching from stale state.
 
+Local workers run inside a controller-owned execution unit. On Linux the
+controller uses a transient user systemd scope backed by cgroup v2 when the host
+provides it, and recovery requires that whole cgroup to be unpopulated. The
+identity binds the boot id, invocation id, cgroup, and exact supervisor birth.
+On macOS `proc_pidinfo` supplies the exact birth identity, but the supervisor
+session is cooperative containment: an escaped descendant cannot be disproved,
+so automatic recovery is disabled. Launch intent precedes process creation and
+the supervisor retains a terminal tombstone, including for workers that exit
+before attach.
+
+Exceptional recovery is delegated to
+`/usr/local/libexec/orchestration-recovery-authority`, which must be owned by a
+different host principal, set-user-ID, and not group/other writable. It
+atomically consumes a scope-bound token. If that helper is absent or unsafe,
+override is disabled;
+there is deliberately no repository, home-directory, or same-UID secret.
+
 `concurrency_max` is a ticket-lane limit. The host separately admits local
 builds, full test suites, and browser runs under `max_heavy_processes`; model
 lanes waiting on providers do not justify oversubscribing those local commands.
