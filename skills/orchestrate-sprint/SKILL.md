@@ -157,39 +157,48 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
 
    Preserve the `attempt_token` returned by reserve. It fences worker completion
    and requeue from every earlier or replacement attempt. The controller also
-   owns the separate one-use `attach_capability`; API workers receive the
+   owns the separate one-use local-launch `attach_capability`; API workers receive the
    returned `attempt_capability` and its exact immutable worker reference.
 
    Then launch a fresh isolated worker for that one ticket. Instruct it to use
    `$orchestrate-ticket`, pass the freshly fetched Jira body and acceptance
    criteria with provenance `from Jira, verified in this sprint query`, and
    require its final report to include outcome, summary, PR, branch, and any
-   user action. After launch, replace the provisional reference:
+   user action. For a local process, the controller must perform the launch and
+   return evidence bound to this exact attempt:
 
    ```text
-   sprint-controller.py attach --sprint <id> --ticket <key> --worker-pid <actual-worker-pid> --attach-capability <attach_capability>
+   sprint-controller.py launch-local --sprint <id> --ticket <key> \
+     --attach-capability <attach_capability> --output <repository-output> \
+     [--stdin-file <repository-input>] -- <worker-command>
+   sprint-controller.py attach --sprint <id> --ticket <key> --launch-evidence <launch_evidence>
    ```
 
-   Attach accepts only a live process that the controller can verify and binds
-   its immutable PID/start fingerprint. Never substitute a native task label or
-   arbitrary run reference. When a native task has no supported process adapter,
-   keep the reservation and require explicit operator recovery.
+   Attach accepts only controller-owned evidence for the exact repository,
+   sprint, ticket, and attempt. It never accepts a caller PID. The evidence
+   binds Linux `/proc` start ticks or the macOS process start time; PID reuse and
+   unknown inspection errors remain fenced. `run_ref` is display metadata only.
+   When a native task has no verified adapter, keep the reservation and require
+   explicit operator recovery.
 
    **Codex host launch contract.** A reservation is not a worker launch. First
-   use the native multi-agent worker tool when it is available and record its
-   actual task/agent reference. On SSH or `codex exec` hosts where that tool is
-   unavailable, launch one detached worker process per reservation with the
-   host's Codex binary, for example:
+   use the native multi-agent worker tool only when its verified adapter can
+   return controller-owned launch evidence. On SSH or `codex exec` hosts, use
+   `launch-local` to start one detached worker process per reservation with the
+   host's Codex binary.
 
    ```text
-   <codex-bin> exec --ephemeral --json --sandbox danger-full-access      --model <configured-model> --cd <repository>      "Use the orchestrate-ticket skill for <ticket>; report outcome, PR,
-      branch, and user action." > <checkpoint-dir>/<run-ref>.jsonl 2>&1 < /dev/null &
+   sprint-controller.py launch-local --sprint <id> --ticket <key> \
+     --attach-capability <attach_capability> --output <checkpoint-dir>/<run-ref>.jsonl \
+     -- <codex-bin> exec --ephemeral --json --sandbox danger-full-access \
+     --model <configured-model> --cd <repository> <prompt-file>
    ```
 
    Pass the ticket body through a temporary file or stdin; never interpolate
-Before launching, resolve the executable because non-interactive SSH shells may not load the npm-global PATH: `CODEX_BIN="$(command -v codex || printf '%s' /home/orchestrator/.npm-global/bin/codex)"`; verify it is executable. Use this exact background form: ("$CODEX_BIN" exec --ephemeral --json --sandbox danger-full-access --cd <repository> <prompt> > <output> 2>&1 < /dev/null) & pid=$!; echo $pid. Do not call disown and do not place pid=$! inside the subshell.
-   Jira text into a shell command. Use the detached process id plus output path
-   as the actual run reference, monitor it to terminal outcome, and call
+Before launching, resolve the executable because non-interactive SSH shells may not load the npm-global PATH: `CODEX_BIN="$(command -v codex || printf '%s' /home/orchestrator/.npm-global/bin/codex)"`; verify it is executable. Pass that executable and arguments to `launch-local`; do not background it independently or supply a PID to `attach`.
+   Jira text into a shell command. Keep the detached worker's PID in the
+   controller-owned evidence and keep `run_ref` as display metadata; monitor the
+   worker to terminal outcome and call
    `finish` immediately. Do not mark a reserved ticket blocked merely because
    native subagents are unavailable when this CLI fallback can run. If neither
    native workers nor a Codex executable is available, stop with a clear

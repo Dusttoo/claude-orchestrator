@@ -52,9 +52,35 @@ eq "a no-tracker PR owns an immutable repository-bound subject" \
 if led open 1 --work-kind jira --work-id PROJ-1 >/dev/null 2>&1; then
   bad "an existing ledger work subject cannot be rebound"
 else ok "an existing ledger work subject cannot be rebound"; fi
-led open PROJ-101 --work-kind jira --work-id proj-101 >/dev/null
-eq "a Jira-backed ledger normalizes its work subject" "PROJ-101" \
-  "$(led status PROJ-101 | python3 -c 'import json,sys; print(json.load(sys.stdin)["work_subject"]["id"])')"
+led open PROJ-100 --work-kind jira --work-id proj-100 >/dev/null
+eq "a Jira-backed ledger normalizes its work subject" "PROJ-100" \
+  "$(led status PROJ-100 | python3 -c 'import json,sys; print(json.load(sys.stdin)["work_subject"]["id"])')"
+led open 30 --work-kind jira --work-id PROJ-101 >/dev/null
+eq "a Jira-backed ledger resolves through its distinct PR number" "PROJ-101" \
+  "$(led status 30 | python3 -c 'import json,sys; print(json.load(sys.stdin)["work_subject"]["id"])')"
+cat > "$TMP/jira-pr-pass.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[{"name":"review","status":"pass"}],"findings":[]}
+JSON
+eq "distinct Jira and PR ids complete permit and record end to end" "gates-clear" \
+  "$(review_record 30 code "$TMP/jira-pr-pass.json" | field next_action)"
+if led design-open 30 >/dev/null 2>&1; then
+  bad "the same PR cannot collide across work-subject kinds"
+else ok "the same PR cannot collide across work-subject kinds"; fi
+led open 31 --work-kind jira --work-id PROJ-102 >/dev/null
+JIRA_CANCEL_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+JIRA_CANCEL_PERMIT="$(led permit-review 31 --role code-reviewer --head "$JIRA_CANCEL_HEAD" | field review_phase_permit)"
+python3 - "$TMP" "$JIRA_CANCEL_PERMIT" "$JIRA_CANCEL_HEAD" "$LEDGER" <<'PY'
+import importlib.util,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location("review_permit",str(Path(sys.argv[4]).with_name("review_permit.py")))
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+common=dict(shared_root=Path(sys.argv[1]),ledger_dir=".orchestration/.review-ledger",pr="31",token=sys.argv[2],role="code-reviewer",head=sys.argv[3])
+module.consume(**common,timestamp="start")
+module.cancel_started(**common,timestamp="cancel")
+PY
+if led complete-review 31 --role code-reviewer --phase-permit "$JIRA_CANCEL_PERMIT" --result "$TMP/jira-pr-pass.json" >/dev/null 2>&1; then
+  bad "cancelled permit resolves by PR when Jira id differs"
+else ok "cancelled permit resolves by PR when Jira id differs"; fi
 led open no-tracker-e2e >/dev/null
 cat > "$TMP/no-tracker-pass.json" <<'JSON'
 {"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[{"name":"review","status":"pass"}],"findings":[]}
@@ -304,6 +330,37 @@ eq "aliasing preserves every gate owner" "code-review,security-review" \
   "$(led status alias-claims | python3 -c 'import json,sys; print(",".join(sorted(json.load(sys.stdin)["components"]["src/a.ts:canonical"]["claims"])))')"
 eq "code gate cannot resolve aliased security ownership" "src/a.ts:canonical" \
   "$(led record alias-claims --gate code-review --verdict FAIL | field open_blocking)"
+
+led open legacy-alias-claims >/dev/null
+led record legacy-alias-claims --gate code-review --verdict FAIL --blocking 'src/a.ts:canonical' >/dev/null
+led record legacy-alias-claims --gate security-review --verdict FAIL --blocking 'src/a.ts:drifted' >/dev/null
+python3 - "$TMP/.orchestration/.review-ledger" <<'PY'
+import json,sys
+from pathlib import Path
+path=next(p for p in Path(sys.argv[1]).glob("subject-*.json") if json.loads(p.read_text()).get("pr") == "legacy-alias-claims")
+state=json.loads(path.read_text())
+for component in state["components"].values(): component.pop("claims", None)
+path.write_text(json.dumps(state, indent=2, sort_keys=True)+"\n")
+PY
+led alias legacy-alias-claims --from 'src/a.ts:drifted' --to 'src/a.ts:canonical' >/dev/null
+eq "alias backfills every legacy per-gate owner before merge" "code-review,security-review" \
+  "$(led status legacy-alias-claims | python3 -c 'import json,sys; print(",".join(sorted(json.load(sys.stdin)["components"]["src/a.ts:canonical"]["claims"])))')"
+
+led open recorded-alias >/dev/null
+led record recorded-alias --gate code-review --verdict FAIL --blocking 'src/a.ts:canonical' --blocking 'src/a.ts:old' >/dev/null
+led alias recorded-alias --from 'src/a.ts:old' --to 'src/a.ts:canonical' >/dev/null
+eq "direct recording resolves persisted aliases" "src/a.ts:canonical" \
+  "$(led record recorded-alias --gate code-review --verdict FAIL --blocking 'src/a.ts:old' | field accepted_blocking)"
+eq "direct recording cannot recreate an aliased component" "src/a.ts:canonical" \
+  "$(led status recorded-alias | python3 -c 'import json,sys; print(",".join(sorted(json.load(sys.stdin)["components"])))')"
+cat > "$TMP/recorded-alias-repair.json" <<'JSON'
+{"schema_version":1,"head":"abcdef8","findings":[{"component":"src/a.ts:canonical","status":"closed","root_cause":"drift","change":"canonicalized","verification":"alias regression"}]}
+JSON
+led record-repair recorded-alias --report "$TMP/recorded-alias-repair.json" >/dev/null
+led record recorded-alias --gate code-review --verdict FAIL --blocking 'src/a.ts:old' --head abcdef8 >/dev/null
+led complete-repair-review recorded-alias >/dev/null
+eq "staged recording resolves persisted aliases" "src/a.ts:canonical" \
+  "$(led status recorded-alias | field open_blocking)"
 
 # --- v0.7 ledgers preserve their already-spent budget -------------------------
 cat > "$TMP/.orchestration/.review-ledger/pr-legacy.json" <<'JSON'

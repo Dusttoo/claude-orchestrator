@@ -84,21 +84,22 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    provisional reference and run `reserve --sprint <id> --ticket <key>
    --run-ref <provisional>`. Reserve is the authoritative `concurrency_max`
    check. Preserve the returned `attempt_token` for finish/requeue and the
-   separate one-use `attach_capability` for controller attach. Then launch a fresh isolated
+   separate one-use `attach_capability` for controller-owned launch. Then launch a fresh isolated
    worker that runs `/orchestration:orchestrate <key>` with the freshly fetched
    ticket body and acceptance criteria. On Codex SSH/CLI hosts, if native
-   multi-agent tools are unavailable, launch a detached `codex exec
-   --ephemeral --json --sandbox danger-full-access` worker in the repository
-   and record its PID plus output file as the actual run reference. Pass ticket
+   multi-agent tools are unavailable, use `launch-local` to start a detached
+   `codex exec --ephemeral --json --sandbox danger-full-access` worker in the repository.
+   Pass ticket
    text through stdin or a temporary file; never interpolate Jira text into a
-   shell command. A reservation is not a launch: verify a real worker process or
-   process identity before calling `attach`; native task references with no
+   shell command. A reservation is not a launch: consume the returned controller
+   launch evidence with `attach`; native task references with no
    supported process adapter remain reserved for operator recovery. Do not mark a ticket blocked merely
    because native subagents are unavailable when the Codex CLI fallback can run.
    If neither launch mechanism exists, record `user_action` and preserve the
-   reservation for reconciliation. After a real local process launch, run
-   `attach --sprint <id> --ticket <key> --worker-pid <actual-worker-pid> --attach-capability <attach_capability>`.
-   The controller records the verified PID plus its process-start fingerprint.
+   reservation for reconciliation. Launch and attach local work with
+   `launch-local --sprint <id> --ticket <key> --attach-capability <attach_capability> --output <repository-output> [--stdin-file <repository-input>] -- <worker-command>`
+   followed by `attach --sprint <id> --ticket <key> --launch-evidence <launch_evidence>`.
+   The controller records stable kernel process-start identity while preserving `run_ref` separately.
    A native task reference is display metadata, not liveness evidence; if no
    supported adapter exposes its process identity, leave it reserved for
    explicit operator recovery.

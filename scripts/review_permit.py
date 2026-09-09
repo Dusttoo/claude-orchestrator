@@ -24,6 +24,26 @@ def safe_pr(value: str) -> str:
     return result
 
 
+def subject_ledger_candidates(directory: Path, repository: str, pr: str) -> list[Path]:
+    """Find ledgers by their immutable PR binding, never by a subject slug."""
+    candidates: list[Path] = []
+    for candidate in directory.glob("subject-*.json") if directory.exists() else []:
+        try:
+            state = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        subject = state.get("work_subject")
+        if (
+            str(state.get("pr")) == str(pr)
+            and isinstance(subject, dict)
+            and subject.get("repository") == repository
+            and isinstance(subject.get("kind"), str)
+            and isinstance(subject.get("id"), str)
+        ):
+            candidates.append(candidate)
+    return candidates
+
+
 def ledger_path(shared_root: Path, ledger_dir: str, pr: str) -> Path:
     relative = Path(ledger_dir)
     if relative.is_absolute() or ".." in relative.parts:
@@ -33,19 +53,7 @@ def ledger_path(shared_root: Path, ledger_dir: str, pr: str) -> Path:
     directory = shared_root / relative
     repository = str(shared_root.resolve())
     legacy = directory / f"pr-{safe_pr(pr)}.json"
-    candidates = []
-    for candidate in directory.glob("subject-*.json") if directory.exists() else []:
-        try:
-            state = json.loads(candidate.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        subject = state.get("work_subject")
-        if (
-            isinstance(subject, dict)
-            and subject.get("id") == str(pr)
-            and subject.get("repository") == repository
-        ):
-            candidates.append(candidate)
+    candidates = subject_ledger_candidates(directory, repository, pr)
     if len(candidates) == 1:
         return candidates[0]
     if len(candidates) > 1:
@@ -57,8 +65,8 @@ def ledger_path(shared_root: Path, ledger_dir: str, pr: str) -> Path:
             raise ReviewPermitError(f"cannot read legacy review ledger: {exc}") from exc
         subject = state.get("work_subject")
         if not (
-            isinstance(subject, dict)
-            and subject.get("id") == str(pr)
+            str(state.get("pr")) == str(pr)
+            and isinstance(subject, dict)
             and subject.get("repository") == repository
         ):
             raise ReviewPermitError(

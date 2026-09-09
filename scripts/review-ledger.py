@@ -33,6 +33,7 @@ from review_permit import (
     ReviewPermitError,
     complete as complete_review_permit,
     consume_completion,
+    subject_ledger_candidates,
 )
 from runtime_state import (
     RuntimeStateError,
@@ -137,6 +138,19 @@ def normalize_key(raw: str) -> str:
     if not path:
         raise LedgerError(f"component key has no path segment: {raw!r}")
     return f"{path}:{symbol}" if symbol else path
+
+
+def resolve_alias(state: dict[str, Any], key: str) -> str:
+    """Resolve a persisted component alias to its canonical stable key."""
+    aliases = state.get("aliases", {})
+    seen: set[str] = set()
+    current = key
+    while current in aliases:
+        if current in seen:
+            raise LedgerError(f"component alias cycle includes {current}")
+        seen.add(current)
+        current = normalize_key(str(aliases[current]))
+    return current
 
 
 # --- state --------------------------------------------------------------------
@@ -258,9 +272,11 @@ def ledger_path(args: argparse.Namespace) -> Path:
         slug = (
             re.sub(r"[^A-Za-z0-9_.-]", "-", subject["id"]).strip("-")[:48] or "subject"
         )
-        encoded = json.dumps(subject, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        encoded = json.dumps(
+            {"pr": identifier, "work_subject": subject},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
         return (
             directory
             / f"subject-{subject['kind']}-{slug}-{hashlib.sha256(encoded).hexdigest()[:20]}.json"
@@ -290,30 +306,37 @@ def ledger_path(args: argparse.Namespace) -> Path:
                 )
             target = canonical_path(legacy_subject)
         os.replace(legacy, target)
-    if target.exists():
-        return target
-
-    # Existing commands historically only carry the display id. Resolve it by
-    # exact embedded subject equality, never by a lossy filename slug.
-    matches: list[Path] = []
-    for candidate in directory.glob("subject-*.json"):
+    # Gate commands carry the PR id even when Jira owns the work subject. Locate
+    # by immutable state.pr, then enforce repository and any explicitly supplied
+    # subject. This also prevents a PR subject and Jira subject from colliding.
+    matches = subject_ledger_candidates(
+        directory, requested["repository"], identifier
+    )
+    explicit_subject = bool(
+        getattr(args, "work_kind", None) or getattr(args, "work_id", None)
+    )
+    exact = []
+    for candidate in matches:
         try:
-            candidate_state = load(candidate)
-            subject = candidate_state.get("work_subject")
+            if load(candidate).get("work_subject") == requested:
+                exact.append(candidate)
         except LedgerError:
             continue
-        if (
-            isinstance(subject, dict)
-            and subject.get("id") == identifier
-            and subject.get("repository") == requested["repository"]
-        ):
-            matches.append(candidate)
-    if len(matches) == 1:
+    if explicit_subject:
+        if len(exact) == 1:
+            return exact[0]
+        if matches:
+            raise LedgerError(
+                "review ledger PR is already bound to a different immutable work subject"
+            )
+    elif len(matches) == 1:
         return matches[0]
-    if len(matches) > 1:
+    elif len(matches) > 1:
         raise LedgerError(
-            "work subject id is ambiguous; supply --work-kind and --work-id"
+            "PR ledger is ambiguous; supply --work-kind and --work-id"
         )
+    if target.exists():
+        return target
     return target
 
 
@@ -688,15 +711,23 @@ def cmd_record(args: argparse.Namespace) -> None:
         # The security gate never loses blocking authority to the scope freeze: a
         # data leak found late is not a process nit.
         exempt = args.gate == "security-review"
-        regressions = {normalize_key(k) for k in args.regression}
+        finding_details = {
+            resolve_alias(state, key): value for key, value in finding_details.items()
+        }
+        regressions = {
+            resolve_alias(state, normalize_key(k)) for k in args.regression
+        }
 
         accepted: list[tuple[str, str]] = []
         demoted: list[tuple[str, str]] = []
+        accepted_seen: set[str] = set()
         for raw in args.blocking:
-            key = normalize_key(raw)
+            key = resolve_alias(state, normalize_key(raw))
             known = key in state["components"]
             if scope == FULL or known or key in regressions or exempt:
-                accepted.append((key, raw))
+                if key not in accepted_seen:
+                    accepted.append((key, raw))
+                    accepted_seen.add(key)
             else:
                 demoted.append((key, raw))
 
@@ -740,12 +771,12 @@ def cmd_record(args: argparse.Namespace) -> None:
 
         advisories = [
             {
-                "key": normalize_key(raw),
+                "key": resolve_alias(state, normalize_key(raw)),
                 "display": raw.strip(),
                 "reason": "reported-advisory",
                 **(
-                    {"finding": finding_details[normalize_key(raw)]}
-                    if normalize_key(raw) in finding_details
+                    {"finding": finding_details[resolve_alias(state, normalize_key(raw))]}
+                    if resolve_alias(state, normalize_key(raw)) in finding_details
                     else {}
                 ),
             }
@@ -1444,11 +1475,19 @@ def cmd_alias(args: argparse.Namespace) -> None:
     with locked(path):
         state = load(path)
         source = normalize_key(args.source)
-        target = normalize_key(args.target)
+        target = resolve_alias(state, normalize_key(args.target))
         if source == target:
             raise LedgerError("alias source and target normalize to the same key")
         if source not in state["components"]:
             raise LedgerError(f"no such component on the ledger: {source}")
+        # Materialize legacy gate ownership before either component is removed
+        # or combined. Old ledgers recorded `gates` without per-gate claims.
+        _component(
+            state,
+            source,
+            state["components"][source].get("display", args.source),
+            int(state["components"][source].get("last_round", 1)),
+        )
         merged = state["components"].pop(source)
         canonical = _component(state, target, args.target, merged["first_round"])
         canonical["strikes"] += merged["strikes"]
@@ -1481,6 +1520,9 @@ def cmd_alias(args: argparse.Namespace) -> None:
         if merged["status"] == "open":
             canonical["status"] = "open"
         state.setdefault("aliases", {})[source] = target
+        for alias, destination in list(state["aliases"].items()):
+            if alias != source and normalize_key(str(destination)) == source:
+                state["aliases"][alias] = target
         save(path, state)
         emit(
             {

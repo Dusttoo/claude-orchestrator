@@ -47,6 +47,10 @@ class SprintError(RuntimeError):
     pass
 
 
+class ProcessAbsent(SprintError):
+    """The OS conclusively reported that a process no longer exists."""
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -306,6 +310,7 @@ def load(path: Path) -> dict[str, Any]:
         )
         ticket.setdefault("attach_capability", "")
         ticket.setdefault("attached_at", "")
+        ticket.setdefault("launch_evidence", {})
     return value
 
 
@@ -612,6 +617,7 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             "worker_identity": "",
             "attach_capability": "",
             "attached_at": "",
+            "launch_evidence": {},
             "history": [],
         }
     missing_subtasks = sorted(
@@ -916,6 +922,7 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                         "worker_identity",
                         "attach_capability",
                         "attached_at",
+                        "launch_evidence",
                     ):
                         if field in previous:
                             fresh[field] = previous[field]
@@ -1477,6 +1484,7 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["worker_identity"] = ""
         ticket["attach_capability"] = "attachcap_" + uuid.uuid4().hex
         ticket["attached_at"] = ""
+        ticket["launch_evidence"] = {}
         event = {"at": now(), "event": "reserved", "run_ref": args.run_ref}
         ticket["history"].append(event)
         save(path, state)
@@ -1501,10 +1509,33 @@ def require_attempt(ticket: dict[str, Any], supplied: str) -> None:
         )
 
 
-def attach(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+def _repository_path(root: Path, raw: str, *, label: str) -> Path:
+    path = Path(raw)
+    resolved = (path if path.is_absolute() else root / path).resolve()
+    try:
+        resolved.relative_to(root.resolve())
+    except ValueError as exc:
+        raise SprintError(f"{label} must stay inside the shared repository") from exc
+    return resolved
+
+
+def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    """Launch locally so process provenance is observed by the controller."""
     path = state_path(cfg["state_dir"], str(args.sprint))
     key = normalize_key(args.ticket)
-    identity = process_identity(args.worker_pid)
+    command = list(args.command)
+    if command and command[0] == "--":
+        command.pop(0)
+    if not command:
+        raise SprintError("launch-local requires an executable and arguments after --")
+    output_path = _repository_path(cfg["shared_root"], args.output, label="worker output")
+    input_path = (
+        _repository_path(cfg["shared_root"], args.stdin_file, label="worker input")
+        if args.stdin_file
+        else None
+    )
+    if input_path is not None and not input_path.is_file():
+        raise SprintError("worker input must be an existing repository file")
     with locked(path):
         state = load(path)
         ticket = state["tickets"].get(key)
@@ -1515,13 +1546,102 @@ def attach(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             not expected
             or args.attach_capability != expected
             or ticket.get("attached_at")
+            or ticket.get("launch_evidence")
         ):
             raise SprintError(
-                "attach capability is missing, stale, or already consumed"
+                "attach capability is missing, stale, or already used for a launch"
             )
+        evidence = {
+            "token": "launch_" + uuid.uuid4().hex,
+            "status": "launching",
+            "repository": str(cfg["shared_root"]),
+            "sprint": str(args.sprint),
+            "ticket": key,
+            "attempt": ticket["attempts"],
+            "attempt_token": ticket["attempt_token"],
+            "created_at": now(),
+        }
+        # Persist the launch intent first. A controller crash can then fence the
+        # lane for reconciliation instead of allowing a duplicate launch.
+        ticket["launch_evidence"] = evidence
+        save(path, state)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        stdin_handle = input_path.open("rb") if input_path is not None else subprocess.DEVNULL
+        try:
+            with output_path.open("ab") as output_handle:
+                worker = subprocess.Popen(
+                    command,
+                    cwd=cfg["shared_root"],
+                    stdin=stdin_handle,
+                    stdout=output_handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+        except (OSError, subprocess.SubprocessError) as exc:
+            ticket["launch_evidence"] = {}
+            save(path, state)
+            raise SprintError(f"controller could not launch local worker: {exc}") from exc
+        finally:
+            if input_path is not None:
+                stdin_handle.close()
+        try:
+            identity = process_identity(str(worker.pid))
+        except SprintError:
+            worker.terminate()
+            raise
+        evidence.update({"status": "launched", "identity": identity})
+        ticket["launch_evidence"] = evidence
+        ticket["history"].append(
+            {"at": now(), "event": "worker-launched", "worker_identity": identity}
+        )
+        save(path, state)
+    emit(
+        {
+            "ticket": key,
+            "state": "running",
+            "launch_evidence": evidence["token"],
+            "worker_pid": identity["pid"],
+            "run_ref": ticket["run_ref"],
+        }
+    )
+
+
+def attach(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    path = state_path(cfg["state_dir"], str(args.sprint))
+    key = normalize_key(args.ticket)
+    with locked(path):
+        state = load(path)
+        ticket = state["tickets"].get(key)
+        if not ticket or ticket["state"] != "running":
+            raise SprintError(f"ticket {key} is not running")
+        evidence = ticket.get("launch_evidence") or {}
+        expected = {
+            "repository": str(cfg["shared_root"]),
+            "sprint": str(args.sprint),
+            "ticket": key,
+            "attempt": ticket["attempts"],
+            "attempt_token": ticket["attempt_token"],
+        }
+        if (
+            not evidence
+            or args.launch_evidence != evidence.get("token")
+            or evidence.get("status") != "launched"
+            or any(evidence.get(name) != value for name, value in expected.items())
+            or ticket.get("attached_at")
+        ):
+            raise SprintError(
+                "controller launch evidence is missing, stale, or belongs to another attempt"
+            )
+        identity = evidence.get("identity")
+        if not isinstance(identity, dict):
+            raise SprintError("controller launch evidence has no process identity")
+        current = process_identity(str(identity.get("pid")))
+        if current.get("start_fingerprint") != identity.get("start_fingerprint"):
+            raise SprintError("launched worker PID was reused before attach")
         ticket["worker_identity"] = identity
         ticket["attached_at"] = now()
         ticket["attach_capability"] = ""
+        ticket["launch_evidence"] = {}
         ticket["history"].append(
             {"at": now(), "event": "attached", "worker_identity": identity}
         )
@@ -1576,6 +1696,7 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["worker_identity"] = ""
         ticket["attach_capability"] = ""
         ticket["attached_at"] = ""
+        ticket["launch_evidence"] = {}
         ticket["history"].append(
             {"at": now(), "event": "requeued", "reason": args.reason.strip()}
         )
@@ -1619,11 +1740,11 @@ def require_worker_stopped(
     identity = ticket.get("worker_identity")
     if isinstance(identity, dict) and identity.get("kind") == "process":
         try:
-            current = process_identity(str(identity.get("pid")))
+            process_identity(str(identity.get("pid")))
+        except ProcessAbsent:
+            return
         except SprintError:
-            return
-        if current.get("start_fingerprint") != identity.get("start_fingerprint"):
-            return
+            pass
     capability_path = cfg["shared_root"] / ".orchestration/operator-recovery.cap"
     if not operator_token or not capability_path.is_file():
         raise SprintError(
@@ -1636,7 +1757,7 @@ def require_worker_stopped(
 
 
 def process_identity(raw_pid: str) -> dict[str, Any]:
-    """Bind a live PID to its OS-reported start time so PID reuse is harmless."""
+    """Read a stable kernel process-start identity, distinguishing unknown from gone."""
     try:
         pid = int(str(raw_pid))
     except ValueError as exc:
@@ -1645,18 +1766,60 @@ def process_identity(raw_pid: str) -> dict[str, Any]:
         raise SprintError("worker PID must be a positive integer")
     try:
         os.kill(pid, 0)
-        started = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", str(pid)],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except (ProcessLookupError, PermissionError, OSError, subprocess.CalledProcessError) as exc:
-        raise SprintError(f"worker PID {pid} is not a verifiable live process") from exc
-    if not started:
-        raise SprintError(f"worker PID {pid} has no verifiable start time")
-    fingerprint = hashlib.sha256(f"{pid}:{started}".encode("utf-8")).hexdigest()
-    return {"kind": "process", "pid": pid, "start_fingerprint": fingerprint}
+    except ProcessLookupError as exc:
+        raise ProcessAbsent(f"worker PID {pid} does not exist") from exc
+    except PermissionError as exc:
+        raise SprintError(f"permission denied while inspecting worker PID {pid}") from exc
+    except OSError as exc:
+        raise SprintError(f"cannot inspect worker PID {pid}: {exc}") from exc
+
+    if sys.platform.startswith("linux"):
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            tail = raw[raw.rindex(")") + 2 :].split()
+            started = tail[19]
+        except FileNotFoundError as exc:
+            raise ProcessAbsent(f"worker PID {pid} exited during inspection") from exc
+        except (PermissionError, OSError, ValueError, IndexError) as exc:
+            raise SprintError(f"cannot verify Linux start identity for PID {pid}") from exc
+        try:
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+                encoding="utf-8"
+            ).strip()
+        except (PermissionError, OSError) as exc:
+            raise SprintError("cannot verify the Linux boot identity") from exc
+        marker = f"linux:{boot_id}:{started}"
+    elif sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SprintError(f"cannot inspect macOS worker PID {pid}") from exc
+        started = result.stdout.strip()
+        if result.returncode != 0 or not started:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError as exc:
+                raise ProcessAbsent(f"worker PID {pid} exited during inspection") from exc
+            except (PermissionError, OSError) as exc:
+                raise SprintError(f"cannot verify macOS worker PID {pid}") from exc
+            raise SprintError(f"ps did not return a start identity for live PID {pid}")
+        marker = f"darwin:{started}"
+    else:
+        raise SprintError(
+            f"process start identity is unsupported on platform {sys.platform}"
+        )
+    fingerprint = hashlib.sha256(f"{pid}:{marker}".encode("utf-8")).hexdigest()
+    return {
+        "kind": "process",
+        "pid": pid,
+        "start_fingerprint": fingerprint,
+        "start_identity": marker,
+    }
 
 
 def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
@@ -1766,9 +1929,16 @@ def parser() -> argparse.ArgumentParser:
     attach_parser = commands.add_parser("attach")
     attach_parser.add_argument("--sprint", required=True)
     attach_parser.add_argument("--ticket", required=True)
-    attach_parser.add_argument("--worker-pid", required=True)
-    attach_parser.add_argument("--attach-capability", required=True)
+    attach_parser.add_argument("--launch-evidence", required=True)
     attach_parser.set_defaults(func=attach)
+    launch_parser = commands.add_parser("launch-local")
+    launch_parser.add_argument("--sprint", required=True)
+    launch_parser.add_argument("--ticket", required=True)
+    launch_parser.add_argument("--attach-capability", required=True)
+    launch_parser.add_argument("--output", required=True)
+    launch_parser.add_argument("--stdin-file")
+    launch_parser.add_argument("command", nargs=argparse.REMAINDER)
+    launch_parser.set_defaults(func=launch_local)
     finish_parser = commands.add_parser("finish")
     finish_parser.add_argument("--sprint", required=True)
     finish_parser.add_argument("--ticket", required=True)

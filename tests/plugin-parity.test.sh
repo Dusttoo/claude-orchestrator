@@ -48,7 +48,9 @@ contains_contract "sprint restart reconciliation" 'needs_reconcile' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "atomic sprint reservation" 'reserve' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
-contains_contract "complete attach capability invocation" 'attach --sprint <id> --ticket <key> --worker-pid <actual[^>]*> --attach-capability <attach_capability>' \
+contains_contract "controller-owned local launch" 'launch-local --sprint <id> --ticket <key>' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "launch evidence attach" 'attach --sprint <id> --ticket <key> --launch-evidence <launch_evidence>' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "adapter-owned Jira fetch" 'sync --inventory-template' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md

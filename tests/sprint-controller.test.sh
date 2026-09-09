@@ -8,7 +8,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/.."
 CONTROLLER="$ROOT/scripts/sprint-controller.py"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+WORKER_PIDS=""
+trap 'for pid in $WORKER_PIDS; do kill "$pid" 2>/dev/null || true; done; rm -rf "$TMP"' EXIT
 
 fails=0
 ok() { printf 'ok   %s\n' "$1"; }
@@ -121,9 +122,14 @@ TOKEN1="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attem
 ATTACH1="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attach_capability"])' "$TMP/reserve1.json")"
 TOKEN3="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_token"])' "$TMP/reserve3.json")"
 run_fail "third reservation is rejected at concurrency_max" "$CONTROLLER" reserve --sprint 42 --ticket PROJ-2 --run-ref should-fail
-run_fail "stale worker cannot attach without its controller capability" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --worker-pid "$$" --attach-capability attach_stale
-run_fail "attach rejects a nonexistent native process" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --worker-pid 999999 --attach-capability "$ATTACH1"
-run_ok "actual worker process attaches after launch" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --worker-pid "$$" --attach-capability "$ATTACH1"
+run_fail "caller-supplied live PID cannot be attached" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --worker-pid "$$" --attach-capability "$ATTACH1"
+run_fail "stale capability cannot create controller launch evidence" "$CONTROLLER" launch-local --sprint 42 --ticket PROJ-1 --attach-capability attach_stale --output .orchestration/worker1.log -- /bin/sh -c 'sleep 30'
+"$CONTROLLER" launch-local --sprint 42 --ticket PROJ-1 --attach-capability "$ATTACH1" --output .orchestration/worker1.log -- /bin/sh -c 'sleep 30' > "$TMP/launch1.json"
+LAUNCH1="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["launch_evidence"])' "$TMP/launch1.json")"
+PID1="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["worker_pid"])' "$TMP/launch1.json")"
+WORKER_PIDS="$WORKER_PIDS $PID1"
+run_ok "attach consumes controller-owned launch evidence" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --launch-evidence "$LAUNCH1"
+run_fail "controller launch evidence is one-use" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --launch-evidence "$LAUNCH1"
 
 "$CONTROLLER" plan --sprint 42 > "$TMP/restart.json"
 json_check "restart exposes running work for reconciliation" "$TMP/restart.json" 'data["needs_reconcile"] == ["PROJ-1", "PROJ-3"] and data["launch"] == []'
@@ -142,12 +148,40 @@ run_ok "running ticket survives inventory resync" "$CONTROLLER" sync --inventory
 "$CONTROLLER" plan --sprint 42 > "$TMP/resync.json"
 json_check "resync does not duplicate a running workflow" "$TMP/resync.json" 'data["needs_reconcile"] == ["PROJ-2"] and "PROJ-2" not in data["launch"]'
 run_fail "requeue without stopped-worker proof fails closed" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason missing-proof --attempt-token "$TOKEN2"
-run_fail "worker attempt token cannot rewrite death evidence" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --worker-pid "$$" --attach-capability "$TOKEN2"
-run_ok "controller attach capability establishes actual worker identity once" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --worker-pid "$$" --attach-capability "$ATTACH2"
-run_fail "controller attach capability is one-use" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --worker-pid "$$" --attach-capability "$ATTACH2"
+run_fail "worker attempt token cannot create launch evidence" "$CONTROLLER" launch-local --sprint 42 --ticket PROJ-2 --attach-capability "$TOKEN2" --output .orchestration/worker2.log -- /bin/sh -c 'sleep 30'
+"$CONTROLLER" launch-local --sprint 42 --ticket PROJ-2 --attach-capability "$ATTACH2" --output .orchestration/worker2.log -- /bin/sh -c 'sleep 30' > "$TMP/launch2.json"
+LAUNCH2="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["launch_evidence"])' "$TMP/launch2.json")"
+PID2="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["worker_pid"])' "$TMP/launch2.json")"
+WORKER_PIDS="$WORKER_PIDS $PID2"
+run_fail "launch evidence is bound to its exact ticket and attempt" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --launch-evidence "$LAUNCH2"
+run_ok "controller attach capability establishes launched worker identity" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --launch-evidence "$LAUNCH2"
 run_fail "live attached worker blocks requeue despite dead provisional identity" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker no longer exists' --attempt-token "$TOKEN2"
-printf 'recover-once' > .orchestration/operator-recovery.cap
-run_ok "operator can requeue a live mechanically bound worker" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'operator stopped worker' --attempt-token "$TOKEN2" --operator-capability recover-once
+kill "$PID2" 2>/dev/null || true
+wait "$PID2" 2>/dev/null || true
+run_ok "confirmed process absence permits automatic requeue" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker exited' --attempt-token "$TOKEN2"
+python3 - "$CONTROLLER" "$TMP/repo" <<'PY' && ok "unknown process inspection and PID reuse fail closed" || fail_case "unknown process inspection and PID reuse fail closed"
+import importlib.util,sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).parent))
+spec=importlib.util.spec_from_file_location("sprint_controller", sys.argv[1])
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+cfg={"shared_root": Path(sys.argv[2])}
+ticket={"worker_identity":{"kind":"process","pid":123,"start_fingerprint":"original"}}
+for failure in (
+    module.SprintError("permission denied while inspecting worker"),
+    module.SprintError("ps returned malformed output"),
+):
+    module.process_identity=lambda _pid, failure=failure: (_ for _ in ()).throw(failure)
+    try: module.require_worker_stopped(ticket, "", cfg)
+    except module.SprintError: pass
+    else: raise AssertionError("unknown inspection was treated as confirmed absence")
+module.process_identity=lambda _pid: {"kind":"process","pid":123,"start_fingerprint":"replacement"}
+try: module.require_worker_stopped(ticket, "", cfg)
+except module.SprintError: pass
+else: raise AssertionError("PID reuse was treated as confirmed worker absence")
+module.process_identity=lambda _pid: (_ for _ in ()).throw(module.ProcessAbsent("gone"))
+module.require_worker_stopped(ticket, "", cfg)
+PY
 run_ok "pending attempt history survives Jira resync" "$CONTROLLER" sync --inventory inventory.json
 "$CONTROLLER" reserve --sprint 42 --ticket PROJ-2 --run-ref codex-task-two > "$TMP/reserve2b.json" && ok "requeued ticket can reserve again" || bad "requeued ticket can reserve again"
 json_check "relaunch accounting survives pending sync" "$TMP/reserve2b.json" 'data["attempt"] == 2'

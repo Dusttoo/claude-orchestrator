@@ -32,12 +32,14 @@ GitHub branch protection and the plugin's merge guard remain the enforcement
 boundary for merges.
 
 Every launch is reserved first, and restart plans surface all running
-reservations as `needs_reconcile`. Local-process attach validates the live PID
-and stores a fingerprint of its OS-reported start time, so PID reuse cannot make
-a replacement process authoritative. Requeue consults only that immutable
-identity. Native task labels and provisional run references are never liveness
-evidence; tasks without a supported process adapter require explicit operator
-recovery. This deliberately prefers a paused lane over duplicate execution.
+reservations as `needs_reconcile`. `launch-local` starts the process itself and
+records controller-owned evidence bound to the exact repository, sprint,
+ticket, and attempt. `attach` consumes only that evidence; it never accepts a
+caller-supplied PID. Linux `/proc` start ticks or the macOS kernel process start
+time are fingerprinted so PID reuse cannot make a replacement authoritative.
+`run_ref` remains display metadata. Native task labels and tasks without a
+verified adapter require explicit operator recovery. Unknown inspection errors
+also remain fenced; only confirmed absence permits automatic requeue.
 
 ## Context and provider efficiency
 
