@@ -80,6 +80,9 @@ wins.
   legacy configs this is `integration_branch`. Never branch from a protected
   release target unless the configured workflow explicitly says this is the
   source role for the transition.
+- **Use the exact ticket branch supplied by the root run** when one is present.
+  Do not derive a competing name from the ticket; a run-scoped branch may be
+  required so retries and parallel runs remain isolated.
 - **Target the configured destination branch role** with your PR. Never stack on
   another feature branch unless the configured workflow explicitly allows it.
 - **Definition of done is every surface.** When you change a data source, schema,

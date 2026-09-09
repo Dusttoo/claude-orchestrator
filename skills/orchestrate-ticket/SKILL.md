@@ -82,6 +82,7 @@ reading them:
 - `../../scripts/merge-guard.sh`
 - `../../scripts/merge-on-green.sh`
 - `../../scripts/cleanup-worktree.sh`
+- `../../scripts/ticket-branch.sh`
 - `../../scripts/context_pipeline.py`
 - `../../scripts/api_agent.py`
 - `../../scripts/orchestration-engine.py`
@@ -98,6 +99,16 @@ working directory.
    Ready: a description you could write a failing test from. If it is too thin,
    scope it (see the `scope-ticket` skill) or push back BEFORE cutting a branch.
    With no tracker, treat the request as the spec.
+
+   If `.orchestration/config.yaml` sets `ticket_branch_template`, resolve the
+   feature branch now with `../../scripts/ticket-branch.sh` resolved to an
+   absolute plugin path, while the target repository remains the working
+   directory. Supply the canonical ticket id/title and exact configured source
+   ref/SHA. `ORCH_RUN_ID` must come from durable caller/root-run context and is
+   opaque to this skill; never have a subagent invent it. Persist and relay the
+   returned exact branch to every role. The local
+   `.orchestration/runs/<run-id>/ticket-branch.json` is only a mirror that
+   detects disagreement, not the source of run identity. Refuse a mismatch.
 
    Resolve `worker_trust_profile` now. It applies only to orchestration workers
    versus the host; it never narrows the application threat model. Do not let a
@@ -134,7 +145,8 @@ working directory.
    `orchestration-implementer.md`, passing the ticket body and the click-path. If
    the host supports subagents, launch a fresh implementer with
    `isolation: "worktree"`; otherwise perform that role as a distinct pass in an
-   isolated git worktree. Use configured branch roles. In legacy configs, this
+   isolated git worktree. Use configured branch roles and, when resolved above,
+   the exact ticket branch. In legacy configs, this
    remains one agent-role, one ticket, one worktree, one branch off the legacy
    configured source branch, one PR to the legacy configured target branch. Wait for its structured report
    (PR number, branch, worktree, SELF_CHECK).

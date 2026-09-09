@@ -59,6 +59,15 @@ Steps:
    or push back BEFORE cutting a branch. If `ticket.kind == none`, treat
    `$ARGUMENTS` as the spec.
 
+   If `ticket_branch_template` is set, resolve the feature branch once before
+   any subagent launch with `${CLAUDE_PLUGIN_ROOT}/scripts/ticket-branch.sh`,
+   while the target repository remains cwd. Supply canonical ticket id/title and
+   exact configured source ref/SHA. `ORCH_RUN_ID` is an opaque durable
+   caller/root-run identity and must be supplied by the caller; never invent it
+   in a subagent. Relay the exact resolved branch to every role. Its local
+   `.orchestration/runs/<run-id>/ticket-branch.json` mirror only detects a
+   disagreement; it is not the source of run identity.
+
    Resolve `worker_trust_profile` now. It applies only to orchestration workers
    versus the host and never narrows application security. Keep that profile
    fixed through design, implementation, and review.
@@ -84,7 +93,8 @@ Steps:
 
 3. **Implement.** Launch the `orchestration-implementer` agent with
    `isolation: "worktree"`, passing the ticket body + the click-path. Use the
-   configured source and target branch roles. In legacy configs, this is one
+   configured source and target branch roles and, when resolved above, the exact
+   ticket branch. In legacy configs, this is one
    agent, one ticket, one worktree, one branch, one PR to the legacy configured
    target branch. Wait for its structured report (PR number, branch,
    worktree, SELF_CHECK).
