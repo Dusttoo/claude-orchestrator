@@ -25,6 +25,8 @@ check_not() {
 
 check "template declares legacy schema by default" \
   grep -Eq '^schema_version:[[:space:]]*1([[:space:]]|$)' "$ROOT/templates/config.yaml"
+check "template defaults to the portable cooperative worker profile" \
+  grep -Eq '^worker_trust_profile:[[:space:]]*cooperative-worker([[:space:]]|$)' "$ROOT/templates/config.yaml"
 check_not "template does not actively enable schema v2" \
   grep -Eq '^schema_version:[[:space:]]*2([[:space:]]|$)' "$ROOT/templates/config.yaml"
 check "template leaves integration branch for repo detection" \

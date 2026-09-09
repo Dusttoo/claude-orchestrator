@@ -41,6 +41,7 @@ DROP_JIRA_KEYS = {
     "self",
 }
 ROUTE_FIELDS = {"execution", "provider", "fallback", "model", "effort", "allowed_tools"}
+WORKER_TRUST_PROFILES = {"cooperative-worker", "isolated-worker"}
 LLM_POLICY_BLOCKS = {"budgets", "pricing"}
 EXECUTIONS = {"desktop", "api"}
 PROVIDERS = {"anthropic", "openai", "azure_adm", "bedrock", "bedrock_mantle"}
@@ -374,6 +375,21 @@ def llm_route_from_config(path: Path, requested_role: str) -> dict[str, Any]:
     return _validate_route(resolved, role)
 
 
+def worker_trust_profile_from_config(path: Path | None) -> str:
+    """Resolve the host-worker threat model without requiring a YAML runtime."""
+    if path is None or not path.is_file():
+        return "cooperative-worker"
+    value = _flat_config_scalar(
+        path.read_text(encoding="utf-8").splitlines(), "worker_trust_profile"
+    )
+    profile = value or "cooperative-worker"
+    if profile not in WORKER_TRUST_PROFILES:
+        raise ContextError(
+            "worker_trust_profile must be cooperative-worker or isolated-worker"
+        )
+    return profile
+
+
 def jira_fields_from_config(path: Path) -> list[str]:
     """Read ticket.jira_fields without requiring a YAML runtime dependency."""
     if not path.is_file():
@@ -492,8 +508,20 @@ def _joined_files(paths: list[str], heading: str) -> str:
 
 def ordered_context(args: argparse.Namespace) -> tuple[list[str], str]:
     """Return the stable prefix sections and dynamic suffix in canonical order."""
+    profile = worker_trust_profile_from_config(
+        Path(args.config) if args.config else None
+    )
+    profile_contract = (
+        "# Orchestration worker trust profile\n"
+        f"Selected profile: {profile}. This profile applies only to orchestration "
+        "workers versus their host/controller. It never weakens the threat model "
+        "for application users, tenants, remote clients, ticket text, or external "
+        "provider responses. Judge findings against this selected profile."
+    )
     stable = [
-        _joined_files(args.role_file, "Global role briefs"),
+        _joined_files(args.role_file, "Global role briefs")
+        + "\n\n"
+        + profile_contract,
         _joined_files(args.rules_file, "Repository rules and conventions"),
     ]
     repo_map = _read_text(args.repo_map)

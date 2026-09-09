@@ -23,6 +23,14 @@ Read every doc in `.orchestration/config.yaml` `rules_docs` (CLAUDE.md /
 AGENTS.md), especially any "engineering standards" / "definition of done" /
 voice sections. Those are the concrete FAIL conditions for THIS repo.
 
+Also read `worker_trust_profile` (default `cooperative-worker` when absent). It
+governs only orchestration workers versus their host. With
+`cooperative-worker`, a deliberately malicious same-UID worker
+is outside scope unless the ticket explicitly promises that isolation. With
+`isolated-worker`, same-UID files, processes, and helpers are not independent
+boundaries. Neither profile weakens security expectations for application users,
+tenants, remote clients, ticket text, or external services.
+
 ## Input scope: unified diff first
 
 Your default code input is the raw unified git diff supplied by the orchestrator,
@@ -106,6 +114,15 @@ Every blocker must fit at least one authoritative category: unmet acceptance
 criteria; correctness/data integrity; security/privacy/authorization;
 regression; broken or weakened verification; or a material repository-rule/
 architecture violation. If it fits none, it is advisory.
+
+Every blocker must also carry closure evidence in its explanation: name the
+specific input or precondition, the production path, the wrong observable
+outcome and impact, plus either a reproducing test/command or the exact
+falsifying assertion to add. A concern that depends on an undeclared stronger
+worker threat profile, an unverified platform assumption, or a hypothetical
+architecture expansion is ADVISORY. Review the contract this PR actually claims;
+do not turn an in-repository ticket into a daemon, container, or cloud project
+unless its acceptance criteria or approved design requires that boundary.
 
 **ADVISORY** -- real, worth recording, but does not block this merge:
 - Dead weight: unused exports, premature abstraction beyond the ticket.
@@ -238,9 +255,11 @@ Rules:
   `AC#N mirror-only` with both the assertion and the bug it would miss.
 - Mark a blocking finding `REGRESSION` when the previous round's fix caused it.
   That preserves its blocking authority under the scope freeze.
-- **Round 1 or 2:** if unsure whether something is a real defect, treat it as
-  blocking and say what would resolve your doubt. A false FAIL costs one loop;
-  a false PASS ships a bug.
+- **Round 1 or 2:** investigate uncertainty before deciding. Block only when you
+  can state the concrete input/precondition, production path, wrong outcome and
+  impact, plus a reproduction or exact falsifying assertion. Otherwise file it
+  as ADVISORY and say what evidence would settle it. Be exhaustive without
+  turning uncertainty itself into a repair cycle.
 - **Round 3 or later:** that asymmetry no longer holds -- a false FAIL now costs
   every remaining round and may burn the PR's round cap. If unsure, file it as
   ADVISORY and name the exact evidence that would settle it. Block only on a

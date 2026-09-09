@@ -23,6 +23,12 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    `$ARGUMENTS` when supplied), and `concurrency_max >= 1`. Missing Jira access is
    a user action and no worker may launch.
 
+   Resolve `worker_trust_profile` once for the sprint. It applies only to the
+   orchestration worker-versus-host boundary and never weakens application or
+   tenant security. `isolated-worker` requires its independently owned host
+   boundary before launch; do not silently impose that boundary on a
+   `cooperative-worker` repository.
+
    Before each lane launch, resolve `sprint-worker` with
    `${CLAUDE_PLUGIN_ROOT}/scripts/context_pipeline.py route --config
    .orchestration/config.yaml --role sprint-worker`. Desktop routes keep the
@@ -76,7 +82,7 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    Run `sprint-controller.py sync --inventory-template <template>` so the
    controller-owned adapter performs authenticated approved-origin requests,
    exhaustive pagination, and content-addressed evidence itself. Requeue requires its current
-   `--attempt-token` and mechanical process/workspace-lease liveness proof, or
+   `--attempt-token` and the controller-bound PID/start fingerprint, or
    a separately provisioned single-use operator capability.
 
 5. For each key in `plan.launch` — already ordered by `(priority, key)`, so
@@ -84,18 +90,33 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    provisional reference and run `reserve --sprint <id> --ticket <key>
    --run-ref <provisional>`. Reserve is the authoritative `concurrency_max`
    check. Preserve the returned `attempt_token` for finish/requeue and the
-   separate one-use `attach_capability` for controller attach. Then launch a fresh isolated
+   separate one-use `attach_capability` for controller-owned launch. Then launch a fresh isolated
    worker that runs `/orchestration:orchestrate <key>` with the freshly fetched
    ticket body and acceptance criteria. On Codex SSH/CLI hosts, if native
-   multi-agent tools are unavailable, launch a detached `codex exec
-   --ephemeral --json --sandbox danger-full-access` worker in the repository
-   and record its PID plus output file as the actual run reference. Pass ticket
+   multi-agent tools are unavailable, use `launch-local` to start a detached
+   `codex exec --ephemeral --json --sandbox danger-full-access` worker in the repository.
+   Pass ticket
    text through stdin or a temporary file; never interpolate Jira text into a
-   shell command. A reservation is not a launch: verify a real worker process or
-   task reference before calling `attach`. Do not mark a ticket blocked merely
+   shell command. A reservation is not a launch: consume the returned controller
+   launch evidence with `attach`; native task references with no
+   supported process adapter remain reserved for operator recovery. Do not mark a ticket blocked merely
    because native subagents are unavailable when the Codex CLI fallback can run.
    If neither launch mechanism exists, record `user_action` and preserve the
-   reservation for reconciliation. After a real launch, run `attach --sprint <id> --ticket <key> --run-ref <actual-agent-ref> --attach-capability <attach_capability>`.
+   reservation for reconciliation. Launch and attach local work with
+   `launch-local --sprint <id> --ticket <key> --attach-capability <attach_capability> --output <repository-output> [--stdin-file <repository-input>] -- <worker-command>`
+   followed by `attach --sprint <id> --ticket <key> --launch-evidence <launch_evidence>`.
+   The controller records a controller-owned execution unit separately from `run_ref`.
+   Linux uses a cgroup-v2 systemd scope when available so descendant liveness is
+   checked. macOS supervision is cooperative and possible escape requires the
+   distinct host operator recovery authority; repository and same-UID secrets
+   are not authority. Fast exits retain an attachable terminal tombstone.
+   For Codex CLI, pass `--stdin-file <prompt-file>` to `launch-local` and use `-`
+   as the `codex exec` prompt so the file contents, not its pathname, reach stdin.
+   The complete input-bearing form is
+   `launch-local --sprint <id> --ticket <key> --attach-capability <attach_capability> --output <checkpoint-dir>/<run-ref>.jsonl --stdin-file <checkpoint-dir>/<run-ref>.prompt -- <codex-bin> exec --ephemeral --json --sandbox danger-full-access --model <configured-model> --cd <repository> -`.
+   A native task reference is display metadata, not liveness evidence; if no
+   supported adapter exposes its process identity, leave it reserved for
+   explicit operator recovery.
 
    For a lane explicitly marked `background: true` and `interactive: false`, do
    not start an interactive worker. Use the resolved API route and assemble each

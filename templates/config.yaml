@@ -26,6 +26,19 @@
 # explicitly migrate to schema_version: 2.
 schema_version: 1
 
+# --- Orchestration worker threat model ---------------------------------- agent
+# This governs only the boundary between an orchestration worker and its host.
+# It never relaxes application security for users, tenants, remote clients,
+# untrusted ticket text, or external services.
+#
+# cooperative-worker: workers may be wrong, crash, loop, overspend, or misuse an
+# API accidentally, but are not assumed to deliberately defeat same-UID host
+# controls. This is the portable default for ordinary repositories.
+# isolated-worker: workers may be hostile. The design must use an independently
+# owned boundary such as a separate UID/container and credential broker; a
+# same-UID helper or repository file cannot satisfy this profile.
+worker_trust_profile: cooperative-worker  # cooperative-worker | isolated-worker
+
 # --- LLM execution routing ---------------------------------------------- agent
 # Existing repositories remain on desktop execution unless they opt into API.
 # Provider/model/effort are used only by API routes. A role inherits every
