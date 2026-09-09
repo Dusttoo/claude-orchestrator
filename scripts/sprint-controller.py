@@ -19,7 +19,6 @@ import os
 import re
 import shutil
 import signal
-import stat
 import subprocess
 import sys
 import tempfile
@@ -30,6 +29,12 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from api_agent import AgentError, Pricing, UsageLedger, budgets_from_config, load_yaml
+from operator_authority import (
+    AuthorityError,
+    activate_budget,
+    budget_ceiling as authorized_budget_ceiling,
+    consume_recovery,
+)
 
 from runtime_state import (
     RuntimeStateError,
@@ -920,11 +925,17 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
         total = item["spent_usd"] + item["reserved_usd"]
         item["projected_total_usd"] = round(total, 6)
         pause = cfg["pause_usd_per_ticket"]
+        try:
+            grant_ceiling = authorized_budget_ceiling(cfg["shared_root"], ticket)
+        except AuthorityError as exc:
+            raise SprintError(str(exc)) from exc
+        if grant_ceiling is not None:
+            pause = max(pause, float(grant_ceiling))
         warning = cfg["warn_usd_per_ticket"]
         item["state"] = (
             "operator_action"
             if (
-                ticket in pause_events
+                (ticket in pause_events and grant_ceiling is None)
                 or (pause and total > pause)
                 or item["run_count"] >= cfg["max_model_runs_per_ticket"]
                 or item["reviewer_run_count"] >= cfg["max_reviewer_runs_per_ticket"]
@@ -2198,6 +2209,80 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     emit({"ticket": key, "state": "pending"})
 
 
+def grant_budget(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    """Activate a root-issued absolute ticket ceiling and record it in state."""
+    path = state_path(cfg["state_dir"], str(args.sprint))
+    key = normalize_key(args.ticket)
+    with locked(path):
+        state = load(path)
+        ticket = state["tickets"].get(key)
+        if not ticket or ticket["state"] == "completed":
+            current = ticket["state"] if ticket else "missing"
+            raise SprintError(f"ticket {key} cannot receive a budget grant from state {current}")
+        try:
+            ceiling = activate_budget(cfg["shared_root"], key, operator_capability(args))
+        except AuthorityError as exc:
+            raise SprintError(str(exc)) from exc
+        ticket["history"].append(
+            {
+                "at": now(),
+                "event": "operator-budget-granted",
+                "ceiling_usd": str(ceiling),
+            }
+        )
+        save(path, state)
+    emit({"ticket": key, "budget_ceiling_usd": str(ceiling), "state": ticket["state"]})
+
+
+def recover_terminal(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    """Requeue a terminal lane using a separately issued recovery capability."""
+    path = state_path(cfg["state_dir"], str(args.sprint))
+    key = normalize_key(args.ticket)
+    if not args.reason.strip():
+        raise SprintError("terminal recovery reason must not be empty")
+    with locked(path):
+        state = load(path)
+        ticket = state["tickets"].get(key)
+        if not ticket or ticket.get("state") not in {"blocked", "user_action"}:
+            current = ticket.get("state") if ticket else "missing"
+            raise SprintError(f"ticket {key} cannot be terminal-recovered from state {current}")
+        try:
+            consume_recovery(
+                cfg["shared_root"],
+                key,
+                int(ticket.get("attempts") or 0),
+                operator_capability(args),
+            )
+        except AuthorityError as exc:
+            raise SprintError(str(exc)) from exc
+        ticket["state"] = "pending"
+        ticket["reason"] = args.reason.strip()
+        ticket["run_ref"] = ""
+        ticket["branch"] = ""
+        ticket["pr"] = ""
+        ticket["attempt_token"] = ""
+        ticket["attempt_capability"] = {}
+        ticket["worker_identity"] = ""
+        ticket["attach_capability"] = ""
+        ticket["attached_at"] = ""
+        ticket["launch_evidence"] = {}
+        ticket["legacy_recovery_pending"] = False
+        ticket["history"].append(
+            {"at": now(), "event": "terminal-recovered", "reason": args.reason.strip()}
+        )
+        save(path, state)
+    emit({"ticket": key, "state": "pending", "recovered": True})
+
+
+def operator_capability(args: argparse.Namespace) -> str:
+    if getattr(args, "operator_capability_stdin", False):
+        value = sys.stdin.readline().strip()
+        if not value:
+            raise SprintError("operator capability stdin was empty")
+        return value
+    return str(getattr(args, "operator_capability", ""))
+
+
 def recover_legacy(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     """Requeue a fenced schema-v1 lane after external process verification."""
     path = state_path(cfg["state_dir"], str(args.sprint))
@@ -2250,47 +2335,16 @@ def require_worker_stopped(
 def consume_operator_recovery(
     operator_token: str, ticket: dict[str, Any], cfg: dict[str, Any]
 ) -> bool:
-    """Ask a separately owned host helper to atomically consume a capability."""
-    if not operator_token:
-        return False
-    helper = Path("/usr/local/libexec/orchestration-recovery-authority")
-    if os.environ.get("ORCHESTRATION_TEST_MODE") == "1" and os.environ.get(
-        "ORCHESTRATION_TEST_RECOVERY_HELPER"
-    ):
-        helper = Path(os.environ["ORCHESTRATION_TEST_RECOVERY_HELPER"])
     try:
-        st = helper.stat()
-    except OSError:
-        return False
-    if os.environ.get("ORCHESTRATION_TEST_MODE") != "1":
-        if (
-            st.st_uid == os.geteuid()
-            or st.st_mode & 0o022
-            or not st.st_mode & stat.S_ISUID
-            or not helper.is_file()
-        ):
-            return False
-    scope = json.dumps(
-        {
-            "repository": str(cfg["shared_root"]),
-            "ticket": ticket.get("key", ""),
-            "attempt": ticket.get("attempts", 0),
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    try:
-        result = subprocess.run(
-            [str(helper), "consume", "--scope", scope],
-            input=operator_token + "\n",
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
+        consume_recovery(
+            cfg["shared_root"],
+            str(ticket.get("key") or ""),
+            int(ticket.get("attempts") or 0),
+            operator_token,
         )
-    except (OSError, subprocess.SubprocessError):
+    except AuthorityError:
         return False
-    return result.returncode == 0
+    return True
 
 
 def process_identity(raw_pid: str) -> dict[str, Any]:
@@ -2561,6 +2615,21 @@ def parser() -> argparse.ArgumentParser:
         "--worker-stopped", action="store_true", help=argparse.SUPPRESS
     )
     requeue_parser.set_defaults(func=requeue)
+    budget_parser = commands.add_parser("grant-budget")
+    budget_parser.add_argument("--sprint", required=True)
+    budget_parser.add_argument("--ticket", required=True)
+    budget_capability = budget_parser.add_mutually_exclusive_group(required=True)
+    budget_capability.add_argument("--operator-capability")
+    budget_capability.add_argument("--operator-capability-stdin", action="store_true")
+    budget_parser.set_defaults(func=grant_budget)
+    terminal_recovery_parser = commands.add_parser("recover-terminal")
+    terminal_recovery_parser.add_argument("--sprint", required=True)
+    terminal_recovery_parser.add_argument("--ticket", required=True)
+    terminal_recovery_parser.add_argument("--reason", required=True)
+    terminal_capability = terminal_recovery_parser.add_mutually_exclusive_group(required=True)
+    terminal_capability.add_argument("--operator-capability")
+    terminal_capability.add_argument("--operator-capability-stdin", action="store_true")
+    terminal_recovery_parser.set_defaults(func=recover_terminal)
     recover_parser = commands.add_parser("recover-legacy")
     recover_parser.add_argument("--sprint", required=True)
     recover_parser.add_argument("--ticket", required=True)

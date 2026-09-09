@@ -249,8 +249,17 @@ Before launching, resolve the executable because non-interactive SSH shells may 
 
    Treat controller `spend` as authoritative. Stop admission when a ticket is
    `operator_action`; never relaunch to evade a model/reviewer run-count breaker.
-   A pause is a hard stop until reviewed operator policy changes. Include warning
-   state, projected spend, and run count in meaningful status updates.
+   A pause is a hard stop until root issues an expiring, ticket-scoped budget
+   capability with an exact absolute ceiling and it is consumed by
+   `grant-budget`. Pipe issuance to `--operator-capability-stdin`; never print,
+   store, or invent the token. The grant changes only that ticket's pause and
+   hard ticket-cost ceiling. It does not relax per-run/sprint limits,
+   model/reviewer run-count breakers, gates, or concurrency. If a terminal
+   `blocked`/`user_action` checkpoint has lost its attempt token or mechanically
+   verified execution-unit identity, require a separate root-issued,
+   attempt-bound recovery capability and use `recover-terminal`; do not
+   fabricate inventory or identity. Include warning state, projected spend,
+   active absolute ceiling, and run count in meaningful status updates.
 
    **Quiet captain contract.** When `sprint_status_update_mode` is `event`, do
    not spend model turns polling, rereading full transcripts, or narrating

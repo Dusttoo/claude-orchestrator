@@ -219,7 +219,7 @@ marketplace entry points at `./plugins/claude-orchestrator`, then running:
 codex plugin add claude-orchestrator@personal
 ```
 
-Codex users invoke the same flows in natural language: "orchestrate BL-90 end to
+Codex users invoke the same flows in natural language: "orchestrate PROJ-90 end to
 end", "orchestrate the active sprint", "gate PR 123", "advance the configured
 release transition", or "bootstrap orchestration in this repo". See
 [docs/codex.md](docs/codex.md) for the full marketplace layout and hook trust
@@ -240,7 +240,7 @@ findings; a finding that survives an evidenced repair forces scoped redesign
 before the final attempt. Nothing merges red.
 
 The slash command is the explicit, deterministic entry point. Natural language
-works too: asking to "orchestrate BL-90" or "run this ticket through the
+works too: asking to "orchestrate PROJ-90" or "run this ticket through the
 pipeline" triggers the `orchestrate-ticket` skill, which runs the same flow. Use
 the slash command when you want to be explicit; use plain English when you don't
 want to remember the syntax.

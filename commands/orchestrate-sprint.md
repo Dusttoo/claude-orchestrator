@@ -152,7 +152,14 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    and letting healthy routes continue; `api_agent.py` owns bounded retries.
    Treat `spend.state: operator_action` and model/reviewer run-count errors as
    user actions, never reasons to relaunch. A human may extend a ticket pause
-   boundary is a hard operator-action stop with no same-user CLI bypass.
+   only through a root-issued, expiring, ticket-scoped capability carrying an
+   exact absolute ceiling. Pipe it into `grant-budget --operator-capability-stdin`;
+   never print, persist, or invent it. The grant
+   raises only that ticket's pause and hard ticket-cost ceiling. It never
+   relaxes per-run/sprint budgets, run-count breakers, gates, or concurrency.
+   A terminal checkpoint missing its attempt token or verified execution-unit
+   identity requires a separate root-issued, attempt-bound capability consumed
+   by `recover-terminal`; there is no same-user CLI bypass.
 
    In the default event-driven status mode, block on worker wait primitives or
    detached process ids instead of spending model turns polling unchanged
