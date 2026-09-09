@@ -8,6 +8,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from urllib.request import Request
 
@@ -23,6 +24,33 @@ SPEC.loader.exec_module(jira)
 
 
 class JiraInventoryFetchTest(unittest.TestCase):
+    def test_base_validation_and_response_origin_are_separate(self) -> None:
+        self.assertEqual(
+            jira.validate_base_url("https://jira.example/team"),
+            "https://jira.example",
+        )
+        self.assertEqual(
+            jira.url_origin("https://jira.example/rest/api/3/search?startAt=1"),
+            "https://jira.example",
+        )
+        with self.assertRaisesRegex(ValueError, "base URL"):
+            jira.validate_base_url("https://jira.example/team?redirect=evil")
+
+    def test_network_fetcher_uses_canonical_base_not_environment(self) -> None:
+        with (
+            mock.patch.dict(
+                jira.os.environ,
+                {
+                    "JIRA_BASE_URL": "https://attacker.example",
+                    "JIRA_API_TOKEN": "secret",
+                },
+            ),
+            mock.patch.object(jira, "build_opener") as opener,
+        ):
+            jira.network_fetcher("https://trusted.example")
+        handler = opener.call_args.args[0]
+        self.assertEqual(handler.approved_origin, "https://trusted.example")
+
     def test_cross_origin_redirect_is_rejected_before_authorization_can_follow(
         self,
     ) -> None:
@@ -72,7 +100,7 @@ class JiraInventoryFetchTest(unittest.TestCase):
             "fields": {
                 "summary": "provider summary",
                 "status": {"name": "Ready"},
-                "priority": {"id": "2"},
+                "priority": {"id": "opaque-99", "name": "High"},
                 "sprint": {"id": "42", "name": "Provider Sprint"},
                 "subtasks": [{"key": "PROJ-2"}],
                 "issuelinks": [
@@ -126,6 +154,9 @@ class JiraInventoryFetchTest(unittest.TestCase):
                 fields=jira.required_fields("sprint"),
                 sprint_field="sprint",
                 dependency_links=[{"type": "Blocks", "blocked_side": "inward"}],
+                project="PROJ",
+                sprint_policy="42",
+                priority_order=["Highest", "High", "Medium", "Low", "Lowest"],
             )
         self.assertEqual(output["project"], "PROJ")
         self.assertEqual(output["sprint"], {"id": "42", "name": "Provider Sprint"})
@@ -136,6 +167,115 @@ class JiraInventoryFetchTest(unittest.TestCase):
         self.assertEqual(output["dependency_status"], {"EXT-9": "In Progress"})
         self.assertNotIn("EVIL-9", json.dumps(output))
         self.assertEqual(artifact["authority"], "test-only")
+
+    def test_policy_constructs_queries_and_rejects_wrong_project(self) -> None:
+        self.assertEqual(
+            jira.policy_queries("PROJ", "42"),
+            (
+                'project = "PROJ" AND sprint = 42',
+                'project = "PROJ" AND sprint = 42 AND issuetype in subTaskIssueTypes()',
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "outside configured project"):
+            jira.verify_issue_policy(
+                {"key": "EVIL-1", "fields": {"sprint": {"id": "42", "name": "S"}}},
+                "sprint",
+                "PROJ",
+                "42",
+            )
+
+    def test_current_sprint_selected_while_history_is_tolerated(self) -> None:
+        issue = {
+            "key": "PROJ-1",
+            "fields": {
+                "sprint": [
+                    {"id": "41", "name": "Old", "state": "closed"},
+                    {"id": "42", "name": "Current", "state": "active"},
+                ]
+            },
+        }
+        self.assertEqual(
+            jira.sprint_value(issue, "sprint", "active"), ("42", "Current")
+        )
+
+    def test_priority_uses_configured_names_not_opaque_ids(self) -> None:
+        issue = {"fields": {"priority": {"id": "999", "name": "Highest"}}}
+        self.assertEqual(jira.priority_rank(issue, ["Highest", "High"]), 1)
+        issue["fields"]["priority"] = {"id": "1", "name": "High"}
+        self.assertEqual(jira.priority_rank(issue, ["Highest", "High"]), 2)
+
+    def test_required_fields_are_exactly_the_consumed_surface(self) -> None:
+        self.assertEqual(
+            jira.required_fields("customfield_10020", ["description", "components"]),
+            [
+                "key",
+                "summary",
+                "status",
+                "priority",
+                "subtasks",
+                "parent",
+                "issuelinks",
+                "customfield_10020",
+            ],
+        )
+
+    def test_non_adjacent_cursor_cycle_and_bounds_fail_closed(self) -> None:
+        responses = iter(
+            [
+                {"startAt": 0, "isLast": False, "nextPageToken": "A", "issues": [{}]},
+                {"startAt": 1, "isLast": False, "nextPageToken": "B", "issues": [{}]},
+                {"startAt": 2, "isLast": False, "nextPageToken": "A", "issues": [{}]},
+            ]
+        )
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            self.assertRaisesRegex(ValueError, "cursor"),
+        ):
+            jira.exhaustive(
+                lambda *_: next(responses), "q", "parents", Path(temporary), ["key"]
+            )
+
+    def test_public_cli_has_no_fixture_or_base_url_authority_switch(self) -> None:
+        parser = jira.parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "--inventory-template",
+                    "i",
+                    "--artifact",
+                    "a",
+                    "--output",
+                    "o",
+                    "--test-transport",
+                    "x",
+                ]
+            )
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "--inventory-template",
+                    "i",
+                    "--artifact",
+                    "a",
+                    "--output",
+                    "o",
+                    "--base-url",
+                    "https://evil",
+                ]
+            )
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "--inventory-template",
+                    "i",
+                    "--artifact",
+                    "a",
+                    "--output",
+                    "o",
+                    "--config",
+                    "attacker.yaml",
+                ]
+            )
 
     def test_truncated_total_and_contradictory_relations_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

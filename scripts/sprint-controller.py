@@ -112,7 +112,9 @@ def config_list(path: Path, key: str, default: list[str]) -> list[str]:
     return values or default
 
 
-def settings(args: argparse.Namespace) -> dict[str, Any]:
+def settings(
+    args: argparse.Namespace, *, allow_test_evidence: bool = False
+) -> dict[str, Any]:
     root = project_root()
     shared_root = shared_repository_root(root)
     try:
@@ -193,8 +195,7 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
             x.casefold()
             for x in config_list(config, "sprint_blocked_statuses", DEFAULT_BLOCKED)
         },
-        "allow_test_evidence": bool(getattr(args, "test_only_evidence", False))
-        or os.environ.get("ORCHESTRATION_TEST_MODE") == "1",
+        "allow_test_evidence": allow_test_evidence,
     }
 
 
@@ -934,8 +935,6 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                     str(artifact_path),
                     "--output",
                     str(inventory_path),
-                    "--config",
-                    str(cfg["config"]),
                 ],
                 cwd=cfg["shared_root"],
                 check=True,
@@ -1765,9 +1764,6 @@ def parser() -> argparse.ArgumentParser:
         help="repo orchestration config (default: .orchestration/config.yaml)",
     )
     result.add_argument("--state-dir", help="checkpoint directory override")
-    result.add_argument(
-        "--test-only-evidence", action="store_true", help=argparse.SUPPRESS
-    )
     commands = result.add_subparsers(dest="command", required=True)
     sync_parser = commands.add_parser(
         "sync", help="normalize Jira inventory into a durable checkpoint"
@@ -1845,6 +1841,18 @@ def main() -> int:
     args = parser().parse_args()
     try:
         cfg = settings(args)
+        args.func(args, cfg)
+        return 0
+    except SprintError as exc:
+        print(f"sprint-controller: {exc}", file=sys.stderr)
+        return 2
+
+
+def main_for_test(argv: list[str] | None = None) -> int:
+    """In-process test seam for non-authoritative fixture evidence."""
+    args = parser().parse_args(argv)
+    try:
+        cfg = settings(args, allow_test_evidence=True)
         args.func(args, cfg)
         return 0
     except SprintError as exc:

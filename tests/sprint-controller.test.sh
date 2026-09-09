@@ -2,11 +2,9 @@
 # sprint-controller.test.sh -- scheduling is bounded, resumable, and continues
 # independent work past blocked tickets.
 set -uo pipefail
-export ORCHESTRATION_TEST_MODE=1
-
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/.."
-CONTROLLER="$ROOT/scripts/sprint-controller.py"
+CONTROLLER="$ROOT/tests/sprint_controller_test_driver.py"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -40,8 +38,9 @@ sprint=value["sprint"]
 def fields(item):
   links=[{"type":{"name":"Blocks"},"outwardIssue":{"key":dep}} for dep in item.get("dependencies",[])]
   priority=item.get("priority")
+  priority_names={1:"Highest",2:"High",3:"Medium",4:"Low",5:"Lowest"}
   return {"summary":item.get("summary",""),"status":{"name":item.get("status","")},
-    "priority":({"id":str(priority)} if priority is not None else None),"sprint":sprint,
+    "priority":({"id":"opaque-"+str(priority),"name":priority_names[int(priority)]} if priority is not None else None),"sprint":sprint,
     "subtasks":[{"key":x} for x in item.get("subtasks",[])],"issuelinks":links,
     **({"parent":{"key":item["parent"]}} if item.get("parent") else {})}
 parent_issues=[{"key":key,"fields":fields(by_key[key])} for key in parents]
@@ -55,14 +54,25 @@ if external:
     "issues":[{"key":key,"fields":{"status":{"name":statuses.get(key,"")}}} for key in external]}]
 json.dump(transport,open(sys.argv[2],"w"))
 PY
-  python3 "$ROOT/scripts/jira_inventory_fetch.py" --inventory-template "$inventory" \
-    --test-transport "$transport" --artifact "$artifact" --output "$inventory"
+  python3 - "$inventory" "$TMP/repo/.orchestration/config.yaml" <<'PY'
+import json,re,sys
+inventory=json.load(open(sys.argv[1])); path=sys.argv[2]; text=open(path).read()
+text=re.sub(r'(?m)^(  project:)\s*.*$', rf'\1 "{inventory["project"]}"', text)
+text=re.sub(r'(?m)^sprint_id:\s*.*$', f'sprint_id: {inventory["sprint"]["id"]}', text)
+open(path,"w").write(text)
+PY
+  python3 "$ROOT/tests/jira_fixture_driver.py" "$transport" \
+    "$TMP/repo/.orchestration/config.yaml" --inventory-template "$inventory" \
+    --artifact "$artifact" --output "$inventory"
 }
 
 mkdir -p "$TMP/repo/.git" "$TMP/repo/.orchestration"
 cp "$ROOT/templates/config.yaml" "$TMP/repo/.orchestration/config.yaml"
 sed -i.bak 's/^concurrency_max:.*/concurrency_max: 2/' "$TMP/repo/.orchestration/config.yaml"
 rm "$TMP/repo/.orchestration/config.yaml.bak"
+
+run_fail "public controller CLI cannot enable test evidence" \
+  "$ROOT/scripts/sprint-controller.py" --test-only-evidence sync --inventory missing.json
 
 cat > "$TMP/repo/inventory.json" <<'JSON'
 {
@@ -98,7 +108,7 @@ if [ "$BEFORE_FAILED_FETCH" = "$AFTER_FAILED_FETCH" ]; then
 else
   fail_case "failed provider inspection preserves the prior checkpoint"
 fi
-if env -u ORCHESTRATION_TEST_MODE "$CONTROLLER" sync --inventory inventory.json >/dev/null 2>&1; then
+if "$ROOT/scripts/sprint-controller.py" sync --inventory inventory.json >/dev/null 2>&1; then
   fail_case "test transport cannot authorize production Jira sync"
 else
   ok "test transport cannot authorize production Jira sync"

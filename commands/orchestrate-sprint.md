@@ -19,9 +19,10 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
 
 1. Read `.orchestration/config.yaml`; validate it with
    `${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py validate-config`.
-   Require `ticket.kind: jira`, `ticket.project`, `sprint_id` (overridden by
-   `$ARGUMENTS` when supplied), and `concurrency_max >= 1`. Missing Jira access is
-   a user action and no worker may launch.
+   Require `ticket.kind: jira`, `ticket.project`, `sprint_id`, a canonical
+   `jira_base_url`, and `concurrency_max >= 1`. These values are repository
+   policy and cannot be overridden by caller arguments or environment. Missing
+   Jira access is a user action and no worker may launch.
 
    Before each lane launch, resolve `sprint-worker` with
    `${CLAUDE_PLUGIN_ROOT}/scripts/context_pipeline.py route --config
@@ -33,21 +34,22 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    desktop fallback may reuse the provisional reservation only when no
    provider/run id was created. Uncertain API work remains reserved.
 
-2. Resolve `ticket.jira_fields` with
-   `${CLAUDE_PLUGIN_ROOT}/scripts/context_pipeline.py jira-fields`; when absent it
-   defaults to `key,summary,description,status,priority,components,subtasks,issuelinks`.
-   Define one entire-sprint JQL query and one independent child JQL query. The
-   controller-owned adapter passes the compact fields plus scheduler-required
+2. The controller-owned adapter constructs one entire-sprint JQL query and one
+   independent child JQL query from canonical `ticket.project` and `sprint_id`.
+   It requests only `key,summary,status,priority,subtasks,parent,issuelinks` plus
+   the configured sprint field and rejects returned issues outside that policy.
+   The controller-owned adapter passes the compact fields plus scheduler-required
    relation and configured `jira_sprint_field` fields, exhausts pagination, and
    applies `context_pipeline.py sanitize-jira`. It derives exact sprint identity,
    ticket metadata, relations, and external dependency statuses from
    authenticated Jira responses. Do not query or normalize Jira in the captain.
 
-3. Write only query policy beneath `sprint_checkpoint_dir` (default
-   `.orchestration/.sprint-state`) as JSON:
+3. Write an empty JSON inventory template beneath `sprint_checkpoint_dir`
+   (default `.orchestration/.sprint-state`). The adapter ignores caller-authored
+   queries and constructs them from canonical repository policy:
 
    ```json
-   {"source_query":"exact Jira query","subtask_source_query":"exact child query"}
+   {}
    ```
 
    Caller-authored scheduler values have no authority. Derived `priority` is

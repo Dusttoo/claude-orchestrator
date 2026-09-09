@@ -15,9 +15,12 @@ from typing import Any, Callable
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from context_pipeline import jira_fields_from_config, sanitize_jira_response
+from context_pipeline import sanitize_jira_response
 
 Fetch = Callable[[str, str, int, int, str, list[str]], dict[str, Any]]
+MAX_PAGES = 10_000
+MAX_ITEMS = 1_000_000
+DEFAULT_PRIORITY_ORDER = ["Highest", "High", "Medium", "Low", "Lowest"]
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -35,21 +38,29 @@ def write_json(path: Path, value: Any) -> None:
             os.unlink(temporary)
 
 
-def origin(url: str) -> str:
+def url_origin(url: str) -> str:
     parsed = urlparse(url)
     if (
         parsed.scheme != "https"
         or not parsed.hostname
         or parsed.username
         or parsed.password
-        or parsed.query
-        or parsed.fragment
     ):
-        raise ValueError(
-            "Jira base URL must be HTTPS without credentials, query, or fragment"
-        )
+        raise ValueError("Jira URL must use HTTPS without embedded credentials")
     port = f":{parsed.port}" if parsed.port else ""
     return f"https://{parsed.hostname.lower()}{port}"
+
+
+def validate_base_url(url: str) -> str:
+    parsed = urlparse(url)
+    approved = url_origin(url)
+    if parsed.query or parsed.fragment:
+        raise ValueError("Jira base URL cannot contain a query or fragment")
+    return approved
+
+
+# Backward-compatible helper for callers that only need an origin comparison.
+origin = url_origin
 
 
 class ApprovedOriginRedirectHandler(HTTPRedirectHandler):
@@ -63,7 +74,7 @@ class ApprovedOriginRedirectHandler(HTTPRedirectHandler):
         self, req: Request, fp: Any, code: int, msg: str, headers: Any, newurl: str
     ) -> Request | None:
         absolute = urljoin(req.full_url, newurl)
-        if origin(absolute) != self.approved_origin:
+        if url_origin(absolute) != self.approved_origin:
             raise ValueError(
                 "Jira cross-origin redirect rejected before credentials were sent"
             )
@@ -78,20 +89,21 @@ class ApprovedOriginRedirectHandler(HTTPRedirectHandler):
 def required_fields(
     sprint_field: str, configured: list[str] | None = None
 ) -> list[str]:
-    fields = list(configured or [])
-    for field in (
-        "key",
-        "summary",
-        "status",
-        "priority",
-        "subtasks",
-        "parent",
-        "issuelinks",
-        sprint_field,
-    ):
-        if field not in fields:
-            fields.append(field)
-    return fields
+    del configured
+    return list(
+        dict.fromkeys(
+            (
+                "key",
+                "summary",
+                "status",
+                "priority",
+                "subtasks",
+                "parent",
+                "issuelinks",
+                sprint_field,
+            )
+        )
+    )
 
 
 def sanitize_page(value: Any, fields: list[str]) -> dict[str, Any]:
@@ -104,10 +116,11 @@ def sanitize_page(value: Any, fields: list[str]) -> dict[str, Any]:
 
 
 def network_fetcher(base_url: str) -> Fetch:
-    approved = origin(base_url)
+    approved = validate_base_url(base_url)
     endpoint = urljoin(base_url.rstrip("/") + "/", "rest/api/3/search/jql")
-    if origin(endpoint) != approved:
+    if url_origin(endpoint) != approved:
         raise ValueError("Jira request escaped the approved origin")
+    # Credentials are read only after canonical policy has established the trust anchor.
     token = os.environ.get("JIRA_API_TOKEN", "")
     if not token:
         raise ValueError("JIRA_API_TOKEN is required")
@@ -142,7 +155,7 @@ def network_fetcher(base_url: str) -> Fetch:
             },
         )
         with opener.open(request, timeout=30) as response:
-            if origin(response.geturl()) != approved:
+            if url_origin(response.geturl()) != approved:
                 raise ValueError("Jira response escaped the approved origin")
             value = json.loads(response.read())
         return sanitize_page(value, fields)
@@ -183,7 +196,14 @@ def exhaustive(
     pages: list[dict[str, Any]] = []
     issues: list[dict[str, Any]] = []
     provider_total: int | None = None
+    seen_cursors: set[str] = set()
     while True:
+        if len(pages) >= MAX_PAGES or len(issues) >= MAX_ITEMS:
+            raise ValueError("Jira pagination exceeded the page or item bound")
+        if cursor:
+            if cursor in seen_cursors:
+                raise ValueError("Jira pagination repeated a previously seen cursor")
+            seen_cursors.add(cursor)
         response = fetch(kind, jql, start_at, 100, cursor, fields)
         page_issues = response.get("issues")
         response_start = response.get("startAt", start_at)
@@ -198,6 +218,8 @@ def exhaustive(
             elif provider_total != total:
                 raise ValueError("Jira total changed during pagination")
         next_start = start_at + len(page_issues)
+        if next_start > MAX_ITEMS:
+            raise ValueError("Jira pagination exceeded the item bound")
         next_cursor = str(response.get("nextPageToken") or "")
         declared_last = response.get("isLast")
         if declared_last is not None and not isinstance(declared_last, bool):
@@ -260,16 +282,34 @@ def status_name(issue: dict[str, Any]) -> str:
     return value
 
 
-def sprint_value(issue: dict[str, Any], sprint_field: str) -> tuple[str, str]:
+def sprint_value(
+    issue: dict[str, Any], sprint_field: str, sprint_policy: str
+) -> tuple[str, str]:
     value = (issue.get("fields") or {}).get(sprint_field)
-    if isinstance(value, list):
-        if len(value) != 1:
-            raise ValueError(f"Jira issue {issue_key(issue)} has ambiguous sprint data")
-        value = value[0]
-    if not isinstance(value, dict):
+    memberships = value if isinstance(value, list) else [value]
+    memberships = [item for item in memberships if isinstance(item, dict)]
+    if sprint_policy.casefold() == "active":
+        matches = [
+            item
+            for item in memberships
+            if str(item.get("state", "")).strip().casefold() == "active"
+        ]
+    else:
+        wanted = sprint_policy.strip().casefold()
+        matches = [
+            item
+            for item in memberships
+            if wanted
+            in {
+                str(item.get("id", "")).strip().casefold(),
+                str(item.get("name", "")).strip().casefold(),
+            }
+        ]
+    if len(matches) != 1:
         raise ValueError(
-            f"Jira issue {issue_key(issue)} has no structured sprint identity"
+            f"Jira issue {issue_key(issue)} does not prove exactly one configured current sprint"
         )
+    value = matches[0]
     sprint_id, name = (
         str(value.get("id", "")).strip(),
         str(value.get("name", "")).strip(),
@@ -338,18 +378,42 @@ def external_statuses(
     return dict(sorted(statuses.items()))
 
 
-def priority_rank(issue: dict[str, Any]) -> int | None:
+def priority_rank(issue: dict[str, Any], priority_order: list[str]) -> int | None:
     value = (issue.get("fields") or {}).get("priority")
     if value is None:
         return None
     if isinstance(value, dict):
-        candidate = value.get("id")
-        if str(candidate or "").isdigit():
-            return int(candidate)
         value = value.get("name")
-    return {"highest": 1, "high": 2, "medium": 3, "low": 4, "lowest": 5}.get(
-        str(value or "").strip().casefold()
-    )
+    normalized = str(value or "").strip().casefold()
+    ranks = {
+        name.strip().casefold(): rank for rank, name in enumerate(priority_order, 1)
+    }
+    if normalized not in ranks:
+        raise ValueError(f"Jira priority {value!r} is absent from jira_priority_order")
+    return ranks[normalized]
+
+
+def policy_queries(project: str, sprint_policy: str) -> tuple[str, str]:
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", project):
+        raise ValueError("configured Jira project must be a canonical project key")
+    if sprint_policy.casefold() == "active":
+        sprint_clause = "sprint in openSprints()"
+    elif sprint_policy.isdigit():
+        sprint_clause = f"sprint = {sprint_policy}"
+    else:
+        escaped = sprint_policy.replace("\\", "\\\\").replace('"', '\\"')
+        sprint_clause = f'sprint = "{escaped}"'
+    base = f'project = "{project}" AND {sprint_clause}'
+    return base, base + " AND issuetype in subTaskIssueTypes()"
+
+
+def verify_issue_policy(
+    issue: dict[str, Any], sprint_field: str, project: str, sprint_policy: str
+) -> tuple[str, str]:
+    key = issue_key(issue)
+    if not key.startswith(f"{project}-"):
+        raise ValueError(f"Jira issue {key} is outside configured project {project}")
+    return sprint_value(issue, sprint_field, sprint_policy)
 
 
 def build_inventory(
@@ -362,11 +426,12 @@ def build_inventory(
     fields: list[str],
     sprint_field: str,
     dependency_links: list[dict[str, str]],
+    project: str,
+    sprint_policy: str,
+    priority_order: list[str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    parent_jql = str(template.get("source_query", "")).strip()
-    child_jql = str(template.get("subtask_source_query", "")).strip()
-    if not parent_jql or not child_jql:
-        raise ValueError("Jira parent and child queries are required policy")
+    del template
+    parent_jql, child_jql = policy_queries(project, sprint_policy)
     parent_pages, parents = exhaustive(fetch, parent_jql, "parents", raw_dir, fields)
     child_pages, children = exhaustive(fetch, child_jql, "children", raw_dir, fields)
     if not parents:
@@ -379,10 +444,10 @@ def build_inventory(
         raise ValueError("Jira parent query contains duplicate issues")
     if not {issue_key(issue) for issue in children}.issubset(set(keys)):
         raise ValueError("Jira child query returned an issue outside the sprint query")
-    projects = {key.split("-", 1)[0] for key in keys}
-    if len(projects) != 1:
-        raise ValueError("Jira sprint inventory spans multiple projects")
-    sprints = {sprint_value(issue, sprint_field) for issue in all_issues}
+    sprints = {
+        verify_issue_policy(issue, sprint_field, project, sprint_policy)
+        for issue in all_issues
+    }
     if len(sprints) != 1:
         raise ValueError("Jira issues disagree on exact sprint identity")
     sprint_id, sprint_name = next(iter(sprints))
@@ -432,7 +497,7 @@ def build_inventory(
             "key": key,
             "summary": str(data.get("summary") or "").strip(),
             "status": status_name(issue),
-            "priority": priority_rank(issue),
+            "priority": priority_rank(issue, priority_order),
             "dependencies": dependencies[key],
             "subtasks": sorted(
                 child for child, parent in child_parents.items() if parent == key
@@ -445,7 +510,7 @@ def build_inventory(
             ticket["parent"] = child_parents[key]
         tickets.append(ticket)
     output = {
-        "project": next(iter(projects)),
+        "project": project,
         "sprint": {"id": sprint_id, "name": sprint_name},
         "source_query": parent_jql,
         "subtask_source_query": child_jql,
@@ -472,13 +537,53 @@ def scalar_config(path: Path, key: str, default: str) -> str:
     return match.group(1).strip().strip("\"'") if match else default
 
 
+def ticket_project_from_config(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    in_ticket = False
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        if raw.startswith("ticket:"):
+            in_ticket = True
+            continue
+        if in_ticket and raw and not raw[0].isspace():
+            break
+        match = re.fullmatch(r"\s+project:\s*([^#]+?)(?:\s+#.*)?", raw)
+        if in_ticket and match:
+            return match.group(1).strip().strip("\"'")
+    return ""
+
+
+def list_config(path: Path, key: str, default: list[str]) -> list[str]:
+    if not path.is_file():
+        return list(default)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    values: list[str] = []
+    active = False
+    for raw in lines:
+        if raw.startswith(f"{key}:"):
+            active = True
+            continue
+        if active and raw and not raw[0].isspace():
+            break
+        match = re.fullmatch(r"\s+-\s+([^#]+?)(?:\s+#.*)?", raw)
+        if active and match:
+            values.append(match.group(1).strip().strip("\"'"))
+    return values or list(default)
+
+
 def dependency_links_from_config(path: Path) -> list[dict[str, str]]:
     if not path.is_file():
         return [{"type": "Blocks", "blocked_side": "inward"}]
-    lines, in_block, result, current = path.read_text().splitlines(), False, [], None
+    lines, in_block, saw_block, result, current = (
+        path.read_text().splitlines(),
+        False,
+        False,
+        [],
+        None,
+    )
     for raw in lines:
         if raw.startswith("sprint_dependency_links:"):
-            in_block = True
+            in_block = saw_block = True
             continue
         if not in_block:
             continue
@@ -496,39 +601,52 @@ def dependency_links_from_config(path: Path) -> list[dict[str, str]]:
             current["blocked_side"] = match.group(1)
     if current:
         result.append(current)
+    if not saw_block:
+        return [{"type": "Blocks", "blocked_side": "inward"}]
     if not result or any(set(item) != {"type", "blocked_side"} for item in result):
         raise ValueError("sprint_dependency_links must define type and blocked_side")
     return result
 
 
-def main() -> int:
+def parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inventory-template", required=True)
     parser.add_argument("--artifact", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--config", default=".orchestration/config.yaml")
-    parser.add_argument("--base-url", default=os.environ.get("JIRA_BASE_URL", ""))
-    parser.add_argument("--test-transport", help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    return parser
+
+
+def run_adapter(
+    args: argparse.Namespace,
+    *,
+    fetch_override: Fetch | None = None,
+    config_override: Path | None = None,
+) -> int:
     template = json.loads(Path(args.inventory_template).read_text())
-    config = Path(args.config)
+    config = (config_override or Path(".orchestration/config.yaml")).resolve()
+    project = ticket_project_from_config(config).upper()
+    sprint_policy = scalar_config(config, "sprint_id", "").strip()
+    base_url = scalar_config(config, "jira_base_url", "").strip()
+    if not project or not sprint_policy:
+        raise ValueError(
+            "ticket.project and sprint_id are required canonical Jira policy"
+        )
     sprint_field = scalar_config(config, "jira_sprint_field", "sprint")
-    fields = required_fields(sprint_field, jira_fields_from_config(config))
+    fields = required_fields(sprint_field)
     links = dependency_links_from_config(config)
+    priority_order = list_config(config, "jira_priority_order", DEFAULT_PRIORITY_ORDER)
     raw_dir = Path(args.artifact).resolve().parent / "jira-raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    if args.test_transport:
+    if fetch_override is not None:
         authority, approved = "test-only", "test-only"
-        fetch = fixture_fetch(
-            json.loads(Path(args.test_transport).read_text()), template
-        )
+        fetch = fetch_override
     else:
-        if not args.base_url:
-            raise ValueError("JIRA_BASE_URL is required")
+        if not base_url:
+            raise ValueError("jira_base_url is required canonical Jira policy")
         authority, approved, fetch = (
             "provider-network",
-            origin(args.base_url),
-            network_fetcher(args.base_url),
+            validate_base_url(base_url),
+            network_fetcher(base_url),
         )
     inventory, artifact = build_inventory(
         template,
@@ -539,6 +657,9 @@ def main() -> int:
         fields=fields,
         sprint_field=sprint_field,
         dependency_links=links,
+        project=project,
+        sprint_policy=sprint_policy,
+        priority_order=priority_order,
     )
     artifact_path = Path(args.artifact).resolve()
     write_json(artifact_path, artifact)
@@ -548,6 +669,23 @@ def main() -> int:
     inventory["fetch_artifact"] = {"path": str(artifact_path), "sha256": digest}
     write_json(Path(args.output), inventory)
     return 0
+
+
+def run_fixture_adapter(
+    argv: list[str], pages: dict[str, list[dict[str, Any]]], config: Path
+) -> int:
+    """In-process fixture seam; intentionally unreachable from the public CLI."""
+    args = parser().parse_args(argv)
+    template = json.loads(Path(args.inventory_template).read_text())
+    return run_adapter(
+        args,
+        fetch_override=fixture_fetch(pages, template),
+        config_override=config,
+    )
+
+
+def main() -> int:
+    return run_adapter(parser().parse_args())
 
 
 if __name__ == "__main__":
