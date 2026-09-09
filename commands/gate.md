@@ -26,7 +26,9 @@ Before each `code-reviewer` or `security-reviewer` launch, resolve its route wit
 agents; API routes use `context_pipeline.py payload --config ... --role <role>`
 and pipe it to `${CLAUDE_PLUGIN_ROOT}/scripts/api_agent.py run --request -
 --config .orchestration/config.yaml --role <role> --ticket <ticket> --run-id
-<stable-run-id>`. Desktop fallback is permitted only before provider
+<stable-run-id> --review-pr <pr> --review-authorization <token>`. Issue it first
+from the valid ledger phase with `review-ledger.py permit-review <pr>
+--role <role> --head <full-exact-head>`. Desktop fallback is permitted only before provider
 acknowledgement; a provider id, timeout after submission, or uncertain state
 must be reconciled and never duplicated.
 
@@ -47,6 +49,10 @@ must be reconciled and never duplicated.
    and the open component keys the reviewer must reuse. Without it a reviewer
    assumes round 1 and reviews with full blocking authority.
 
+   Keep `worker_trust_profile` from `.orchestration/config.yaml` fixed across
+   both reviews. It governs only orchestration workers versus the host and never
+   narrows application or tenant security.
+
 1. **Code review.** Launch the `orchestration-code-reviewer` agent (a FRESH
    agent, no implementer context) on the PR. Generate and pass the raw unified
    base-to-head git diff as its default and authoritative code input. Also pass
@@ -56,6 +62,10 @@ must be reconciled and never duplicated.
    the repo's review skill + self-checks, finish the full checklist/diff/adversarial
    matrix even after finding a blocker, then return only the concise structured
    review JSON. Explanations belong only to findings.
+   Each blocker must state a concrete failing input/precondition, production
+   path, wrong outcome/impact, and reproduction or exact falsifying assertion
+   under the configured profile. Stronger-profile hypotheticals are advisory;
+   they cannot silently turn this PR into host infrastructure work.
 
 2. **Security review.** Inspect the PR diff. If it touches any
    `security_required_when` trigger (auth, data isolation, migrations, payments,
@@ -68,8 +78,12 @@ must be reconciled and never duplicated.
    and advisory findings alike:
 
    ```bash
-   ${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py record <pr> --gate code-review \
+   ${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py complete-review <pr> \
+     --role code-reviewer --phase-permit <token> \
      --result .orchestration/.review-results/code-review.json
+   ${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py record <pr> --gate code-review \
+     --result .orchestration/.review-results/code-review.json --head <exact-sha> \
+     --phase-permit <token>
    ```
 
    The validated result carries blocking, advisory, severity, regression, and

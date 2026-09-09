@@ -117,6 +117,30 @@ other rather than against private copies of the limit. Reservations are included
 run, ticket, and sprint checks, preventing concurrent workers from racing past a
 shared limit. A request that could exceed any configured ceiling is not sent.
 
+Ticket controls are layered: `warn_usd_per_ticket` records an event without
+stopping work, `pause_usd_per_ticket` is a hard operator-action stop, and
+`max_usd_per_ticket` remains the hard ceiling. Unique run IDs are bounded by
+`max_model_runs_per_ticket` and `max_reviewer_runs_per_ticket`; tool rounds
+inside one run do not consume extra run slots. Repository configuration may
+tighten the compiled incident ceilings but cannot raise or disable them. There
+is deliberately no same-user CLI approval bypass.
+
+API reviewer runs require a review-ledger phase permit bound to the ledger's
+immutable repository work subject, role, PR/design ledger, and full exact commit:
+
+```text
+scripts/review-ledger.py permit-review 123 \
+  --role code-reviewer --head "$(git rev-parse HEAD)"
+# pass the returned token to api_agent.py run --review-pr 123 \
+#   --review-authorization <token>
+```
+
+Implementer and sprint-worker API routes also require `--attempt-capability`
+and `--worker-ref` exactly as returned and bound by `sprint-controller.py
+reserve`. Reviewer output is usable only after the API runner creates a
+digest-bound completion receipt; native reviewers use `review-ledger.py
+complete-review` after writing their structured result.
+
 After every response, actual uncached input, cache writes, cache reads, output,
 and reasoning usage is recorded under `.orchestration/.llm-usage/usage.jsonl`.
 Run `scripts/api_agent.py usage` for totals and open reservations.
@@ -133,8 +157,10 @@ request stays reconcilable after its worktree is cleaned up.
 
 Tool execution is unaffected and stays sandboxed to the lane's own worktree.
 
-Set `ORCHESTRATION_USAGE_ROOT` to point the ledger somewhere else explicitly --
-for example to hold several repositories to one budget. Outside a git
+Runtime state always resolves from Git's common directory. Environment overrides
+are intentionally ignored because selecting a fresh directory would reset every
+shared enforcement counter.
+Outside a git
 repository the ledger falls back to the `--repo` directory.
 
 ### Reading the ledger

@@ -38,9 +38,18 @@ Before each `code-reviewer` or `security-reviewer` pass, resolve its route with
 <role>`. Desktop routes use fresh native agents. API routes build their request
 with `context_pipeline.py payload --config ... --role <role>` and use the
 `api_agent.py run --request -` adapter with the ticket and a stable run id.
+First issue a phase permit from the durable ledger with `review-ledger.py
+permit-review <pr> --role <role> --head <full-exact-head>`;
+pass it to `run --review-pr <pr> --review-authorization <token>`. The ledger
+issues it only while that gate is the permitted next phase, and it cannot be
+reused. This is sequencing, not human authentication.
 Desktop fallback is allowed only before provider
 acknowledgement; submitted, timed-out, or uncertain work must be reconciled
 instead of duplicated.
+For a native desktop reviewer, write its final structured JSON first, then run
+`review-ledger.py complete-review <pr> --role <role>
+--phase-permit <token> --result <file>`. API execution creates the same
+completion receipt after successful provider output.
 
 1. Read `.orchestration/config.yaml` and run
    `orchestration-engine.py validate-config`. For `schema_version: 2`, use
@@ -48,6 +57,9 @@ instead of duplicated.
    configured gate or merge transition; branch roles, evidence, approvals, CI
    categories, and adapters come from that plan. For legacy configs, continue
    with the existing review gates below.
+   Keep the configured `worker_trust_profile` fixed for every reviewer. It
+   governs only worker-versus-host assumptions and never relaxes application,
+   tenant, client, ticket-input, or provider security.
 2. Open the durable review ledger and build this round's brief:
    `review-ledger.py open <pr>` then `review-ledger.py brief <pr>`. The
    failure ledger lives on disk, not in this conversation -- it survives
@@ -70,6 +82,10 @@ instead of duplicated.
    The reviewer must finish the full checklist, diff, and adversarial matrix even
    after finding a blocker, then return only concise structured review JSON.
    Explanations belong only to findings; each finding has a stable component key.
+   A blocker must name a concrete failing input/precondition, production path,
+   wrong outcome/impact, and reproduction or exact falsifying assertion under
+   the selected profile. Do not let a reviewer expand the PR into new host
+   infrastructure based only on a stronger, unconfigured threat model.
 4. Inspect the PR diff against `security_required_when` before launching the
    pair. If any trigger matches, run a fresh security-review pass using
    `orchestration-security-reviewer.md`
@@ -79,7 +95,8 @@ instead of duplicated.
 5. Wait for both launched reviewers, then record every completed gate through the
    ledger, blocking and advisory findings
    alike: `review-ledger.py record <pr> --gate code-review --result
-   .orchestration/.review-results/code-review.json`. The validated JSON carries
+   .orchestration/.review-results/code-review.json --head <exact-sha>
+   --phase-permit <token>`. The validated JSON carries
    disposition, severity, regression, and explanation. The ledger increments strikes, auto-resolves components this gate
    no longer reports, demotes out-of-scope new findings in a frozen round, and
    returns `next_action`. Its `effective_verdict` governs, not the claimed one.

@@ -17,9 +17,9 @@ four properties that kept pushing it away from that exit:
    unrelated surface to find something new in, every time.
 3. **No severity floor.** "There is no minor, merge anyway" made a note about
    premature abstraction as load-bearing as an IDOR.
-4. **A doubt rule calibrated for round 1**, applied identically at round 8: *a
-   false FAIL costs one loop; a false PASS ships a bug.* True the first time,
-   misleading the eighth.
+4. **Uncertainty treated as a defect.** A reviewer could spend a repair cycle on
+   a plausible concern without naming a failing input, production path, impact,
+   or falsifying assertion. The implementer then had no objective closure target.
 
 Together those make P(some blocking finding) roughly constant round over round.
 That is a process with no absorbing state, and 10+ rounds is its expected tail,
@@ -48,10 +48,12 @@ else serves.
   disabled tests, cross-surface disagreement, and root-cause suppression block.
   Dead weight, naming, and "while I was in here" are recorded and carried to the
   PR body. They are not discarded -- they are just not merge blockers.
-- **Round-aware doubt.** Rounds 1-2 keep block-on-doubt. From round 3 a false
-  FAIL no longer costs one loop, it costs every remaining one, so the reviewer
-  files uncertain findings as advisory and names the evidence that would settle
-  them.
+- **Evidence before blocking.** Every round investigates uncertainty, but a
+  blocker names the failing input/precondition, production path, wrong outcome
+  and impact, plus a reproduction or exact falsifying assertion. Incomplete
+  hypotheses are advisory and name the evidence that would settle them. Later
+  rounds remain even more conservative because a false FAIL can consume the last
+  repair opportunity.
 - **Keys that are derived, not invented.** The structured `component` value is
   the bare `<path>:<symbol>` key, with no `[component: ...]` wrapper. Line
   numbers are stripped (they drift on rebase) and free-text subsystem names are
@@ -118,6 +120,15 @@ The scope freeze narrows what the *code* reviewer may block on. It does not appl
 to `orchestration-security-reviewer`. A leak found in round 4 blocks exactly as
 hard as one found in round 1, and `record` never demotes a security-gate finding.
 Convergence is a scheduling concern; it is not a reason to ship a data leak.
+
+That exemption does not authorize threat-model expansion. The configured
+`worker_trust_profile` applies only to orchestration workers versus their host:
+`cooperative-worker` covers mistakes, crashes, loops, duplicate execution, and
+accidental misuse; `isolated-worker` requires independently owned process and
+credential boundaries. Application users, tenants, remote clients, ticket text,
+and provider responses remain untrusted under both profiles. A security blocker
+must identify a profile-relevant production path and closure evidence; a
+hypothetical stronger-profile concern is recorded as advisory.
 
 ## Tuning
 

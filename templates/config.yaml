@@ -26,6 +26,19 @@
 # explicitly migrate to schema_version: 2.
 schema_version: 1
 
+# --- Orchestration worker threat model ---------------------------------- agent
+# This governs only the boundary between an orchestration worker and its host.
+# It never relaxes application security for users, tenants, remote clients,
+# untrusted ticket text, or external services.
+#
+# cooperative-worker: workers may be wrong, crash, loop, overspend, or misuse an
+# API accidentally, but are not assumed to deliberately defeat same-UID host
+# controls. This is the portable default for ordinary repositories.
+# isolated-worker: workers may be hostile. The design must use an independently
+# owned boundary such as a separate UID/container and credential broker; a
+# same-UID helper or repository file cannot satisfy this profile.
+worker_trust_profile: cooperative-worker  # cooperative-worker | isolated-worker
+
 # --- LLM execution routing ---------------------------------------------- agent
 # Existing repositories remain on desktop execution unless they opt into API.
 # Provider/model/effort are used only by API routes. A role inherits every
@@ -48,8 +61,12 @@ llm:
   # worktree, so N concurrent lanes share one ceiling instead of getting N.
   budgets:
     max_usd_per_run: 1.00
+    warn_usd_per_ticket: 1.00     # event only; work continues
+    pause_usd_per_ticket: 1.50    # hard operator-action stop; no same-user CLI bypass
     max_usd_per_ticket: 2.00
     max_usd_per_sprint: 20.00
+    max_model_runs_per_ticket: 12 # unique run ids, not provider tool-round calls
+    max_reviewer_runs_per_ticket: 6
     max_output_tokens_per_turn: 4096
     max_tool_rounds: 8
     max_tool_output_chars: 12000
@@ -145,6 +162,10 @@ llm:
 # --- Branch model --------------------------------------------------------- both
 integration_branch: ""          # fill for schema v1, e.g. the branch feature work targets
 production_branch: ""           # fill for schema v1, e.g. the protected release/history target
+
+# Initial launch plus this many recovery launches are automatic. A later launch
+# stops for an operator policy change; a worker cannot self-approve a bypass.
+max_lane_relaunches: 2
 
 # --- Merge strategy per target -------------------------------------------- both
 merge_to_integration: merge     # merge | squash. `merge` preserves per-PR history
@@ -273,6 +294,21 @@ ticket:
 # blocked_side identifies the Jira API side occupied by the blocked ticket; the
 # issue on the opposite side is its prerequisite. Adjust for your Jira scheme.
 sprint_id: active
+# Canonical credential trust anchor. This must be repository policy, never a
+# caller-selected environment value.
+jira_base_url: ""
+# Jira Cloud commonly exposes sprint identity through a custom field such as
+# customfield_10020. Configure its exact REST field id here; the adapter derives
+# the checkpoint sprint id/name from this provider field, never from a template.
+jira_sprint_field: sprint
+# Canonical provider priority names, most urgent first. Jira numeric priority
+# ids are opaque record identifiers and are never used as ranks.
+jira_priority_order:
+  - Highest
+  - High
+  - Medium
+  - Low
+  - Lowest
 sprint_dependency_links:
   - type: Blocks
     blocked_side: inward       # inward | outward; Jira default "is blocked by"

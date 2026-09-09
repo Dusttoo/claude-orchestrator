@@ -17,16 +17,31 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
 import sys
 import tempfile
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 import context_pipeline
+from review_permit import (
+    ReviewPermitError,
+    complete as complete_review_permit,
+    consume_completion,
+    subject_ledger_candidates,
+)
+from runtime_state import (
+    RuntimeStateError,
+    canonical_config_path,
+    migrate_legacy_runtime_dir,
+    shared_repository_root,
+    working_repository_root,
+)
 
 
 SCHEMA_VERSION = 1
@@ -60,11 +75,7 @@ def emit(value: Any) -> None:
 
 
 def project_root() -> Path:
-    current = Path.cwd().resolve()
-    for candidate in (current, *current.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    return current
+    return working_repository_root(Path.cwd())
 
 
 def unquote(value: str) -> str:
@@ -129,6 +140,19 @@ def normalize_key(raw: str) -> str:
     return f"{path}:{symbol}" if symbol else path
 
 
+def resolve_alias(state: dict[str, Any], key: str) -> str:
+    """Resolve a persisted component alias to its canonical stable key."""
+    aliases = state.get("aliases", {})
+    seen: set[str] = set()
+    current = key
+    while current in aliases:
+        if current in seen:
+            raise LedgerError(f"component alias cycle includes {current}")
+        seen.add(current)
+        current = normalize_key(str(aliases[current]))
+    return current
+
+
 # --- state --------------------------------------------------------------------
 
 
@@ -179,13 +203,17 @@ def load(path: Path) -> dict[str, Any]:
     # resetting a live PR when v0.8 first writes it.
     if "repair_attempts" not in value:
         legacy_failures = [
-            entry for entry in value.get("rounds", []) if entry.get("effective_verdict") == "FAIL"
+            entry
+            for entry in value.get("rounds", [])
+            if entry.get("effective_verdict") == "FAIL"
         ]
         value["repair_attempts"] = [
             {
                 "attempt": index,
                 "recorded_at": entry.get("recorded_at", value.get("updated_at", now())),
-                "completed_at": entry.get("recorded_at", value.get("updated_at", now())),
+                "completed_at": entry.get(
+                    "recorded_at", value.get("updated_at", now())
+                ),
                 "head": "legacy-unknown",
                 "findings": [],
                 "open_before": entry.get("blocking", []),
@@ -199,6 +227,16 @@ def load(path: Path) -> dict[str, Any]:
         ]
         value["repair_pending_review"] = False
     value.setdefault("repair_pending_review", False)
+    value.setdefault("review_permits", [])
+    value.setdefault("review_generation", 1)
+    value.setdefault(
+        "work_subject",
+        {
+            "kind": "jira" if value.get("ticket") else "pr",
+            "id": str(value.get("ticket") or value.get("pr")),
+            "repository": str(shared_repository_root(project_root()).resolve()),
+        },
+    )
     value.setdefault(
         "design",
         {"max_rounds": DEFAULT_MAX_DESIGN_ROUNDS, "rounds": [], "escalated": False},
@@ -209,23 +247,114 @@ def load(path: Path) -> dict[str, Any]:
 def ledger_path(args: argparse.Namespace) -> Path:
     root = project_root()
     if args.ledger_dir:
-        directory = Path(args.ledger_dir)
-    else:
-        cfg = Path(args.config) if args.config else root / ".orchestration/config.yaml"
-        directory = Path(config_scalar(cfg, "review_ledger_dir", DEFAULT_LEDGER_DIR))
-    if not directory.is_absolute():
-        directory = root / directory
-    pr = re.sub(r"[^A-Za-z0-9_.-]", "-", str(args.pr)).strip("-")
-    if not pr:
-        raise LedgerError(f"invalid pr identifier: {args.pr!r}")
-    return directory / f"pr-{pr}.json"
-
-
-def positive_config_int(args: argparse.Namespace, cli_name: str, key: str, default: int) -> int:
-    override = getattr(args, cli_name, None)
-    cfg = Path(args.config) if args.config else project_root() / ".orchestration/config.yaml"
-    value = str(override) if override is not None else config_scalar(cfg, key, str(default))
+        raise LedgerError(
+            "--ledger-dir overrides are not allowed; use the canonical repository config"
+        )
     try:
+        cfg = canonical_config_path(root, args.config)
+        relative = Path(config_scalar(cfg, "review_ledger_dir", DEFAULT_LEDGER_DIR))
+        if relative.is_absolute():
+            raise LedgerError("review_ledger_dir must be repository-relative")
+        directory = migrate_legacy_runtime_dir(root, relative)
+    except RuntimeStateError as exc:
+        raise LedgerError(str(exc)) from exc
+    identifier = str(args.pr).strip()
+    if not identifier:
+        raise LedgerError(f"invalid pr identifier: {args.pr!r}")
+    explicit_kind = getattr(args, "work_kind", None)
+    default_kind = "design" if getattr(args, "command", "") == "design-open" else "pr"
+    requested = normalized_work_subject(
+        str(explicit_kind or default_kind),
+        str(getattr(args, "work_id", None) or identifier),
+    )
+
+    def canonical_path(subject: dict[str, str]) -> Path:
+        slug = (
+            re.sub(r"[^A-Za-z0-9_.-]", "-", subject["id"]).strip("-")[:48] or "subject"
+        )
+        encoded = json.dumps(
+            {"pr": identifier, "work_subject": subject},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return (
+            directory
+            / f"subject-{subject['kind']}-{slug}-{hashlib.sha256(encoded).hexdigest()[:20]}.json"
+        )
+
+    target = canonical_path(requested)
+    legacy_slug = re.sub(r"[^A-Za-z0-9_.-]", "-", identifier).strip("-")
+    legacy = directory / f"pr-{legacy_slug}.json"
+    if not target.exists() and legacy.exists():
+        legacy_state = load(legacy)
+        legacy_subject = legacy_state.get("work_subject")
+        explicit_subject = bool(
+            getattr(args, "work_kind", None) or getattr(args, "work_id", None)
+        )
+        if explicit_subject and legacy_subject != requested:
+            raise LedgerError(
+                "legacy review ledger subject is ambiguous; explicit migration is required"
+            )
+        if not explicit_subject:
+            if (
+                str(legacy_state.get("pr")) != identifier
+                or not isinstance(legacy_subject, dict)
+                or legacy_subject.get("repository") != requested["repository"]
+            ):
+                raise LedgerError(
+                    "legacy review ledger subject is ambiguous; explicit migration is required"
+                )
+            target = canonical_path(legacy_subject)
+        os.replace(legacy, target)
+    # Gate commands carry the PR id even when Jira owns the work subject. Locate
+    # by immutable state.pr, then enforce repository and any explicitly supplied
+    # subject. This also prevents a PR subject and Jira subject from colliding.
+    matches = subject_ledger_candidates(
+        directory, requested["repository"], identifier
+    )
+    explicit_subject = bool(
+        getattr(args, "work_kind", None) or getattr(args, "work_id", None)
+    )
+    exact = []
+    for candidate in matches:
+        try:
+            if load(candidate).get("work_subject") == requested:
+                exact.append(candidate)
+        except LedgerError:
+            continue
+    if explicit_subject:
+        if len(exact) == 1:
+            return exact[0]
+        if matches:
+            raise LedgerError(
+                "review ledger PR is already bound to a different immutable work subject"
+            )
+    elif len(matches) == 1:
+        return matches[0]
+    elif len(matches) > 1:
+        raise LedgerError(
+            "PR ledger is ambiguous; supply --work-kind and --work-id"
+        )
+    if target.exists():
+        return target
+    return target
+
+
+def positive_config_int(
+    args: argparse.Namespace, cli_name: str, key: str, default: int
+) -> int:
+    try:
+        cfg = canonical_config_path(project_root(), args.config)
+    except RuntimeStateError as exc:
+        raise LedgerError(str(exc)) from exc
+    configured = config_scalar(cfg, key, str(default))
+    override = getattr(args, cli_name, None)
+    try:
+        value = (
+            str(min(int(configured), int(override)))
+            if override is not None
+            else configured
+        )
         result = int(value)
     except ValueError as exc:
         raise LedgerError(f"{key} must be an integer, got {value!r}") from exc
@@ -235,33 +364,75 @@ def positive_config_int(args: argparse.Namespace, cli_name: str, key: str, defau
 
 
 def max_rounds_for(args: argparse.Namespace) -> int:
-    if getattr(args, "max_rounds", None):
-        value = str(args.max_rounds)
-    else:
-        cfg = Path(args.config) if args.config else project_root() / ".orchestration/config.yaml"
-        # max_review_rounds is the v0.7 compatibility alias. New repositories
-        # distinguish pre-code design rounds from post-code repair attempts.
-        value = config_scalar(cfg, "max_repair_cycles", "")
-        if not value:
-            value = config_scalar(cfg, "max_review_rounds", str(DEFAULT_MAX_REPAIR_CYCLES))
+    try:
+        cfg = canonical_config_path(project_root(), args.config)
+    except RuntimeStateError as exc:
+        raise LedgerError(str(exc)) from exc
+    value = config_scalar(cfg, "max_repair_cycles", "")
+    if not value:
+        value = config_scalar(cfg, "max_review_rounds", str(DEFAULT_MAX_REPAIR_CYCLES))
+    if getattr(args, "max_rounds", None) is not None:
+        value = str(min(int(value), int(args.max_rounds)))
     try:
         rounds = int(value)
     except ValueError as exc:
-        raise LedgerError(f"max_repair_cycles must be an integer, got {value!r}") from exc
+        raise LedgerError(
+            f"max_repair_cycles must be an integer, got {value!r}"
+        ) from exc
     if rounds < 1:
         raise LedgerError(f"max_repair_cycles must be >= 1, got {rounds}")
     return rounds
 
 
-def new_state(pr: str, max_rounds: int) -> dict[str, Any]:
+def normalized_work_subject(kind: str, identifier: str) -> dict[str, str]:
+    value = str(identifier).strip()
+    if not value:
+        raise LedgerError("work subject id must not be empty")
+    if kind == "jira":
+        value = value.upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*-[0-9]+", value):
+            raise LedgerError("Jira work subject id must be a canonical Jira key")
+    elif kind == "pr":
+        value = re.sub(r"\s+", " ", value)
+    elif kind == "design":
+        value = re.sub(r"\s+", " ", value)
+    else:
+        raise LedgerError(f"unsupported work subject kind: {kind}")
+    return {
+        "kind": kind,
+        "id": value,
+        "repository": str(shared_repository_root(project_root()).resolve()),
+    }
+
+
+def requested_work_subject(
+    args: argparse.Namespace, default_kind: str
+) -> dict[str, str]:
+    return normalized_work_subject(
+        str(getattr(args, "work_kind", None) or default_kind),
+        str(getattr(args, "work_id", None) or args.pr),
+    )
+
+
+def bind_work_subject(state: dict[str, Any], requested: dict[str, str]) -> None:
+    current = state.get("work_subject")
+    if current is not None and current != requested:
+        raise LedgerError(f"review ledger work subject is immutable: {current}")
+    state["work_subject"] = requested
+
+
+def new_state(pr: str, max_rounds: int, work_subject: dict[str, str]) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "pr": str(pr),
         "created_at": now(),
         "updated_at": now(),
         "max_rounds": max_rounds,
+        "work_subject": work_subject,
         "repair_attempts": [],
         "repair_pending_review": False,
+        "review_permits": [],
+        "review_generation": 1,
         "design": {
             "max_rounds": DEFAULT_MAX_DESIGN_ROUNDS,
             "rounds": [],
@@ -296,7 +467,9 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
     if "repair_attempts" in state:
         fix_cycles = len(state["repair_attempts"])
     else:
-        fix_cycles = sum(1 for entry in state["rounds"] if entry["effective_verdict"] == "FAIL")
+        fix_cycles = sum(
+            1 for entry in state["rounds"] if entry["effective_verdict"] == "FAIL"
+        )
     blocking = sorted(c["key"] for c in open_components(state))
     pending = sorted(c["key"] for c in redesign_pending(state))
 
@@ -304,8 +477,11 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
     for entry in state["rounds"]:
         gate_verdicts[entry["gate"]] = entry["effective_verdict"]
     pending_review = bool(state.get("repair_pending_review"))
-    gates_clear = not pending_review and bool(gate_verdicts) and not blocking and all(
-        verdict == "PASS" for verdict in gate_verdicts.values()
+    gates_clear = (
+        not pending_review
+        and bool(gate_verdicts)
+        and not blocking
+        and all(verdict == "PASS" for verdict in gate_verdicts.values())
     )
 
     cap_reached = not pending_review and fix_cycles >= max_rounds and bool(blocking)
@@ -326,7 +502,9 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
         "fix_cycles": fix_cycles,
         "fix_cycles_remaining": max(0, max_rounds - fix_cycles),
         "next_scope_mode": FULL if next_round == 1 else FROZEN,
-        "uncertainty_rule": "block-on-doubt" if fix_cycles == 0 else "advisory-on-doubt",
+        "uncertainty_rule": "investigate-on-doubt"
+        if fix_cycles == 0
+        else "advisory-on-doubt",
         "open_blocking": blocking,
         "redesign_required": pending,
         "gate_verdicts": gate_verdicts,
@@ -342,29 +520,38 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
 def cmd_open(args: argparse.Namespace) -> None:
     path = ledger_path(args)
     rounds = max_rounds_for(args)
+    subject = requested_work_subject(args, "pr")
     with locked(path):
         if path.exists():
             state = load(path)
-            if getattr(args, "max_rounds", None):
-                state["max_rounds"] = rounds
-            if getattr(args, "max_design_rounds", None):
-                _design_state(
-                    state,
-                    positive_config_int(
-                        args, "max_design_rounds", "max_design_rounds", DEFAULT_MAX_DESIGN_ROUNDS
-                    ),
-                )
+            bind_work_subject(state, subject)
+            # Existing caps are immutable from worker-facing CLI syntax.
+            state["max_rounds"] = min(int(state.get("max_rounds", rounds)), rounds)
+            _design_state(state)["max_rounds"] = min(
+                int(_design_state(state)["max_rounds"]),
+                positive_config_int(
+                    args,
+                    "max_design_rounds",
+                    "max_design_rounds",
+                    DEFAULT_MAX_DESIGN_ROUNDS,
+                ),
+            )
             save(path, state)
         else:
-            state = new_state(args.pr, rounds)
+            state = new_state(args.pr, rounds, subject)
             state["design"]["max_rounds"] = positive_config_int(
-                args, "max_design_rounds", "max_design_rounds", DEFAULT_MAX_DESIGN_ROUNDS
+                args,
+                "max_design_rounds",
+                "max_design_rounds",
+                DEFAULT_MAX_DESIGN_ROUNDS,
             )
             save(path, state)
         emit({"ledger": str(path), **decide(state)})
 
 
-def _component(state: dict[str, Any], key: str, raw: str, round_no: int) -> dict[str, Any]:
+def _component(
+    state: dict[str, Any], key: str, raw: str, round_no: int
+) -> dict[str, Any]:
     component = state["components"].get(key)
     if component is None:
         component = {
@@ -375,19 +562,86 @@ def _component(state: dict[str, Any], key: str, raw: str, round_no: int) -> dict
             "first_round": round_no,
             "rounds": [],
             "gates": [],
+            "claims": {},
             "redesigned_at_strike": 0,
             "repair_failures": 0,
             "redesigned_at_repair_failure": 0,
         }
         state["components"][key] = component
+    if not isinstance(component.get("claims"), dict):
+        component["claims"] = {}
+    if not component["claims"] and component.get("gates"):
+        component["claims"].update(
+            {
+            gate: {
+                "status": component.get("status", "open"),
+                "last_round": component.get("last_round", round_no),
+                "generation": component.get("review_generation", 1),
+            }
+            for gate in component.get("gates", [])
+            }
+        )
     return component
+
+
+def apply_gate_claims(
+    state: dict[str, Any],
+    *,
+    gate: str,
+    accepted: list[tuple[str, str]],
+    finding_details: dict[str, dict[str, Any]],
+    round_no: int,
+) -> list[str]:
+    """Atomically apply one gate's claims without disturbing other owners."""
+    accepted_keys = {key for key, _ in accepted}
+    for key, raw in accepted:
+        component = _component(state, key, raw, round_no)
+        component["strikes"] += 1
+        component["status"] = "open"
+        component["display"] = raw.strip()
+        component["last_round"] = round_no
+        component["rounds"].append(round_no)
+        if key in finding_details:
+            component["finding"] = finding_details[key]
+        if gate not in component["gates"]:
+            component["gates"].append(gate)
+        component["claims"][gate] = {
+            "status": "open",
+            "last_round": round_no,
+            "generation": state.get("review_generation", 1),
+        }
+
+    resolved: list[str] = []
+    for key, component in state["components"].items():
+        claims = _component(state, key, component.get("display", key), round_no)[
+            "claims"
+        ]
+        claim = claims.get(gate)
+        if claim and claim.get("status") == "open" and key not in accepted_keys:
+            claim.update(
+                {
+                    "status": "resolved",
+                    "resolved_round": round_no,
+                    "resolved_generation": state.get("review_generation", 1),
+                }
+            )
+        aggregate_open = any(item.get("status") == "open" for item in claims.values())
+        was_open = component.get("status") == "open"
+        component["status"] = "open" if aggregate_open else "resolved"
+        if was_open and not aggregate_open:
+            component["resolved_round"] = round_no
+            component["resolved_by_gate"] = gate
+            resolved.append(key)
+    return resolved
 
 
 def cmd_record(args: argparse.Namespace) -> None:
     finding_details: dict[str, dict[str, Any]] = {}
     if args.result:
         if args.verdict or args.blocking or args.advisory or args.regression:
-            raise LedgerError("--result cannot be combined with manual verdict or finding flags")
+            raise LedgerError(
+                "--result cannot be combined with manual verdict or finding flags"
+            )
         try:
             structured = json.loads(Path(args.result).read_text(encoding="utf-8"))
             context_pipeline.validate_review_output(structured, args.gate)
@@ -395,11 +649,13 @@ def cmd_record(args: argparse.Namespace) -> None:
             raise LedgerError(f"invalid structured review result: {exc}") from exc
         args.verdict = structured["verdict"]
         args.blocking = [
-            item["component"] for item in structured["findings"]
+            item["component"]
+            for item in structured["findings"]
             if item["disposition"] == "blocking"
         ]
         args.advisory = [
-            item["component"] for item in structured["findings"]
+            item["component"]
+            for item in structured["findings"]
             if item["disposition"] == "advisory"
         ]
         args.regression = [
@@ -410,9 +666,33 @@ def cmd_record(args: argparse.Namespace) -> None:
         }
     elif not args.verdict:
         raise LedgerError("record requires either --result or --verdict")
+    elif args.verdict == "PASS":
+        raise LedgerError(
+            "review PASS requires a structured --result and completion receipt"
+        )
     path = ledger_path(args)
     with locked(path):
         state = load(path)
+        if args.result:
+            role = {
+                "code-review": "code-reviewer",
+                "security-review": "security-reviewer",
+            }.get(args.gate)
+            if not role or not args.phase_permit or not args.head:
+                raise LedgerError(
+                    "structured review record requires --phase-permit and exact --head"
+                )
+            if not consume_completion(
+                state,
+                token=args.phase_permit,
+                role=role,
+                head=args.head,
+                result=structured,
+                timestamp=now(),
+            ):
+                raise LedgerError(
+                    "review result lacks a matching single-use provider completion receipt"
+                )
         plan = decide(state)
         if plan["next_action"] == ACTION_ESCALATE:
             raise LedgerError(
@@ -431,56 +711,80 @@ def cmd_record(args: argparse.Namespace) -> None:
         # The security gate never loses blocking authority to the scope freeze: a
         # data leak found late is not a process nit.
         exempt = args.gate == "security-review"
-        regressions = {normalize_key(k) for k in args.regression}
+        finding_details = {
+            resolve_alias(state, key): value for key, value in finding_details.items()
+        }
+        regressions = {
+            resolve_alias(state, normalize_key(k)) for k in args.regression
+        }
 
         accepted: list[tuple[str, str]] = []
         demoted: list[tuple[str, str]] = []
+        accepted_seen: set[str] = set()
         for raw in args.blocking:
-            key = normalize_key(raw)
+            key = resolve_alias(state, normalize_key(raw))
             known = key in state["components"]
             if scope == FULL or known or key in regressions or exempt:
-                accepted.append((key, raw))
+                if key not in accepted_seen:
+                    accepted.append((key, raw))
+                    accepted_seen.add(key)
             else:
                 demoted.append((key, raw))
 
         accepted_keys = {key for key, _ in accepted}
-        for key, raw in accepted:
-            component = _component(state, key, raw, round_no)
-            component["strikes"] += 1
-            component["status"] = "open"
-            component["display"] = raw.strip()
-            component["last_round"] = round_no
-            component["rounds"].append(round_no)
-            if key in finding_details:
-                component["finding"] = finding_details[key]
-            if args.gate not in component["gates"]:
-                component["gates"].append(args.gate)
-
-        # A completed re-run of the same gate that no longer reports an open
-        # component is the evidence that it was fixed. This is what shrinks the
-        # blocking set round over round.
-        resolved: list[str] = []
-        for key, component in state["components"].items():
-            if (
-                component["status"] == "open"
-                and args.gate in component["gates"]
-                and key not in accepted_keys
-            ):
-                component["status"] = "resolved"
-                component["resolved_round"] = round_no
-                component["resolved_by_gate"] = args.gate
-                resolved.append(key)
+        pending_attempt = (
+            state["repair_attempts"][-1]
+            if state.get("repair_pending_review") and state.get("repair_attempts")
+            else None
+        )
+        if pending_attempt is not None:
+            staged = pending_attempt.setdefault("gate_claims", {})
+            if args.gate in staged:
+                raise LedgerError(
+                    f"gate {args.gate} already recorded for review generation "
+                    f"{state.get('review_generation', 1)}"
+                )
+            staged[args.gate] = {
+                "round": round_no,
+                "accepted": [
+                    {
+                        "key": key,
+                        "display": raw,
+                        **(
+                            {"finding": finding_details[key]}
+                            if key in finding_details
+                            else {}
+                        ),
+                    }
+                    for key, raw in accepted
+                ],
+            }
+            resolved = []
+        else:
+            resolved = apply_gate_claims(
+                state,
+                gate=args.gate,
+                accepted=accepted,
+                finding_details=finding_details,
+                round_no=round_no,
+            )
 
         advisories = [
             {
-                "key": normalize_key(raw), "display": raw.strip(),
+                "key": resolve_alias(state, normalize_key(raw)),
+                "display": raw.strip(),
                 "reason": "reported-advisory",
-                **({"finding": finding_details[normalize_key(raw)]} if normalize_key(raw) in finding_details else {}),
+                **(
+                    {"finding": finding_details[resolve_alias(state, normalize_key(raw))]}
+                    if resolve_alias(state, normalize_key(raw)) in finding_details
+                    else {}
+                ),
             }
             for raw in args.advisory
         ] + [
             {
-                "key": key, "display": raw.strip(),
+                "key": key,
+                "display": raw.strip(),
                 "reason": "out-of-scope-in-frozen-round",
                 **({"finding": finding_details[key]} if key in finding_details else {}),
             }
@@ -538,16 +842,27 @@ def _load_repair_report(path: str) -> dict[str, Any]:
         report = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise LedgerError(f"cannot read repair report: {exc}") from exc
-    if set(report) != {"schema_version", "head", "findings"} or report.get("schema_version") != 1:
-        raise LedgerError("repair report requires exactly schema_version=1, head, and findings")
-    if not isinstance(report["head"], str) or not re.fullmatch(r"[0-9a-fA-F]{7,64}", report["head"]):
-        raise LedgerError("repair report head must be a 7-64 character hexadecimal commit id")
+    if (
+        set(report) != {"schema_version", "head", "findings"}
+        or report.get("schema_version") != 1
+    ):
+        raise LedgerError(
+            "repair report requires exactly schema_version=1, head, and findings"
+        )
+    if not isinstance(report["head"], str) or not re.fullmatch(
+        r"[0-9a-fA-F]{7,64}", report["head"]
+    ):
+        raise LedgerError(
+            "repair report head must be a 7-64 character hexadecimal commit id"
+        )
     if not isinstance(report["findings"], list) or not report["findings"]:
         raise LedgerError("repair report findings must be a non-empty array")
     required = {"component", "status", "root_cause", "change", "verification"}
     for item in report["findings"]:
         if not isinstance(item, dict) or set(item) != required:
-            raise LedgerError(f"each repair finding requires exactly: {', '.join(sorted(required))}")
+            raise LedgerError(
+                f"each repair finding requires exactly: {', '.join(sorted(required))}"
+            )
         if item["status"] not in {"closed", "unresolved"}:
             raise LedgerError("repair finding status must be closed or unresolved")
         for key in ("component", "root_cause", "change", "verification"):
@@ -576,7 +891,9 @@ def cmd_repair_brief(args: argparse.Namespace) -> None:
         finding = component.get("finding")
         if finding:
             lines.append(f"  {finding['title']}: {finding['explanation']}")
-        lines.append("  Closure must be demonstrated by a named regression test or equivalent evidence.")
+        lines.append(
+            "  Closure must be demonstrated by a named regression test or equivalent evidence."
+        )
     lines += [
         "",
         "The report schema is:",
@@ -593,11 +910,19 @@ def cmd_record_repair(args: argparse.Namespace) -> None:
     report = _load_repair_report(args.report)
     with locked(path):
         state = load(path)
+        state.setdefault("review_generation", 1)
         plan = decide(state)
         if state.get("repair_pending_review"):
-            raise LedgerError("the previous repair is still waiting for its complete review set")
-        if plan["next_action"] == ACTION_ESCALATE or plan["fix_cycles"] >= plan["max_rounds"]:
-            raise LedgerError("the repair budget is spent; render handoff instead of starting another repair")
+            raise LedgerError(
+                "the previous repair is still waiting for its complete review set"
+            )
+        if (
+            plan["next_action"] == ACTION_ESCALATE
+            or plan["fix_cycles"] >= plan["max_rounds"]
+        ):
+            raise LedgerError(
+                "the repair budget is spent; render handoff instead of starting another repair"
+            )
         open_keys = set(plan["open_blocking"])
         report_keys = [normalize_key(item["component"]) for item in report["findings"]]
         if len(report_keys) != len(set(report_keys)):
@@ -605,7 +930,9 @@ def cmd_record_repair(args: argparse.Namespace) -> None:
         if set(report_keys) != open_keys:
             missing = sorted(open_keys - set(report_keys))
             extra = sorted(set(report_keys) - open_keys)
-            raise LedgerError(f"repair report must cover the exact open set; missing={missing}, extra={extra}")
+            raise LedgerError(
+                f"repair report must cover the exact open set; missing={missing}, extra={extra}"
+            )
         gate_verdicts = decide(state)["gate_verdicts"]
         attempt = {
             "attempt": len(state.setdefault("repair_attempts", [])) + 1,
@@ -620,9 +947,24 @@ def cmd_record_repair(args: argparse.Namespace) -> None:
             "reviewed_gates": [],
         }
         state["repair_attempts"].append(attempt)
+        state["review_generation"] += 1
+        superseded_at = now()
+        for permit in state.get("review_permits", []):
+            if (
+                permit.get("review_generation", 1) < state["review_generation"]
+                and not permit.get("receipt_consumed_at")
+            ):
+                permit["superseded_at"] = superseded_at
+                permit["superseded_by_generation"] = state["review_generation"]
         state["repair_pending_review"] = True
         save(path, state)
-        emit({"repair_recorded": attempt["attempt"], "head": attempt["head"], **decide(state)})
+        emit(
+            {
+                "repair_recorded": attempt["attempt"],
+                "head": attempt["head"],
+                **decide(state),
+            }
+        )
 
 
 def cmd_complete_repair_review(args: argparse.Namespace) -> None:
@@ -632,9 +974,34 @@ def cmd_complete_repair_review(args: argparse.Namespace) -> None:
         if not state.get("repair_pending_review") or not state.get("repair_attempts"):
             raise LedgerError("no repaired head is awaiting review completion")
         attempt = state["repair_attempts"][-1]
-        missing = sorted(set(attempt["required_gates"]) - set(attempt["reviewed_gates"]))
+        missing = sorted(
+            set(attempt["required_gates"]) - set(attempt["reviewed_gates"])
+        )
         if missing:
-            raise LedgerError(f"repair review is incomplete; missing gates: {', '.join(missing)}")
+            raise LedgerError(
+                f"repair review is incomplete; missing gates: {', '.join(missing)}"
+            )
+        for gate in attempt["required_gates"]:
+            staged = attempt.get("gate_claims", {}).get(gate)
+            if not staged:
+                raise LedgerError(f"repair review has no staged claims for gate: {gate}")
+            accepted = [
+                (str(item["key"]), str(item["display"]))
+                for item in staged.get("accepted", [])
+            ]
+            details = {
+                str(item["key"]): item["finding"]
+                for item in staged.get("accepted", [])
+                if "finding" in item
+            }
+            apply_gate_claims(
+                state,
+                gate=gate,
+                accepted=accepted,
+                finding_details=details,
+                round_no=int(staged["round"]),
+            )
+        attempt["claims_finalized_at"] = now()
         remaining = {item["key"] for item in open_components(state)}
         attempt["open_after"] = sorted(remaining)
         attempt["closed"] = sorted(set(attempt["open_before"]) - remaining)
@@ -653,49 +1020,71 @@ def cmd_metrics(args: argparse.Namespace) -> None:
     attempts = state.get("repair_attempts", [])
     total_initial = len(attempts[0]["open_before"]) if attempts else 0
     first_closed = len(attempts[0].get("closed", [])) if attempts else 0
-    all_closed = len(set().union(*(set(item.get("closed", [])) for item in attempts))) if attempts else 0
+    all_closed = (
+        len(set().union(*(set(item.get("closed", [])) for item in attempts)))
+        if attempts
+        else 0
+    )
+
     def elapsed(start: str | None, end: str | None) -> float | None:
         if not start or not end:
             return None
-        return round((datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds(), 3)
+        return round(
+            (
+                datetime.fromisoformat(end) - datetime.fromisoformat(start)
+            ).total_seconds(),
+            3,
+        )
 
     repair_durations = [
         elapsed(item.get("recorded_at"), item.get("completed_at")) for item in attempts
     ]
     design_rounds = state.get("design", {}).get("rounds", [])
-    emit({
-        "pr": state["pr"],
-        "review_passes": len(state["rounds"]),
-        "repair_attempts": len(attempts),
-        "initial_blocking_findings": total_initial,
-        "first_repair_closure_rate": (first_closed / total_initial) if total_initial else None,
-        "cumulative_repair_closure_rate": (all_closed / total_initial) if total_initial else None,
-        "no_op_repairs": sum(1 for item in attempts if not item.get("closed")),
-        "repair_review_seconds": repair_durations,
-        "design_rounds": len(design_rounds),
-        "design_elapsed_seconds": elapsed(
-            design_rounds[0].get("recorded_at") if design_rounds else None,
-            design_rounds[-1].get("recorded_at") if design_rounds else None,
-        ),
-        "review_elapsed_seconds": elapsed(
-            state["rounds"][0].get("recorded_at") if state["rounds"] else None,
-            state["rounds"][-1].get("recorded_at") if state["rounds"] else None,
-        ),
-        "new_blocking_after_round_one": sum(
-            1
-            for entry in state["rounds"]
-            if entry["scope_mode"] == FROZEN
-            for key in entry["blocking"]
-            if state["components"].get(key, {}).get("first_round") == entry["round"]
-        ),
-        "open_blocking": decide(state)["open_blocking"],
-    })
+    emit(
+        {
+            "pr": state["pr"],
+            "review_passes": len(state["rounds"]),
+            "repair_attempts": len(attempts),
+            "initial_blocking_findings": total_initial,
+            "first_repair_closure_rate": (first_closed / total_initial)
+            if total_initial
+            else None,
+            "cumulative_repair_closure_rate": (all_closed / total_initial)
+            if total_initial
+            else None,
+            "no_op_repairs": sum(1 for item in attempts if not item.get("closed")),
+            "repair_review_seconds": repair_durations,
+            "design_rounds": len(design_rounds),
+            "design_elapsed_seconds": elapsed(
+                design_rounds[0].get("recorded_at") if design_rounds else None,
+                design_rounds[-1].get("recorded_at") if design_rounds else None,
+            ),
+            "review_elapsed_seconds": elapsed(
+                state["rounds"][0].get("recorded_at") if state["rounds"] else None,
+                state["rounds"][-1].get("recorded_at") if state["rounds"] else None,
+            ),
+            "new_blocking_after_round_one": sum(
+                1
+                for entry in state["rounds"]
+                if entry["scope_mode"] == FROZEN
+                for key in entry["blocking"]
+                if state["components"].get(key, {}).get("first_round") == entry["round"]
+            ),
+            "open_blocking": decide(state)["open_blocking"],
+        }
+    )
 
 
-def _design_state(state: dict[str, Any], max_rounds: int | None = None) -> dict[str, Any]:
+def _design_state(
+    state: dict[str, Any], max_rounds: int | None = None
+) -> dict[str, Any]:
     design = state.setdefault(
         "design",
-        {"max_rounds": max_rounds or DEFAULT_MAX_DESIGN_ROUNDS, "rounds": [], "escalated": False},
+        {
+            "max_rounds": max_rounds or DEFAULT_MAX_DESIGN_ROUNDS,
+            "rounds": [],
+            "escalated": False,
+        },
     )
     if max_rounds is not None:
         design["max_rounds"] = max_rounds
@@ -726,21 +1115,130 @@ def cmd_design_open(args: argparse.Namespace) -> None:
     design_rounds = positive_config_int(
         args, "max_design_rounds", "max_design_rounds", DEFAULT_MAX_DESIGN_ROUNDS
     )
+    subject = requested_work_subject(args, "design")
     with locked(path):
-        state = load(path) if path.exists() else new_state(args.pr, rounds)
-        _design_state(state, design_rounds)
+        existed = path.exists()
+        state = load(path) if existed else new_state(args.pr, rounds, subject)
+        bind_work_subject(state, subject)
+        design = _design_state(state)
+        design["max_rounds"] = min(
+            int(design.get("max_rounds", design_rounds)), design_rounds
+        )
         save(path, state)
         emit({"ledger": str(path), **_design_plan(state)})
 
 
 def cmd_design_record(args: argparse.Namespace) -> None:
+    artifact: dict[str, Any] | None = None
+    if args.result:
+        if args.verdict or args.evidence:
+            raise LedgerError("--result cannot be combined with manual design fields")
+        try:
+            artifact = json.loads(Path(args.result).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise LedgerError(f"invalid design result: {exc}") from exc
+        required = {
+            "schema_version",
+            "gate",
+            "verdict",
+            "source_sha",
+            "artifact",
+            "artifact_sha256",
+            "checks",
+            "phase_permit",
+        }
+        if set(artifact) != required or artifact.get("schema_version") != 1:
+            raise LedgerError(
+                "design result requires exactly schema_version=1, gate, verdict, source_sha, artifact, checks"
+            )
+        if artifact.get("gate") != "design-review" or artifact.get("verdict") not in {
+            "PASS",
+            "FAIL",
+        }:
+            raise LedgerError("design result gate/verdict is invalid")
+        if not re.fullmatch(
+            r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})",
+            str(artifact.get("source_sha") or ""),
+        ):
+            raise LedgerError("design result source_sha must be a full commit id")
+        if (
+            not str(artifact.get("artifact") or "").strip()
+            or not isinstance(artifact.get("checks"), list)
+            or not artifact["checks"]
+        ):
+            raise LedgerError(
+                "design result requires a named artifact and non-empty checks"
+            )
+        if any(
+            not isinstance(item, dict) or item.get("status") not in {"pass", "fail"}
+            for item in artifact["checks"]
+        ):
+            raise LedgerError("every design check requires status pass or fail")
+        if artifact["verdict"] == "PASS" and any(
+            item["status"] != "pass" for item in artifact["checks"]
+        ):
+            raise LedgerError("design PASS contradicts a failed check")
+        try:
+            actual_head = (
+                subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=project_root(),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                .stdout.strip()
+                .lower()
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise LedgerError(
+                "cannot verify design result against repository HEAD"
+            ) from exc
+        if actual_head != str(artifact["source_sha"]).lower():
+            raise LedgerError(
+                f"design result source {artifact['source_sha']} does not match current HEAD {actual_head}"
+            )
+        artifact_path = (project_root() / str(artifact["artifact"])).resolve()
+        root = project_root()
+        if artifact_path != root and root not in artifact_path.parents:
+            raise LedgerError("design artifact escapes the repository")
+        if not artifact_path.is_file():
+            raise LedgerError("design artifact must be an existing repository file")
+        digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        if artifact.get("artifact_sha256") != digest:
+            raise LedgerError(
+                "design artifact digest does not match the reviewed artifact"
+            )
+        args.verdict = artifact["verdict"]
+        args.evidence = artifact["artifact"]
+    elif args.verdict == "PASS":
+        raise LedgerError(
+            "design PASS requires a machine-readable --result bound to source_sha"
+        )
+    elif not args.verdict or not args.evidence:
+        raise LedgerError(
+            "design FAIL requires --verdict and --evidence, or use --result"
+        )
     path = ledger_path(args)
     with locked(path):
         state = load(path)
+        if artifact and not consume_completion(
+            state,
+            token=str(artifact["phase_permit"]),
+            role="design-reviewer",
+            head=str(artifact["source_sha"]),
+            result=artifact,
+            timestamp=now(),
+        ):
+            raise LedgerError(
+                "design result lacks a matching single-use reviewer completion receipt"
+            )
         design = _design_state(state)
         plan = _design_plan(state)
         if plan["next_action"] == ACTION_ESCALATE:
-            raise LedgerError("the design-round budget is spent; hand off instead of running another round")
+            raise LedgerError(
+                "the design-round budget is spent; hand off instead of running another round"
+            )
         if plan["next_action"] == "implement":
             raise LedgerError("the design gate already passed")
         design["rounds"].append(
@@ -748,6 +1246,7 @@ def cmd_design_record(args: argparse.Namespace) -> None:
                 "round": len(design["rounds"]) + 1,
                 "verdict": args.verdict,
                 "evidence": args.evidence,
+                **({"result": artifact} if artifact else {}),
                 "recorded_at": now(),
             }
         )
@@ -769,7 +1268,9 @@ def cmd_design_handoff(args: argparse.Namespace) -> None:
         "## Round history",
     ]
     for item in design["rounds"]:
-        lines.append(f"- Round {item['round']}: {item['verdict']} -- {item['evidence']}")
+        lines.append(
+            f"- Round {item['round']}: {item['verdict']} -- {item['evidence']}"
+        )
     print("\n".join(lines))
 
 
@@ -782,10 +1283,17 @@ def cmd_status(args: argparse.Namespace) -> None:
             "gates": component["gates"],
             "rounds": component["rounds"],
             "display": component["display"],
+            "claims": component.get("claims", {}),
         }
         for key, component in sorted(state["components"].items())
     }
-    emit({**decide(state), "components": components})
+    emit(
+        {
+            **decide(state),
+            "work_subject": state["work_subject"],
+            "components": components,
+        }
+    )
 
 
 def cmd_brief(args: argparse.Namespace) -> None:
@@ -818,8 +1326,11 @@ def cmd_brief(args: argparse.Namespace) -> None:
             "report it for the PR body, but it does not FAIL this gate.",
         ]
     doubt = (
-        "When unsure whether something is a real defect, treat it as BLOCKING."
-        if plan["uncertainty_rule"] == "block-on-doubt"
+        "Investigate uncertainty before the verdict. Block only with a concrete "
+        "failing input or precondition, production path, wrong outcome and impact, "
+        "plus a reproduction or exact falsifying assertion. If that evidence "
+        "remains incomplete, file it as ADVISORY and name what would settle it."
+        if plan["uncertainty_rule"] == "investigate-on-doubt"
         else (
             f"This is fix cycle {plan['fix_cycles'] + 1}. A false FAIL no longer costs one loop -- it costs\n"
             "the next one too. When unsure whether something is a real defect, file it as\n"
@@ -832,7 +1343,9 @@ def cmd_brief(args: argparse.Namespace) -> None:
     if open_list:
         lines.append("OPEN LEDGER COMPONENTS (reuse these exact keys):")
         for component in sorted(open_list, key=lambda c: c["key"]):
-            mark = "  [REDESIGN REQUIRED]" if component in redesign_pending(state) else ""
+            mark = (
+                "  [REDESIGN REQUIRED]" if component in redesign_pending(state) else ""
+            )
             lines.append(
                 f"  - `{component['key']}` strikes={component['strikes']}"
                 f" gates={','.join(component['gates'])}{mark}"
@@ -884,7 +1397,11 @@ def cmd_handoff(args: argparse.Namespace) -> None:
         lines.append(
             f"- Round {entry['round']} ({entry['gate']}, {entry['scope_mode']}): "
             f"{entry['effective_verdict']}"
-            + (f" -- resolved {', '.join(entry['resolved'])}" if entry["resolved"] else "")
+            + (
+                f" -- resolved {', '.join(entry['resolved'])}"
+                if entry["resolved"]
+                else ""
+            )
         )
     attempts = state.get("repair_attempts", [])
     if attempts:
@@ -961,22 +1478,62 @@ def cmd_alias(args: argparse.Namespace) -> None:
     with locked(path):
         state = load(path)
         source = normalize_key(args.source)
-        target = normalize_key(args.target)
+        target = resolve_alias(state, normalize_key(args.target))
         if source == target:
             raise LedgerError("alias source and target normalize to the same key")
         if source not in state["components"]:
             raise LedgerError(f"no such component on the ledger: {source}")
+        # Materialize legacy gate ownership before either component is removed
+        # or combined. Old ledgers recorded `gates` without per-gate claims.
+        _component(
+            state,
+            source,
+            state["components"][source].get("display", args.source),
+            int(state["components"][source].get("last_round", 1)),
+        )
         merged = state["components"].pop(source)
         canonical = _component(state, target, args.target, merged["first_round"])
         canonical["strikes"] += merged["strikes"]
         canonical["rounds"] = sorted(set(canonical["rounds"] + merged["rounds"]))
         canonical["gates"] = sorted(set(canonical["gates"] + merged["gates"]))
+        canonical_claims = canonical.setdefault("claims", {})
+        merged_claims = merged.get("claims", {})
+        for gate in canonical["gates"]:
+            left = canonical_claims.get(gate)
+            right = merged_claims.get(gate)
+            if left is None and right is not None:
+                canonical_claims[gate] = right
+            elif left is not None and right is not None:
+                canonical_claims[gate] = {
+                    **left,
+                    **right,
+                    "status": "open"
+                    if "open" in {left.get("status"), right.get("status")}
+                    else "resolved",
+                    "generation": max(
+                        int(left.get("generation", 1)),
+                        int(right.get("generation", 1)),
+                    ),
+                    "last_round": max(
+                        int(left.get("last_round", 0)),
+                        int(right.get("last_round", 0)),
+                    ),
+                }
         canonical["first_round"] = min(canonical["first_round"], merged["first_round"])
         if merged["status"] == "open":
             canonical["status"] = "open"
         state.setdefault("aliases", {})[source] = target
+        for alias, destination in list(state["aliases"].items()):
+            if alias != source and normalize_key(str(destination)) == source:
+                state["aliases"][alias] = target
         save(path, state)
-        emit({"aliased": {source: target}, "strikes": canonical["strikes"], **decide(state)})
+        emit(
+            {
+                "aliased": {source: target},
+                "strikes": canonical["strikes"],
+                **decide(state),
+            }
+        )
 
 
 def cmd_escalate(args: argparse.Namespace) -> None:
@@ -989,36 +1546,188 @@ def cmd_escalate(args: argparse.Namespace) -> None:
         emit({"escalated": True, "reason": args.reason, **decide(state)})
 
 
+def cmd_permit_review(args: argparse.Namespace) -> None:
+    """Issue one phase capability when durable ledger state allows review."""
+    try:
+        actual_head = (
+            subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=project_root(),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            .stdout.strip()
+            .lower()
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise LedgerError("cannot bind review permit to repository HEAD") from exc
+    if args.head.lower() != actual_head:
+        raise LedgerError(
+            "review permit head must exactly match the full repository HEAD"
+        )
+    path = ledger_path(args)
+    with locked(path):
+        state = load(path)
+        subject = state.get("work_subject")
+        if not isinstance(subject, dict):
+            raise LedgerError("review ledger has no immutable work subject")
+        if args.role == "design-reviewer":
+            if _design_plan(state)["next_action"] != "redesign":
+                raise LedgerError(
+                    "design ledger phase does not permit another reviewer"
+                )
+        elif decide(state)["next_action"] != ACTION_REVIEW:
+            raise LedgerError("review ledger phase does not permit another reviewer")
+        active = [
+            item
+            for item in state.get("review_permits", [])
+            if item.get("role") == args.role
+            and item.get("head") == actual_head
+            and item.get("review_generation", 1) == state.get("review_generation", 1)
+            and not item.get("cancelled_at")
+            and not item.get("superseded_at")
+            and not item.get("receipt_consumed_at")
+        ]
+        if active:
+            raise LedgerError(
+                "the current gate already has an outstanding phase permit"
+            )
+        token = "phase_" + os.urandom(24).hex()
+        state.setdefault("review_permits", []).append(
+            {
+                "token": token,
+                "work_subject": subject,
+                "role": args.role,
+                "head": actual_head,
+                "review_generation": state["review_generation"],
+                "issued_at": now(),
+                "round_count": len(state.get("rounds", [])),
+                "repair_count": len(state.get("repair_attempts", [])),
+                "design_round_count": len(
+                    (state.get("design") or {}).get("rounds", [])
+                ),
+                "started_at": "",
+                "completion_receipt": "",
+                "receipt_consumed_at": "",
+            }
+        )
+        save(path, state)
+    emit(
+        {
+            "review_phase_permit": token,
+            "work_subject": subject,
+            "role": args.role,
+            "head": actual_head,
+        }
+    )
+
+
+def cmd_complete_review(args: argparse.Namespace) -> None:
+    """Atomically attest a native desktop review only after its result exists."""
+    try:
+        result = json.loads(Path(args.result).read_text(encoding="utf-8"))
+        gate = {
+            "code-reviewer": "code-review",
+            "security-reviewer": "security-review",
+        }.get(args.role)
+        if gate:
+            context_pipeline.validate_review_output(result, gate)
+    except (OSError, json.JSONDecodeError, context_pipeline.ContextError) as exc:
+        raise LedgerError(f"invalid completed review result: {exc}") from exc
+    try:
+        actual_head = (
+            subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=project_root(),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            .stdout.strip()
+            .lower()
+        )
+        root = shared_repository_root(project_root())
+        receipt = complete_review_permit(
+            shared_root=root,
+            ledger_dir=str(ledger_path(args).parent.relative_to(root)),
+            pr=args.pr,
+            token=args.phase_permit,
+            role=args.role,
+            head=actual_head,
+            result=result,
+            timestamp=now(),
+            desktop=True,
+        )
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        ValueError,
+        ReviewPermitError,
+    ) as exc:
+        raise LedgerError(str(exc)) from exc
+    emit({"completion_receipt": receipt, "head": actual_head, "role": args.role})
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("--config", help="repo orchestration config (default: .orchestration/config.yaml)")
+    result.add_argument(
+        "--config",
+        help="repo orchestration config (default: .orchestration/config.yaml)",
+    )
     result.add_argument("--ledger-dir", help="ledger directory override")
     commands = result.add_subparsers(dest="command", required=True)
 
-    open_parser = commands.add_parser("open", help="create or report the ledger for a PR")
+    open_parser = commands.add_parser(
+        "open", help="create or report the ledger for a PR"
+    )
     open_parser.add_argument("pr")
-    open_parser.add_argument("--max-rounds", help="override the configured round cap")
-    open_parser.add_argument("--max-design-rounds", help="override the configured design-round cap")
+    open_parser.add_argument(
+        "--max-rounds", help="tighten (never raise) the configured repair cap"
+    )
+    open_parser.add_argument(
+        "--max-design-rounds", help="tighten (never raise) the configured design cap"
+    )
+    open_parser.add_argument("--work-kind", choices=("jira", "pr", "design"))
+    open_parser.add_argument("--work-id")
     open_parser.set_defaults(func=cmd_open)
 
-    record_parser = commands.add_parser("record", help="record one completed gate round")
+    record_parser = commands.add_parser(
+        "record", help="record one completed gate round"
+    )
     record_parser.add_argument("pr")
     record_parser.add_argument("--gate", required=True)
-    record_parser.add_argument("--result", help="validated structured reviewer JSON file")
+    record_parser.add_argument(
+        "--result", help="validated structured reviewer JSON file"
+    )
     record_parser.add_argument("--verdict", choices=("PASS", "FAIL"))
     record_parser.add_argument(
-        "--blocking", action="append", default=[], metavar="COMPONENT",
+        "--blocking",
+        action="append",
+        default=[],
+        metavar="COMPONENT",
         help="a blocking finding's component key (repeatable)",
     )
     record_parser.add_argument(
-        "--advisory", action="append", default=[], metavar="COMPONENT",
+        "--advisory",
+        action="append",
+        default=[],
+        metavar="COMPONENT",
         help="a non-blocking finding's component key (repeatable)",
     )
     record_parser.add_argument(
-        "--regression", action="append", default=[], metavar="COMPONENT",
+        "--regression",
+        action="append",
+        default=[],
+        metavar="COMPONENT",
         help="a new key that is a regression in the delta, so it keeps blocking authority",
     )
-    record_parser.add_argument("--head", help="exact reviewed commit; required after record-repair")
+    record_parser.add_argument(
+        "--head", help="exact reviewed commit; required after record-repair"
+    )
+    record_parser.add_argument(
+        "--phase-permit", help="single-use permit with a completed review receipt"
+    )
     record_parser.set_defaults(func=cmd_record)
 
     for name, func, helptext in (
@@ -1027,48 +1736,97 @@ def parser() -> argparse.ArgumentParser:
         ("handoff", cmd_handoff, "render the human escalation report"),
         ("repair-brief", cmd_repair_brief, "emit one deduplicated repair contract"),
         ("metrics", cmd_metrics, "emit repair effectiveness metrics"),
-        ("complete-repair-review", cmd_complete_repair_review, "close a repaired head after every required gate records"),
-        ("design-handoff", cmd_design_handoff, "render the design-round escalation report"),
+        (
+            "complete-repair-review",
+            cmd_complete_repair_review,
+            "close a repaired head after every required gate records",
+        ),
+        (
+            "design-handoff",
+            cmd_design_handoff,
+            "render the design-round escalation report",
+        ),
     ):
         command = commands.add_parser(name, help=helptext)
         command.add_argument("pr")
         command.set_defaults(func=func)
 
-    repair_parser = commands.add_parser("record-repair", help="record one complete repair report before re-review")
+    repair_parser = commands.add_parser(
+        "record-repair", help="record one complete repair report before re-review"
+    )
     repair_parser.add_argument("pr")
     repair_parser.add_argument("--report", required=True)
     repair_parser.set_defaults(func=cmd_record_repair)
 
-    design_open = commands.add_parser("design-open", help="create or report the pre-code design ledger")
+    design_open = commands.add_parser(
+        "design-open", help="create or report the pre-code design ledger"
+    )
     design_open.add_argument("pr", help="ticket or change identifier")
     design_open.add_argument("--max-rounds")
     design_open.add_argument("--max-design-rounds")
+    design_open.add_argument("--work-kind", choices=("jira", "pr", "design"))
+    design_open.add_argument("--work-id")
     design_open.set_defaults(func=cmd_design_open)
 
-    design_record = commands.add_parser("design-record", help="record one pre-code design verdict")
+    design_record = commands.add_parser(
+        "design-record", help="record one pre-code design verdict"
+    )
     design_record.add_argument("pr", help="ticket or change identifier")
-    design_record.add_argument("--verdict", required=True, choices=("PASS", "FAIL"))
-    design_record.add_argument("--evidence", required=True)
+    design_record.add_argument(
+        "--result", help="machine-readable design evidence bound to source SHA"
+    )
+    design_record.add_argument("--verdict", choices=("PASS", "FAIL"))
+    design_record.add_argument("--evidence")
     design_record.set_defaults(func=cmd_design_record)
+    permit = commands.add_parser(
+        "permit-review",
+        help="issue a single-use permit for the ledger's current review phase",
+    )
+    permit.add_argument("pr")
+    permit.add_argument(
+        "--role",
+        required=True,
+        choices=("design-reviewer", "code-reviewer", "security-reviewer"),
+    )
+    permit.add_argument("--head", required=True)
+    permit.set_defaults(func=cmd_permit_review)
+    complete = commands.add_parser(
+        "complete-review", help="complete a native review permit after output exists"
+    )
+    complete.add_argument("pr")
+    complete.add_argument(
+        "--role",
+        required=True,
+        choices=("design-reviewer", "code-reviewer", "security-reviewer"),
+    )
+    complete.add_argument("--phase-permit", required=True)
+    complete.add_argument("--result", required=True)
+    complete.set_defaults(func=cmd_complete_review)
 
     resolve_parser = commands.add_parser("resolve", help="manually close a component")
     resolve_parser.add_argument("pr")
     resolve_parser.add_argument("--key", required=True)
     resolve_parser.set_defaults(func=cmd_resolve)
 
-    redesign_parser = commands.add_parser("redesign", help="record a design-gate verdict for a component")
+    redesign_parser = commands.add_parser(
+        "redesign", help="record a design-gate verdict for a component"
+    )
     redesign_parser.add_argument("pr")
     redesign_parser.add_argument("--key", required=True)
     redesign_parser.add_argument("--verdict", required=True, choices=("PASS", "FAIL"))
     redesign_parser.set_defaults(func=cmd_redesign)
 
-    alias_parser = commands.add_parser("alias", help="merge a duplicate component key into the canonical one")
+    alias_parser = commands.add_parser(
+        "alias", help="merge a duplicate component key into the canonical one"
+    )
     alias_parser.add_argument("pr")
     alias_parser.add_argument("--from", dest="source", required=True)
     alias_parser.add_argument("--to", dest="target", required=True)
     alias_parser.set_defaults(func=cmd_alias)
 
-    escalate_parser = commands.add_parser("escalate", help="stop the loop and hand the PR to a human")
+    escalate_parser = commands.add_parser(
+        "escalate", help="stop the loop and hand the PR to a human"
+    )
     escalate_parser.add_argument("pr")
     escalate_parser.add_argument("--reason", required=True)
     escalate_parser.set_defaults(func=cmd_escalate)

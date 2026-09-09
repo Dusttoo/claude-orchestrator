@@ -27,9 +27,22 @@ import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import context_pipeline
+from attempt_capability import AttemptCapabilityError, validate as validate_attempt_capability
+from review_permit import (
+    ReviewPermitError,
+    cancel_started as cancel_review_permit,
+    complete as complete_review_permit,
+    consume as consume_review_permit,
+)
+from runtime_state import (
+    RuntimeStateError,
+    canonical_config_path,
+    migrate_legacy_runtime_dir,
+    shared_repository_root as resolve_shared_repository_root,
+)
 
 
 MILLION = Decimal("1000000")
@@ -64,9 +77,13 @@ ROLE_TOOL_CEILINGS = {
     "sprint-worker": TOOL_NAMES,
 }
 DEFAULT_BUDGETS = {
-    "max_usd_per_run": Decimal("1.00"),
-    "max_usd_per_ticket": Decimal("0"),
-    "max_usd_per_sprint": Decimal("0"),
+    "max_usd_per_run": Decimal("10.00"),
+    "max_usd_per_ticket": Decimal("30.00"),
+    "max_usd_per_sprint": Decimal("300.00"),
+    "warn_usd_per_ticket": Decimal("10.00"),
+    "pause_usd_per_ticket": Decimal("20.00"),
+    "max_model_runs_per_ticket": 12,
+    "max_reviewer_runs_per_ticket": 6,
     "max_output_tokens_per_turn": 4096,
     "max_tool_rounds": 8,
     "max_tool_output_chars": 12000,
@@ -76,6 +93,14 @@ DEFAULT_BUDGETS = {
     "max_rate_limit_wait_seconds": 600,
     "retry_backoff_seconds": 2,
     "retry_max_backoff_seconds": 60,
+}
+NON_OVERRIDABLE_MAXIMA = {
+    "max_usd_per_run": Decimal("10.00"),
+    "max_usd_per_ticket": Decimal("30.00"),
+    "max_usd_per_sprint": Decimal("300.00"),
+    "pause_usd_per_ticket": Decimal("20.00"),
+    "max_model_runs_per_ticket": 12,
+    "max_reviewer_runs_per_ticket": 6,
 }
 CREDENTIAL_ENV_KEYS = {
     "ANTHROPIC_API_KEY",
@@ -214,28 +239,7 @@ def shared_repository_root(root: Path) -> Path:
     the canonical root. Fall back to the given root when git cannot answer, so a
     non-repository directory still gets a working local ledger.
     """
-    override = os.environ.get("ORCHESTRATION_USAGE_ROOT")
-    if override:
-        return Path(override).expanduser().resolve()
-    try:
-        completed = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=True,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return root.resolve()
-    common = (completed.stdout or "").strip()
-    if not common:
-        return root.resolve()
-    candidate = Path(common)
-    if not candidate.is_absolute():
-        candidate = root / candidate
-    parent = candidate.resolve().parent
-    return parent if parent.is_dir() else root.resolve()
+    return resolve_shared_repository_root(root)
 
 
 def roll_conversation_cache_breakpoint(
@@ -404,7 +408,10 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
     if raw is not None and not isinstance(raw, dict):
         raise AgentError("llm.budgets must be a map")
     raw = raw or {}
-    for key in ("max_usd_per_run", "max_usd_per_ticket", "max_usd_per_sprint"):
+    for key in (
+        "max_usd_per_run", "max_usd_per_ticket", "max_usd_per_sprint",
+        "warn_usd_per_ticket", "pause_usd_per_ticket",
+    ):
         if key in raw:
             result[key] = decimal_value(raw[key], f"llm.budgets.{key}")
     for key in (
@@ -417,15 +424,55 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
         "max_rate_limit_wait_seconds",
         "retry_backoff_seconds",
         "retry_max_backoff_seconds",
+        "max_model_runs_per_ticket",
+        "max_reviewer_runs_per_ticket",
     ):
         if key in raw:
             minimum = 0 if key in {
-                "max_pre_ack_retries", "max_rate_limit_retries", "retry_backoff_seconds"
+                "max_pre_ack_retries", "max_rate_limit_retries", "retry_backoff_seconds",
+                "max_model_runs_per_ticket", "max_reviewer_runs_per_ticket",
             } else 1
             result[key] = int_value(raw[key], f"llm.budgets.{key}", minimum=minimum)
+    # Repository configuration may tighten incident breakers, never relax them.
+    # Raising these ceilings requires shipping reviewed plugin code, not editing
+    # the worktree a worker already controls.
+    for key, maximum in NON_OVERRIDABLE_MAXIMA.items():
+        configured = result[key]
+        result[key] = maximum if not configured else min(configured, maximum)
+    hard = result["max_usd_per_ticket"]
+    if "pause_usd_per_ticket" not in raw:
+        result["pause_usd_per_ticket"] = min(Decimal("20"), hard * Decimal("0.75"))
+    if "warn_usd_per_ticket" not in raw:
+        result["warn_usd_per_ticket"] = min(
+            Decimal("10"), result["pause_usd_per_ticket"] * Decimal("0.666666")
+        )
     if result["max_usd_per_run"] <= 0:
         raise AgentError("llm.budgets.max_usd_per_run must be greater than zero")
+    warning = result["warn_usd_per_ticket"]
+    pause = result["pause_usd_per_ticket"]
+    if warning and pause and warning >= pause:
+        raise AgentError("warn_usd_per_ticket must be lower than pause_usd_per_ticket")
+    if pause and hard and pause >= hard:
+        raise AgentError("pause_usd_per_ticket must be lower than max_usd_per_ticket")
     return result
+
+
+def normalize_ticket_scope(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*-[0-9]+", normalized):
+        raise AgentError("ticket must be a canonical Jira key such as PROJ-123")
+    return normalized
+
+
+def normalize_sprint_scope(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", normalized):
+        raise AgentError("sprint must be a canonical id containing only letters, digits, dot, underscore, or hyphen")
+    return normalized
 
 
 def self_checks(config: dict[str, Any]) -> dict[str, str]:
@@ -498,6 +545,60 @@ class UsageLedger:
             os.chmod(self.lock_path, 0o600)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             events = self._events()
+            if ticket:
+                last_pause = max(
+                    (index for index, event in enumerate(events)
+                     if event.get("kind") == "ticket_budget_pause"
+                     and self._matches(event, "ticket", ticket)),
+                    default=-1,
+                )
+                last_reset = max(
+                    (index for index, event in enumerate(events)
+                     if event.get("kind") == "ticket_budget_reset"
+                     and self._matches(event, "ticket", ticket)),
+                    default=-1,
+                )
+                if last_pause > last_reset:
+                    raise BudgetError(f"ticket_budget_pause is active for {ticket}; operator reset required")
+                run_ids = {
+                    str(event.get("run_id"))
+                    for event in events
+                    if event.get("kind") == "reservation"
+                    and self._matches(event, "ticket", ticket)
+                    and event.get("run_id")
+                }
+                is_new_run = run_id not in run_ids
+                max_runs = limits["max_model_runs_per_ticket"]
+                if is_new_run and max_runs and len(run_ids) >= max_runs:
+                    self._append_locked({
+                        "kind": "ticket_budget_pause", "timestamp": utc_now(), "ticket": ticket,
+                        "run_id": run_id, "reason": "max_model_runs_per_ticket",
+                    })
+                    raise BudgetError(
+                        f"max_model_runs_per_ticket={max_runs} reached for {ticket}; human action required"
+                    )
+                reviewer_roles = {"design-reviewer", "code-reviewer", "security-reviewer"}
+                reviewer_run_ids = {
+                    str(event.get("run_id"))
+                    for event in events
+                    if event.get("kind") == "reservation"
+                    and self._matches(event, "ticket", ticket)
+                    and event.get("role") in reviewer_roles
+                    and event.get("run_id")
+                }
+                max_reviewers = limits["max_reviewer_runs_per_ticket"]
+                if (
+                    is_new_run and role in reviewer_roles and max_reviewers
+                    and len(reviewer_run_ids) >= max_reviewers
+                ):
+                    self._append_locked({
+                        "kind": "ticket_budget_pause", "timestamp": utc_now(), "ticket": ticket,
+                        "run_id": run_id, "reason": "max_reviewer_runs_per_ticket",
+                    })
+                    raise BudgetError(
+                        f"max_reviewer_runs_per_ticket={max_reviewers} reached for {ticket}; "
+                        "human action required"
+                    )
             scopes = [
                 ("run_id", run_id, "max_usd_per_run"),
                 ("ticket", ticket, "max_usd_per_ticket"),
@@ -525,10 +626,56 @@ class UsageLedger:
                     Decimal("0"),
                 )
                 if used + reserved + projected > limit:
+                    if ticket and field in {"ticket", "sprint"}:
+                        self._append_locked({
+                            "kind": "ticket_budget_pause", "timestamp": utc_now(), "ticket": ticket,
+                            "run_id": run_id, "reason": limit_key,
+                            "projected_total_usd": str(used + reserved + projected),
+                        })
                     raise BudgetError(
                         f"{limit_key} would be exceeded: spent ${used:.6f}, reserved "
                         f"${reserved:.6f}, next request up to ${projected:.6f}, limit ${limit:.6f}"
                     )
+            if ticket:
+                used = sum(
+                    (decimal_value(event.get("cost_usd", 0), "ledger cost") for event in events
+                     if event.get("kind") == "usage" and self._matches(event, "ticket", ticket)),
+                    Decimal("0"),
+                )
+                _, open_items = self._totals(events)
+                reserved = sum(
+                    (decimal_value(event.get("projected_cost_usd", 0), "ledger reservation")
+                     for event in open_items.values() if self._matches(event, "ticket", ticket)),
+                    Decimal("0"),
+                )
+                projected_total = used + reserved + projected
+                pause = limits["pause_usd_per_ticket"]
+                if pause and projected_total > pause:
+                    if not any(
+                        event.get("kind") == "ticket_budget_pause"
+                        and self._matches(event, "ticket", ticket)
+                        and event.get("run_id") == run_id
+                        for event in events
+                    ):
+                        self._append_locked({
+                            "kind": "ticket_budget_pause", "timestamp": utc_now(),
+                            "ticket": ticket, "run_id": run_id,
+                            "projected_total_usd": str(projected_total),
+                            "pause_usd": str(pause),
+                        })
+                    raise BudgetError(
+                        f"pause_usd_per_ticket requires operator action for {ticket}: projected total "
+                        f"${projected_total:.6f}, pause ${pause:.6f}; operator policy change required"
+                    )
+                warning = limits["warn_usd_per_ticket"]
+                if warning and projected_total > warning and not any(
+                    event.get("kind") == "ticket_budget_warning"
+                    and self._matches(event, "ticket", ticket) for event in events
+                ):
+                    self._append_locked({
+                        "kind": "ticket_budget_warning", "timestamp": utc_now(), "ticket": ticket,
+                        "projected_total_usd": str(projected_total), "warning_usd": str(warning),
+                    })
             reservation_id = "resv_" + uuid.uuid4().hex
             event = {
                 "kind": "reservation",
@@ -1244,9 +1391,16 @@ class ApiAgent:
         sprint: str | None,
         run_id: str,
         transport: HttpTransport | Any,
+        review_authorization: str | None = None,
+        review_pr: str | None = None,
+        attempt_capability: str | None = None,
+        worker_ref: str | None = None,
     ):
         self.root = root.resolve()
-        self.config_path = config_path.resolve()
+        try:
+            self.config_path = canonical_config_path(self.root, config_path)
+        except RuntimeStateError as exc:
+            raise AgentError(str(exc)) from exc
         load_orchestration_env(self.config_path)
         self.config = load_yaml(self.config_path)
         self.route = context_pipeline.llm_route_from_config(self.config_path, role)
@@ -1255,16 +1409,42 @@ class ApiAgent:
         self.provider = self.route["provider"]
         self.model = self.route["model"]
         self.role = self.route["role"]
-        self.ticket = ticket
-        self.sprint = sprint
+        self.ticket = normalize_ticket_scope(ticket)
+        self.sprint = normalize_sprint_scope(sprint)
         self.run_id = run_id
         self.transport = transport
+        self.review_authorization = review_authorization
+        self.review_pr = review_pr
+        self.attempt_capability = attempt_capability
+        self.worker_ref = worker_ref or run_id
         self.pricing = Pricing.from_config(self.config, self.model)
         self.budgets = budgets_from_config(self.config)
         # Tool execution stays sandboxed to this worktree; spend accounting and
         # run state are repository-wide so concurrent lanes share one ceiling.
         self.shared_root = shared_repository_root(self.root)
+        try:
+            migrate_legacy_runtime_dir(self.root, ".orchestration/.llm-usage")
+            migrate_legacy_runtime_dir(self.root, ".orchestration/.llm-runs")
+        except RuntimeStateError as exc:
+            raise AgentError(str(exc)) from exc
         self.ledger = UsageLedger(self.shared_root)
+        if self.role in {"implementer", "sprint-worker"}:
+            if not self.ticket or not self.sprint or not self.attempt_capability:
+                raise AgentError(
+                    "orchestration worker requires ticket, sprint, and a controller-issued attempt capability"
+                )
+            try:
+                validate_attempt_capability(
+                    state_dir=runtime_path(
+                        self.shared_root,
+                        str(self.config.get("sprint_checkpoint_dir") or ".orchestration/.sprint-state"),
+                    ),
+                    token=self.attempt_capability, repository=str(self.shared_root),
+                    sprint=self.sprint, ticket=self.ticket, role=self.role,
+                    run_id=self.run_id, worker=self.worker_ref,
+                )
+            except AttemptCapabilityError as exc:
+                raise AgentError(str(exc)) from exc
         state_directory = runtime_path(self.shared_root, ".orchestration/.llm-runs")
         self.state_path = state_directory / f"{run_id}.json"
         if self.state_path.exists():
@@ -1597,6 +1777,29 @@ class ApiAgent:
         elif self.provider != "bedrock":
             request["tool_choice"] = "auto"
             request["parallel_tool_calls"] = False
+        reviewer_roles = {"design-reviewer", "code-reviewer", "security-reviewer"}
+        review_head = ""
+        if self.role in reviewer_roles:
+            if not self.review_authorization or not self.review_pr:
+                raise AgentError("reviewer run requires --review-pr and a ledger-issued --review-authorization")
+            try:
+                head = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=self.root, check=True,
+                    capture_output=True, text=True,
+                ).stdout.strip()
+            except (OSError, subprocess.CalledProcessError) as exc:
+                raise AgentError("cannot bind review authorization to repository HEAD") from exc
+            try:
+                consume_review_permit(
+                    shared_root=self.shared_root,
+                    ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
+                    pr=self.review_pr,
+                    token=self.review_authorization,
+                    role=self.role, head=head, timestamp=utc_now(),
+                )
+            except ReviewPermitError as exc:
+                raise AgentError(str(exc)) from exc
+            review_head = head
         self._save(status="ready", request=request)
         body = request
         transcript: list[dict[str, Any]] = []
@@ -1604,7 +1807,23 @@ class ApiAgent:
             try:
                 response = self._submit(body)
             except BudgetError as exc:
+                if self.role in reviewer_roles:
+                    cancel_review_permit(
+                        shared_root=self.shared_root,
+                        ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
+                        pr=str(self.review_pr), token=str(self.review_authorization),
+                        role=self.role, head=review_head, timestamp=utc_now(),
+                    )
                 self._save(status="budget_blocked", error=str(exc))
+                raise
+            except ProviderHTTPError:
+                if self.role in reviewer_roles and self.state.get("status") == "rejected":
+                    cancel_review_permit(
+                        shared_root=self.shared_root,
+                        ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
+                        pr=str(self.review_pr), token=str(self.review_authorization),
+                        role=self.role, head=review_head, timestamp=utc_now(),
+                    )
                 raise
             calls = tool_calls(self.provider, response)
             text = response_text(self.provider, response)
@@ -1653,6 +1872,28 @@ class ApiAgent:
                     except (json.JSONDecodeError, context_pipeline.ContextError) as exc:
                         self._save(status="invalid_output", output_text=text, error=str(exc))
                         raise AgentError(f"reviewer returned invalid structured output: {exc}") from exc
+                if status == "completed" and self.role in reviewer_roles:
+                    completed_result: Any
+                    try:
+                        completed_result = json.loads(review_text(self.provider, text))
+                    except json.JSONDecodeError as exc:
+                        self._save(status="invalid_output", output_text=text, error=str(exc))
+                        raise AgentError("reviewer completion output must be structured JSON") from exc
+                    try:
+                        complete_review_permit(
+                            shared_root=self.shared_root,
+                            ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
+                            pr=str(self.review_pr), token=str(self.review_authorization),
+                            role=self.role,
+                            head=subprocess.run(
+                                ["git", "rev-parse", "HEAD"], cwd=self.root, check=True,
+                                capture_output=True, text=True,
+                            ).stdout.strip().lower(),
+                            result=completed_result, timestamp=utc_now(),
+                        )
+                    except (ReviewPermitError, OSError, subprocess.CalledProcessError) as exc:
+                        self._save(status="invalid_output", output_text=text, error=str(exc))
+                        raise AgentError(f"could not create review completion receipt: {exc}") from exc
                 self._save(status=status, output_text=text, review=review)
                 result = {
                     "run_id": self.run_id,
@@ -1993,6 +2234,10 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--sprint")
     run.add_argument("--run-id")
     run.add_argument("--result")
+    run.add_argument("--review-authorization")
+    run.add_argument("--review-pr")
+    run.add_argument("--attempt-capability")
+    run.add_argument("--worker-ref")
     usage = commands.add_parser("usage", help="summarize durable API usage and open reservations")
     usage.add_argument("--repo", default=".")
     report = commands.add_parser(
@@ -2109,6 +2354,10 @@ def main() -> int:
                 sprint=args.sprint,
                 run_id=run_id,
                 transport=HttpTransport(),
+                review_authorization=args.review_authorization,
+                review_pr=args.review_pr,
+                attempt_capability=args.attempt_capability,
+                worker_ref=args.worker_ref,
             )
             output = agent.run(read_request(args.request))
         if getattr(args, "result", None):
