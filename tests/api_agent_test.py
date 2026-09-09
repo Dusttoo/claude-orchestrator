@@ -95,6 +95,7 @@ class ApiAgentTests(unittest.TestCase):
         roles = extra or "    code-reviewer:\n      allowed_tools: [read_file, search, git_diff, git_status, run_check]"
         path.write_text(
             f"""schema_version: 1
+require_review_authorization: false
 llm:
   execution: api
   provider: {provider}
@@ -163,6 +164,16 @@ self_check:
                 os.environ["AZURE_ADM_BASE_URL"],
                 "https://resource.openai.azure.com/openai/v1",
             )
+            self.assertNotEqual(os.environ.get("PATH"), "/untrusted/path")
+            self.assertEqual(
+                loaded,
+                [
+                    "ANTHROPIC_BASE_URL",
+                    "OPENAI_API_KEY",
+                    "AZURE_ADM_API_KEY",
+                    "AZURE_ADM_BASE_URL",
+                ],
+            )
 
     @unittest.skipUnless(importlib.util.find_spec("botocore"), "optional Bedrock SDK absent")
     def test_bedrock_transport_uses_request_metadata_and_aws_request_id(self):
@@ -216,16 +227,6 @@ self_check:
         with self.assertRaises(api_agent.ProviderAmbiguous):
             api_agent.HttpTransport(bedrock_client=FakeBedrockClient(error=uncertain)).request(
                 "bedrock", "converse", {}
-            )
-            self.assertNotEqual(os.environ.get("PATH"), "/untrusted/path")
-            self.assertEqual(
-                loaded,
-                [
-                    "ANTHROPIC_BASE_URL",
-                    "OPENAI_API_KEY",
-                    "AZURE_ADM_API_KEY",
-                    "AZURE_ADM_BASE_URL",
-                ],
             )
 
     @unittest.skipUnless(
@@ -998,6 +999,64 @@ self_check:
             )
         self.assertFalse(any(call[1] == "messages" for call in transport.calls))
         self.assertEqual(agent.state["status"], "budget_blocked")
+
+    def test_unique_model_and_reviewer_run_breakers_count_runs_not_tool_rounds(self):
+        ledger = api_agent.UsageLedger(self.root)
+        limits = dict(api_agent.DEFAULT_BUDGETS)
+        limits["max_model_runs_per_ticket"] = 2
+        limits["max_reviewer_runs_per_ticket"] = 1
+        ledger.reserve(
+            projected=api_agent.Decimal("0.01"), limits=limits, run_id="review-1",
+            ticket="PROJ-1", sprint="S-1", provider="openai", model="m", role="code-reviewer",
+        )
+        # A second provider/tool round inside one run does not consume another run slot.
+        ledger.reserve(
+            projected=api_agent.Decimal("0.01"), limits=limits, run_id="review-1",
+            ticket="PROJ-1", sprint="S-1", provider="openai", model="m", role="code-reviewer",
+        )
+        with self.assertRaisesRegex(api_agent.BudgetError, "max_reviewer_runs_per_ticket"):
+            ledger.reserve(
+                projected=api_agent.Decimal("0.01"), limits=limits, run_id="review-2",
+                ticket="PROJ-1", sprint="S-1", provider="openai", model="m", role="security-reviewer",
+            )
+        ledger.reserve(
+            projected=api_agent.Decimal("0.01"), limits=limits, run_id="implement-1",
+            ticket="PROJ-1", sprint="S-1", provider="anthropic", model="m", role="implementer",
+        )
+        with self.assertRaisesRegex(api_agent.BudgetError, "max_model_runs_per_ticket"):
+            ledger.reserve(
+                projected=api_agent.Decimal("0.01"), limits=limits, run_id="implement-2",
+                ticket="PROJ-1", sprint="S-1", provider="anthropic", model="m", role="implementer",
+            )
+
+    def test_ticket_pause_requires_durable_human_approval(self):
+        ledger = api_agent.UsageLedger(self.root)
+        limits = dict(api_agent.DEFAULT_BUDGETS)
+        limits["warn_usd_per_ticket"] = api_agent.Decimal("0.05")
+        limits["pause_usd_per_ticket"] = api_agent.Decimal("0.10")
+        with self.assertRaisesRegex(api_agent.BudgetError, "approve-ticket-budget"):
+            ledger.reserve(
+                projected=api_agent.Decimal("0.11"), limits=limits, run_id="costly",
+                ticket="PROJ-9", sprint="S-1", provider="openai", model="m", role="implementer",
+            )
+        ledger.approve_ticket_budget(
+            "PROJ-9", api_agent.Decimal("0.20"), "Dusty", "continue this verified repair"
+        )
+        reservation = ledger.reserve(
+            projected=api_agent.Decimal("0.11"), limits=limits, run_id="costly",
+            ticket="PROJ-9", sprint="S-1", provider="openai", model="m", role="implementer",
+        )
+        self.assertTrue(reservation.startswith("resv_"))
+
+    def test_review_authorization_is_single_use_and_bound_to_head(self):
+        ledger = api_agent.UsageLedger(self.root)
+        head = "a" * 40
+        token = ledger.issue_review_authorization("PROJ-1", "code-reviewer", head, "controller")
+        with self.assertRaisesRegex(api_agent.AgentError, "does not match"):
+            ledger.consume_review_authorization(token, "PROJ-1", "security-reviewer", head)
+        ledger.consume_review_authorization(token, "PROJ-1", "code-reviewer", head)
+        with self.assertRaisesRegex(api_agent.AgentError, "already consumed"):
+            ledger.consume_review_authorization(token, "PROJ-1", "code-reviewer", head)
 
     def test_explicit_rate_limit_retries_with_same_reservation(self):
         transport = FakeTransport(

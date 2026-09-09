@@ -27,9 +27,10 @@ import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import context_pipeline
+from runtime_state import shared_repository_root as resolve_shared_repository_root
 
 
 MILLION = Decimal("1000000")
@@ -67,6 +68,10 @@ DEFAULT_BUDGETS = {
     "max_usd_per_run": Decimal("1.00"),
     "max_usd_per_ticket": Decimal("0"),
     "max_usd_per_sprint": Decimal("0"),
+    "warn_usd_per_ticket": Decimal("0"),
+    "pause_usd_per_ticket": Decimal("0"),
+    "max_model_runs_per_ticket": 0,
+    "max_reviewer_runs_per_ticket": 0,
     "max_output_tokens_per_turn": 4096,
     "max_tool_rounds": 8,
     "max_tool_output_chars": 12000,
@@ -214,28 +219,7 @@ def shared_repository_root(root: Path) -> Path:
     the canonical root. Fall back to the given root when git cannot answer, so a
     non-repository directory still gets a working local ledger.
     """
-    override = os.environ.get("ORCHESTRATION_USAGE_ROOT")
-    if override:
-        return Path(override).expanduser().resolve()
-    try:
-        completed = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=True,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return root.resolve()
-    common = (completed.stdout or "").strip()
-    if not common:
-        return root.resolve()
-    candidate = Path(common)
-    if not candidate.is_absolute():
-        candidate = root / candidate
-    parent = candidate.resolve().parent
-    return parent if parent.is_dir() else root.resolve()
+    return resolve_shared_repository_root(root)
 
 
 def roll_conversation_cache_breakpoint(
@@ -404,7 +388,10 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
     if raw is not None and not isinstance(raw, dict):
         raise AgentError("llm.budgets must be a map")
     raw = raw or {}
-    for key in ("max_usd_per_run", "max_usd_per_ticket", "max_usd_per_sprint"):
+    for key in (
+        "max_usd_per_run", "max_usd_per_ticket", "max_usd_per_sprint",
+        "warn_usd_per_ticket", "pause_usd_per_ticket",
+    ):
         if key in raw:
             result[key] = decimal_value(raw[key], f"llm.budgets.{key}")
     for key in (
@@ -417,14 +404,24 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
         "max_rate_limit_wait_seconds",
         "retry_backoff_seconds",
         "retry_max_backoff_seconds",
+        "max_model_runs_per_ticket",
+        "max_reviewer_runs_per_ticket",
     ):
         if key in raw:
             minimum = 0 if key in {
-                "max_pre_ack_retries", "max_rate_limit_retries", "retry_backoff_seconds"
+                "max_pre_ack_retries", "max_rate_limit_retries", "retry_backoff_seconds",
+                "max_model_runs_per_ticket", "max_reviewer_runs_per_ticket",
             } else 1
             result[key] = int_value(raw[key], f"llm.budgets.{key}", minimum=minimum)
     if result["max_usd_per_run"] <= 0:
         raise AgentError("llm.budgets.max_usd_per_run must be greater than zero")
+    warning = result["warn_usd_per_ticket"]
+    pause = result["pause_usd_per_ticket"]
+    hard = result["max_usd_per_ticket"]
+    if warning and pause and warning >= pause:
+        raise AgentError("warn_usd_per_ticket must be lower than pause_usd_per_ticket")
+    if pause and hard and pause >= hard:
+        raise AgentError("pause_usd_per_ticket must be lower than max_usd_per_ticket")
     return result
 
 
@@ -498,6 +495,38 @@ class UsageLedger:
             os.chmod(self.lock_path, 0o600)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             events = self._events()
+            if ticket:
+                run_ids = {
+                    str(event.get("run_id"))
+                    for event in events
+                    if event.get("kind") == "reservation"
+                    and self._matches(event, "ticket", ticket)
+                    and event.get("run_id")
+                }
+                is_new_run = run_id not in run_ids
+                max_runs = limits["max_model_runs_per_ticket"]
+                if is_new_run and max_runs and len(run_ids) >= max_runs:
+                    raise BudgetError(
+                        f"max_model_runs_per_ticket={max_runs} reached for {ticket}; human action required"
+                    )
+                reviewer_roles = {"design-reviewer", "code-reviewer", "security-reviewer"}
+                reviewer_run_ids = {
+                    str(event.get("run_id"))
+                    for event in events
+                    if event.get("kind") == "reservation"
+                    and self._matches(event, "ticket", ticket)
+                    and event.get("role") in reviewer_roles
+                    and event.get("run_id")
+                }
+                max_reviewers = limits["max_reviewer_runs_per_ticket"]
+                if (
+                    is_new_run and role in reviewer_roles and max_reviewers
+                    and len(reviewer_run_ids) >= max_reviewers
+                ):
+                    raise BudgetError(
+                        f"max_reviewer_runs_per_ticket={max_reviewers} reached for {ticket}; "
+                        "human action required"
+                    )
             scopes = [
                 ("run_id", run_id, "max_usd_per_run"),
                 ("ticket", ticket, "max_usd_per_ticket"),
@@ -529,6 +558,43 @@ class UsageLedger:
                         f"{limit_key} would be exceeded: spent ${used:.6f}, reserved "
                         f"${reserved:.6f}, next request up to ${projected:.6f}, limit ${limit:.6f}"
                     )
+            if ticket:
+                used = sum(
+                    (decimal_value(event.get("cost_usd", 0), "ledger cost") for event in events
+                     if event.get("kind") == "usage" and self._matches(event, "ticket", ticket)),
+                    Decimal("0"),
+                )
+                _, open_items = self._totals(events)
+                reserved = sum(
+                    (decimal_value(event.get("projected_cost_usd", 0), "ledger reservation")
+                     for event in open_items.values() if self._matches(event, "ticket", ticket)),
+                    Decimal("0"),
+                )
+                projected_total = used + reserved + projected
+                pause = limits["pause_usd_per_ticket"]
+                approvals = [
+                    event for event in events
+                    if event.get("kind") == "ticket_budget_approval"
+                    and self._matches(event, "ticket", ticket)
+                ]
+                approved_to = max(
+                    (decimal_value(event.get("approved_up_to_usd", 0), "approval") for event in approvals),
+                    default=Decimal("0"),
+                )
+                if pause and projected_total > pause and approved_to < projected_total:
+                    raise BudgetError(
+                        f"pause_usd_per_ticket requires human approval for {ticket}: projected total "
+                        f"${projected_total:.6f}, pause ${pause:.6f}; run approve-ticket-budget"
+                    )
+                warning = limits["warn_usd_per_ticket"]
+                if warning and projected_total > warning and not any(
+                    event.get("kind") == "ticket_budget_warning"
+                    and self._matches(event, "ticket", ticket) for event in events
+                ):
+                    self._append_locked({
+                        "kind": "ticket_budget_warning", "timestamp": utc_now(), "ticket": ticket,
+                        "projected_total_usd": str(projected_total), "warning_usd": str(warning),
+                    })
             reservation_id = "resv_" + uuid.uuid4().hex
             event = {
                 "kind": "reservation",
@@ -544,6 +610,61 @@ class UsageLedger:
             }
             self._append_locked(event)
             return reservation_id
+
+    def approve_ticket_budget(
+        self, ticket: str, approved_up_to: Decimal, approved_by: str, reason: str
+    ) -> None:
+        if approved_up_to <= 0 or not approved_by.strip() or not reason.strip():
+            raise AgentError("budget approval requires positive amount, approver, and reason")
+        self.append({
+            "kind": "ticket_budget_approval", "timestamp": utc_now(), "ticket": ticket,
+            "approved_up_to_usd": str(approved_up_to), "approved_by": approved_by.strip(),
+            "reason": reason.strip(),
+        })
+
+    def issue_review_authorization(
+        self, ticket: str, role: str, head: str, authorized_by: str
+    ) -> str:
+        if role not in {"design-reviewer", "code-reviewer", "security-reviewer"}:
+            raise AgentError("review authorization role must be a reviewer")
+        if not ticket.strip() or not re.fullmatch(r"[0-9a-fA-F]{7,64}", head):
+            raise AgentError("review authorization requires ticket and exact commit head")
+        if not authorized_by.strip():
+            raise AgentError("review authorization requires an authorizing controller identity")
+        token = "review_" + uuid.uuid4().hex
+        self.append({
+            "kind": "review_authorization", "timestamp": utc_now(), "token": token,
+            "ticket": ticket, "role": role, "head": head.lower(),
+            "authorized_by": authorized_by.strip(),
+        })
+        return token
+
+    def consume_review_authorization(
+        self, token: str, ticket: str | None, role: str, head: str
+    ) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+", encoding="utf-8") as lock:
+            os.chmod(self.lock_path, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            events = self._events()
+            issued = next(
+                (event for event in events if event.get("kind") == "review_authorization" and event.get("token") == token),
+                None,
+            )
+            if not issued or any(
+                event.get("kind") == "review_authorization_consumed" and event.get("token") == token
+                for event in events
+            ):
+                raise AgentError("review authorization is missing, invalid, or already consumed")
+            if (
+                issued.get("ticket") != ticket or issued.get("role") != role
+                or issued.get("head") != head.lower()
+            ):
+                raise AgentError("review authorization does not match ticket, role, and exact head")
+            self._append_locked({
+                "kind": "review_authorization_consumed", "timestamp": utc_now(), "token": token,
+                "ticket": ticket, "role": role, "head": head.lower(),
+            })
 
     def _append_locked(self, event: dict[str, Any]) -> None:
         with self.path.open("a", encoding="utf-8") as handle:
@@ -1244,6 +1365,7 @@ class ApiAgent:
         sprint: str | None,
         run_id: str,
         transport: HttpTransport | Any,
+        review_authorization: str | None = None,
     ):
         self.root = root.resolve()
         self.config_path = config_path.resolve()
@@ -1259,6 +1381,7 @@ class ApiAgent:
         self.sprint = sprint
         self.run_id = run_id
         self.transport = transport
+        self.review_authorization = review_authorization
         self.pricing = Pricing.from_config(self.config, self.model)
         self.budgets = budgets_from_config(self.config)
         # Tool execution stays sandboxed to this worktree; spend accounting and
@@ -1597,6 +1720,21 @@ class ApiAgent:
         elif self.provider != "bedrock":
             request["tool_choice"] = "auto"
             request["parallel_tool_calls"] = False
+        reviewer_roles = {"design-reviewer", "code-reviewer", "security-reviewer"}
+        require_authorization = self.config.get("require_review_authorization", True) is not False
+        if self.role in reviewer_roles and require_authorization:
+            if not self.review_authorization:
+                raise AgentError("reviewer run requires a controller-issued --review-authorization")
+            try:
+                head = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=self.root, check=True,
+                    capture_output=True, text=True,
+                ).stdout.strip()
+            except (OSError, subprocess.CalledProcessError) as exc:
+                raise AgentError("cannot bind review authorization to repository HEAD") from exc
+            self.ledger.consume_review_authorization(
+                self.review_authorization, self.ticket, self.role, head
+            )
         self._save(status="ready", request=request)
         body = request
         transcript: list[dict[str, Any]] = []
@@ -1993,8 +2131,25 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--sprint")
     run.add_argument("--run-id")
     run.add_argument("--result")
+    run.add_argument("--review-authorization")
     usage = commands.add_parser("usage", help="summarize durable API usage and open reservations")
     usage.add_argument("--repo", default=".")
+    approval = commands.add_parser(
+        "approve-ticket-budget", help="record a durable human approval above a ticket pause threshold"
+    )
+    approval.add_argument("--repo", default=".")
+    approval.add_argument("--ticket", required=True)
+    approval.add_argument("--approved-up-to-usd", required=True)
+    approval.add_argument("--approved-by", required=True)
+    approval.add_argument("--reason", required=True)
+    review_approval = commands.add_parser(
+        "authorize-review", help="issue a single-use controller authorization for one reviewer run"
+    )
+    review_approval.add_argument("--repo", default=".")
+    review_approval.add_argument("--ticket", required=True)
+    review_approval.add_argument("--role", required=True)
+    review_approval.add_argument("--head", required=True)
+    review_approval.add_argument("--authorized-by", required=True)
     report = commands.add_parser(
         "report", help="group durable API usage into cost and performance insights"
     )
@@ -2093,6 +2248,20 @@ def main() -> int:
         root = Path(args.repo).resolve()
         if args.command == "usage":
             output = UsageLedger(shared_repository_root(root)).summary()
+        elif args.command == "approve-ticket-budget":
+            amount = decimal_value(args.approved_up_to_usd, "approved amount")
+            ledger = UsageLedger(shared_repository_root(root))
+            ledger.approve_ticket_budget(args.ticket, amount, args.approved_by, args.reason)
+            output = {
+                "status": "completed", "ticket": args.ticket,
+                "approved_up_to_usd": str(amount), "approved_by": args.approved_by,
+            }
+        elif args.command == "authorize-review":
+            ledger = UsageLedger(shared_repository_root(root))
+            token = ledger.issue_review_authorization(
+                args.ticket, args.role, args.head, args.authorized_by
+            )
+            output = {"status": "completed", "review_authorization": token}
         elif args.command == "report":
             output = build_report(shared_repository_root(root), args)
         elif args.command == "reconcile":
@@ -2109,6 +2278,7 @@ def main() -> int:
                 sprint=args.sprint,
                 run_id=run_id,
                 transport=HttpTransport(),
+                review_authorization=args.review_authorization,
             )
             output = agent.run(read_request(args.request))
         if getattr(args, "result", None):

@@ -10,6 +10,14 @@ Jira access and worker launch are host operations. The shared sprint controller
 owns normalization, lane reservations, checkpoints, and exact summaries so Codex
 and Claude Code follow the same state machine.
 
+Before interpreting the sprint request, run `captain-preflight.py` from this
+exact plugin root with `--repo . --host claude|codex`. Continue only when it
+returns `status: ready` and `captain_mode: controller-only`. If the script or
+this exact skill is absent, stop as `user_action`: never infer the plugin's
+purpose, invent a similarly named skill, or operate sprint tickets directly.
+Record the returned plugin version and runtime fingerprint in the first
+checkpoint/status event.
+
 ## Shared controller
 
 Resolve `../../scripts/sprint-controller.py` and
@@ -65,6 +73,9 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    Resolve `active` to one exact Jira sprint id. Fetch the current status of
    every dependency outside the sprint. Do not infer a missing page, link
    direction, or dependency status.
+   Expand every referenced Jira subtask into its own inventory ticket. The
+   controller rejects a parent whose `subtasks` keys are not all present; never
+   silently collapse child work into the parent summary.
 
 3. **Create an inventory.** Write a temporary JSON file inside the configured
    checkpoint directory with this exact shape:
@@ -81,7 +92,8 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
          "status": "Ready",
          "priority": 2,
          "url": "https://jira.example/browse/PROJ-2",
-         "dependencies": ["PROJ-1"]
+         "dependencies": ["PROJ-1"],
+         "subtasks": ["PROJ-3"]
        }
      ],
      "dependency_status": {"OTHER-9": "Done"}
@@ -118,6 +130,8 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    If a previously blocked or user-action ticket becomes safe to retry, requeue
    it explicitly with the evidence in `--reason`; completed tickets cannot be
    requeued. A running ticket additionally requires proof that no worker remains.
+   Requeue requires its current `--attempt-token` and `--worker-stopped`. After
+   `max_lane_relaunches`, reserve requires a durable `--human-approval` reason.
 
 5. **Reserve, then launch.** Launch only keys returned in `plan.launch`, which
    is already ordered by `(priority, key)`; never reorder or reprioritize it
@@ -129,6 +143,9 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    sprint-controller.py reserve --sprint <id> --ticket <key> --run-ref <provisional-ref>
    ```
 
+   Preserve the `attempt_token` returned by reserve. It fences this worker from
+   every earlier or replacement attempt.
+
    Then launch a fresh isolated worker for that one ticket. Instruct it to use
    `$orchestrate-ticket`, pass the freshly fetched Jira body and acceptance
    criteria with provenance `from Jira, verified in this sprint query`, and
@@ -136,7 +153,7 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    user action. After launch, replace the provisional reference:
 
    ```text
-   sprint-controller.py attach --sprint <id> --ticket <key> --run-ref <actual-task-or-agent-ref>
+   sprint-controller.py attach --sprint <id> --ticket <key> --run-ref <actual-task-or-agent-ref> --attempt-token <token>
    ```
 
    **Codex host launch contract.** A reservation is not a worker launch. First
@@ -182,7 +199,7 @@ Before launching, resolve the executable because non-interactive SSH shells may 
    ```text
    sprint-controller.py finish --sprint <id> --ticket <key> \
      --outcome completed|blocked|user_action --summary <text> \
-     --pr <number-or-url> --branch <name>
+     --pr <number-or-url> --branch <name> --attempt-token <token>
    ```
 
    Use `completed` only after the ticket workflow verifies its merge. Use
@@ -204,6 +221,12 @@ Before launching, resolve the executable because non-interactive SSH shells may 
    rate-limit waiting for one provider, stop admitting new work routed there;
    preserve reservations and allow independent work on healthy routes to
    continue. Bounded retries remain owned by `api_agent.py`.
+
+   Treat controller `spend` as authoritative. Stop admission when a ticket is
+   `approval_required`; never relaunch to evade a model/reviewer run-count
+   breaker. Only the operator may extend a pause boundary with the durable
+   `api_agent.py approve-ticket-budget` command. Include warning state,
+   projected spend, run count, and approvals in meaningful status updates.
 
    **Quiet captain contract.** When `sprint_status_update_mode` is `event`, do
    not spend model turns polling, rereading full transcripts, or narrating

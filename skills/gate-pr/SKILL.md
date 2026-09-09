@@ -38,6 +38,10 @@ Before each `code-reviewer` or `security-reviewer` pass, resolve its route with
 <role>`. Desktop routes use fresh native agents. API routes build their request
 with `context_pipeline.py payload --config ... --role <role>` and use the
 `api_agent.py run --request -` adapter with the ticket and a stable run id.
+First issue a token with `api_agent.py authorize-review --ticket <ticket>
+--role <role> --head <exact-head> --authorized-by gate-controller`; pass it to
+`run --review-authorization <token>`. One token authorizes one reviewer at one
+commit.
 Desktop fallback is allowed only before provider
 acknowledgement; submitted, timed-out, or uncertain work must be reconciled
 instead of duplicated.

@@ -29,7 +29,9 @@ native agent launch. An `api` route builds the request with
 `context_pipeline.py payload --config ... --role <role>` and pipes it to
 `${CLAUDE_PLUGIN_ROOT}/scripts/api_agent.py run --request - --config
 .orchestration/config.yaml --role <role>`, including the ticket/sprint/run id
-when available. The runner owns provider submission, limited tools, durable
+when available. Before an API reviewer run, issue a single-use exact-head token
+with `api_agent.py authorize-review` and pass it to `run
+--review-authorization <token>`. The runner owns provider submission, limited tools, durable
 usage, and budget enforcement. Desktop fallback is legal only when the runner
 proves the API request failed before any provider/run id existed; submitted or
 uncertain work stays reserved for reconciliation and is never duplicated.
@@ -66,7 +68,8 @@ Steps:
    concurrency, retries, and hostile input. N/A requires a reason. For planned
    security-sensitive infrastructure, launch a fresh
    `orchestration-design-reviewer`. Open `review-ledger.py design-open
-   <ticket-or-change>`, record every verdict with `design-record`, and stop with
+   <ticket-or-change>`, record FAIL with explicit evidence, and record PASS only
+   through `design-record --result <json>` bound to the exact source SHA. Stop with
    `design-handoff` if `max_design_rounds` is spent. It must define the trust boundary and
    impossible guarantees, reject fragile designs, audit the matrix, and return
    `VERDICT: PASS` before implementation.

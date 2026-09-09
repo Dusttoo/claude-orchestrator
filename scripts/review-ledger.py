@@ -22,11 +22,13 @@ import os
 import re
 import sys
 import tempfile
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 import context_pipeline
+from runtime_state import shared_repository_root, working_repository_root
 
 
 SCHEMA_VERSION = 1
@@ -60,11 +62,7 @@ def emit(value: Any) -> None:
 
 
 def project_root() -> Path:
-    current = Path.cwd().resolve()
-    for candidate in (current, *current.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    return current
+    return working_repository_root(Path.cwd())
 
 
 def unquote(value: str) -> str:
@@ -214,7 +212,7 @@ def ledger_path(args: argparse.Namespace) -> Path:
         cfg = Path(args.config) if args.config else root / ".orchestration/config.yaml"
         directory = Path(config_scalar(cfg, "review_ledger_dir", DEFAULT_LEDGER_DIR))
     if not directory.is_absolute():
-        directory = root / directory
+        directory = shared_repository_root(root) / directory
     pr = re.sub(r"[^A-Za-z0-9_.-]", "-", str(args.pr)).strip("-")
     if not pr:
         raise LedgerError(f"invalid pr identifier: {args.pr!r}")
@@ -734,6 +732,44 @@ def cmd_design_open(args: argparse.Namespace) -> None:
 
 
 def cmd_design_record(args: argparse.Namespace) -> None:
+    artifact: dict[str, Any] | None = None
+    if args.result:
+        if args.verdict or args.evidence:
+            raise LedgerError("--result cannot be combined with manual design fields")
+        try:
+            artifact = json.loads(Path(args.result).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise LedgerError(f"invalid design result: {exc}") from exc
+        required = {"schema_version", "gate", "verdict", "source_sha", "artifact", "checks"}
+        if set(artifact) != required or artifact.get("schema_version") != 1:
+            raise LedgerError("design result requires exactly schema_version=1, gate, verdict, source_sha, artifact, checks")
+        if artifact.get("gate") != "design-review" or artifact.get("verdict") not in {"PASS", "FAIL"}:
+            raise LedgerError("design result gate/verdict is invalid")
+        if not re.fullmatch(r"[0-9a-fA-F]{7,64}", str(artifact.get("source_sha") or "")):
+            raise LedgerError("design result source_sha must be a commit id")
+        if not str(artifact.get("artifact") or "").strip() or not isinstance(artifact.get("checks"), list) or not artifact["checks"]:
+            raise LedgerError("design result requires a named artifact and non-empty checks")
+        if any(not isinstance(item, dict) or item.get("status") not in {"pass", "fail"} for item in artifact["checks"]):
+            raise LedgerError("every design check requires status pass or fail")
+        if artifact["verdict"] == "PASS" and any(item["status"] != "pass" for item in artifact["checks"]):
+            raise LedgerError("design PASS contradicts a failed check")
+        try:
+            actual_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=project_root(), check=True,
+                capture_output=True, text=True,
+            ).stdout.strip().lower()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise LedgerError("cannot verify design result against repository HEAD") from exc
+        if not actual_head.startswith(str(artifact["source_sha"]).lower()):
+            raise LedgerError(
+                f"design result source {artifact['source_sha']} does not match current HEAD {actual_head}"
+            )
+        args.verdict = artifact["verdict"]
+        args.evidence = artifact["artifact"]
+    elif args.verdict == "PASS":
+        raise LedgerError("design PASS requires a machine-readable --result bound to source_sha")
+    elif not args.verdict or not args.evidence:
+        raise LedgerError("design FAIL requires --verdict and --evidence, or use --result")
     path = ledger_path(args)
     with locked(path):
         state = load(path)
@@ -748,6 +784,7 @@ def cmd_design_record(args: argparse.Namespace) -> None:
                 "round": len(design["rounds"]) + 1,
                 "verdict": args.verdict,
                 "evidence": args.evidence,
+                **({"result": artifact} if artifact else {}),
                 "recorded_at": now(),
             }
         )
@@ -1047,8 +1084,9 @@ def parser() -> argparse.ArgumentParser:
 
     design_record = commands.add_parser("design-record", help="record one pre-code design verdict")
     design_record.add_argument("pr", help="ticket or change identifier")
-    design_record.add_argument("--verdict", required=True, choices=("PASS", "FAIL"))
-    design_record.add_argument("--evidence", required=True)
+    design_record.add_argument("--result", help="machine-readable design evidence bound to source SHA")
+    design_record.add_argument("--verdict", choices=("PASS", "FAIL"))
+    design_record.add_argument("--evidence")
     design_record.set_defaults(func=cmd_design_record)
 
     resolve_parser = commands.add_parser("resolve", help="manually close a component")

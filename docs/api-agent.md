@@ -117,6 +117,25 @@ other rather than against private copies of the limit. Reservations are included
 run, ticket, and sprint checks, preventing concurrent workers from racing past a
 shared limit. A request that could exceed any configured ceiling is not sent.
 
+Ticket controls are layered: `warn_usd_per_ticket` records an event without
+stopping work, `pause_usd_per_ticket` requires durable operator approval, and
+`max_usd_per_ticket` remains the hard ceiling. Unique run IDs are bounded by
+`max_model_runs_per_ticket` and `max_reviewer_runs_per_ticket`; tool rounds
+inside one run do not consume extra run slots. Extend a paused ticket with:
+
+```text
+scripts/api_agent.py approve-ticket-budget --ticket PROJ-1 \
+  --approved-up-to-usd 12 --approved-by Dusty --reason "verified repair"
+```
+
+API reviewer runs require a controller-issued single-use token bound to the
+ticket, role, and exact commit:
+
+```text
+scripts/api_agent.py authorize-review --ticket PROJ-1 --role code-reviewer \
+  --head "$(git rev-parse HEAD)" --authorized-by gate-controller
+```
+
 After every response, actual uncached input, cache writes, cache reads, output,
 and reasoning usage is recorded under `.orchestration/.llm-usage/usage.jsonl`.
 Run `scripts/api_agent.py usage` for totals and open reservations.
@@ -133,8 +152,9 @@ request stays reconcilable after its worktree is cleaned up.
 
 Tool execution is unaffected and stays sandboxed to the lane's own worktree.
 
-Set `ORCHESTRATION_USAGE_ROOT` to point the ledger somewhere else explicitly --
-for example to hold several repositories to one budget. Outside a git
+Set `ORCHESTRATION_RUNTIME_ROOT` to relocate all shared orchestration runtime
+state. `ORCHESTRATION_USAGE_ROOT` remains a deprecated compatibility alias.
+Outside a git
 repository the ledger falls back to the `--repo` directory.
 
 ### Reading the ledger

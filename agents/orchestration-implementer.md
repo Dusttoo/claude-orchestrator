@@ -34,6 +34,12 @@ wins.
 
 ## Non-negotiable rules
 
+- **You are not a controller.** Never start another agent, invoke a sprint or
+  ticket orchestration skill, launch a reviewer, reserve/requeue a lane, or
+  repeat your own attempt. Implement only the single assigned brief and return
+  its result. Review and repair loops require a fresh controller-authorized
+  worker.
+
 - **Repair mode closes stable IDs.** When the orchestrator supplies a repair
   brief, do not begin with edits. Map every stable component ID to the verified
   root cause, planned change, affected callers/boundaries, objective closure

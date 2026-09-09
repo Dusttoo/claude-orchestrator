@@ -23,8 +23,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from runtime_state import shared_repository_root, working_repository_root
 
-SCHEMA_VERSION = 1
+
+SCHEMA_VERSION = 2
 TERMINAL = {"completed", "blocked", "user_action"}
 OUTCOMES = TERMINAL
 DEFAULT_DONE = ["done", "closed", "resolved"]
@@ -45,11 +47,7 @@ def emit(value: Any) -> None:
 
 
 def project_root() -> Path:
-    current = Path.cwd().resolve()
-    for candidate in (current, *current.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    return current
+    return working_repository_root(Path.cwd())
 
 
 def unquote(value: str) -> str:
@@ -63,6 +61,17 @@ def config_scalar(path: Path, key: str, default: str) -> str:
     if not path.exists():
         return default
     pattern = re.compile(rf"^{re.escape(key)}:\s*(.*?)\s*(?:#.*)?$")
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = pattern.match(line)
+        if match and match.group(1):
+            return unquote(match.group(1))
+    return default
+
+
+def config_scalar_any_depth(path: Path, key: str, default: str) -> str:
+    if not path.exists():
+        return default
+    pattern = re.compile(rf"^\s*{re.escape(key)}:\s*(.*?)\s*(?:#.*)?$")
     for line in path.read_text(encoding="utf-8").splitlines():
         match = pattern.match(line)
         if match and match.group(1):
@@ -96,6 +105,7 @@ def config_list(path: Path, key: str, default: list[str]) -> list[str]:
 
 def settings(args: argparse.Namespace) -> dict[str, Any]:
     root = project_root()
+    shared_root = shared_repository_root(root)
     config = Path(args.config).resolve() if args.config else root / ".orchestration/config.yaml"
     try:
         concurrency = int(config_scalar(config, "concurrency_max", "2"))
@@ -107,13 +117,28 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
     requested_dir = Path(args.state_dir) if args.state_dir else configured_dir
     if requested_dir.is_absolute():
         raise SprintError("sprint checkpoint directory must be repository-relative")
-    state_dir = (root / requested_dir).resolve()
-    if state_dir != root and root not in state_dir.parents:
+    state_dir = (shared_root / requested_dir).resolve()
+    if state_dir != shared_root and shared_root not in state_dir.parents:
         raise SprintError("sprint checkpoint directory escapes the repository")
+    try:
+        max_lane_relaunches = int(config_scalar(config, "max_lane_relaunches", "2"))
+    except ValueError as exc:
+        raise SprintError("max_lane_relaunches must be an integer") from exc
+    if max_lane_relaunches < 0:
+        raise SprintError("max_lane_relaunches must be at least 0")
+    try:
+        warning_budget = float(config_scalar_any_depth(config, "warn_usd_per_ticket", "0"))
+        pause_budget = float(config_scalar_any_depth(config, "pause_usd_per_ticket", "0"))
+    except ValueError as exc:
+        raise SprintError("ticket warning and pause budgets must be numbers") from exc
     return {
         "config": config,
         "concurrency_max": concurrency,
         "state_dir": state_dir,
+        "shared_root": shared_root,
+        "max_lane_relaunches": max_lane_relaunches,
+        "warn_usd_per_ticket": warning_budget,
+        "pause_usd_per_ticket": pause_budget,
         "ready": {x.casefold() for x in config_list(config, "sprint_ready_statuses", DEFAULT_READY)},
         "done": {x.casefold() for x in config_list(config, "sprint_done_statuses", DEFAULT_DONE)},
         "blocked": {x.casefold() for x in config_list(config, "sprint_blocked_statuses", DEFAULT_BLOCKED)},
@@ -194,6 +219,11 @@ def load(path: Path) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SprintError(f"cannot read checkpoint {path}: {exc}") from exc
+    if value.get("schema_version") == 1:
+        value["schema_version"] = SCHEMA_VERSION
+        for ticket in value.get("tickets", {}).values():
+            ticket.setdefault("attempt_token", "")
+            ticket.setdefault("subtasks", [])
     if value.get("schema_version") != SCHEMA_VERSION:
         raise SprintError(f"unsupported sprint checkpoint schema in {path}")
     return value
@@ -280,6 +310,14 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             normalized = normalize_key(dependency)
             if normalized not in dependencies:
                 dependencies.append(normalized)
+        subtasks: list[str] = []
+        raw_subtasks = item.get("subtasks", [])
+        if not isinstance(raw_subtasks, list):
+            raise SprintError(f"ticket {key} subtasks must be an array")
+        for subtask in raw_subtasks:
+            normalized = normalize_key(subtask.get("key") if isinstance(subtask, dict) else subtask)
+            if normalized not in subtasks:
+                subtasks.append(normalized)
         raw_status = str(item.get("status", "")).strip()
         state, reason = initial_state(raw_status, cfg)
         tickets[key] = {
@@ -289,14 +327,24 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             "raw_status": raw_status,
             "priority": normalize_priority(item.get("priority"), key),
             "dependencies": sorted(dependencies),
+            "subtasks": sorted(subtasks),
             "state": state,
             "reason": reason,
             "run_ref": "",
             "branch": "",
             "pr": "",
             "attempts": 0,
+            "attempt_token": "",
             "history": [],
         }
+    missing_subtasks = sorted(
+        {subtask for ticket in tickets.values() for subtask in ticket["subtasks"] if subtask not in tickets}
+    )
+    if missing_subtasks:
+        raise SprintError(
+            "Jira inventory is incomplete; fetch every referenced subtask explicitly: "
+            + ", ".join(missing_subtasks)
+        )
     external: dict[str, str] = {}
     raw_external = raw.get("dependency_status", {})
     if not isinstance(raw_external, dict):
@@ -370,6 +418,55 @@ def blockers(state: dict[str, Any], key: str, cfg: dict[str, Any]) -> list[str]:
     return sorted(set(reasons))
 
 
+def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    path = cfg["shared_root"] / ".orchestration/.llm-usage/usage.jsonl"
+    result: dict[str, dict[str, Any]] = {}
+    if not path.is_file():
+        return result
+    open_reservations: dict[str, dict[str, Any]] = {}
+    approvals: dict[str, float] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        ticket = str(event.get("ticket") or "")
+        kind = event.get("kind")
+        if kind == "reservation":
+            open_reservations[str(event["reservation_id"])] = event
+            if ticket:
+                item = result.setdefault(
+                    ticket, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_ids": set()}
+                )
+                if event.get("run_id"):
+                    item["run_ids"].add(str(event["run_id"]))
+        elif kind in {"usage", "release"}:
+            open_reservations.pop(str(event.get("reservation_id") or ""), None)
+        if kind == "ticket_budget_approval" and ticket:
+            approvals[ticket] = max(approvals.get(ticket, 0), float(event["approved_up_to_usd"]))
+        if kind == "usage" and ticket:
+            item = result.setdefault(ticket, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_ids": set()})
+            item["spent_usd"] += float(event.get("cost_usd", 0))
+    for event in open_reservations.values():
+        ticket = str(event.get("ticket") or "")
+        if ticket:
+            item = result.setdefault(ticket, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_ids": set()})
+            item["reserved_usd"] += float(event.get("projected_cost_usd", 0))
+            if event.get("run_id"):
+                item["run_ids"].add(str(event["run_id"]))
+    for ticket, item in result.items():
+        item["run_count"] = len(item.pop("run_ids"))
+        total = item["spent_usd"] + item["reserved_usd"]
+        item["projected_total_usd"] = round(total, 6)
+        item["approved_up_to_usd"] = approvals.get(ticket, 0)
+        pause = cfg["pause_usd_per_ticket"]
+        warning = cfg["warn_usd_per_ticket"]
+        item["state"] = (
+            "approval_required" if pause and total > pause and approvals.get(ticket, 0) < total
+            else "warning" if warning and total > warning else "ok"
+        )
+    return result
+
+
 def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     inventory_path = Path(args.inventory)
     try:
@@ -392,7 +489,10 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             for key, fresh in incoming["tickets"].items():
                 previous = current["tickets"].get(key)
                 if previous and previous["state"] in TERMINAL | {"running"}:
-                    for field in ("state", "reason", "run_ref", "branch", "pr", "attempts", "history"):
+                    for field in (
+                        "state", "reason", "run_ref", "branch", "pr", "attempts",
+                        "attempt_token", "history",
+                    ):
                         fresh[field] = previous[field]
                 current["tickets"][key] = fresh
             current["project"] = incoming["project"]
@@ -412,11 +512,13 @@ def get_state(args: argparse.Namespace, cfg: dict[str, Any]) -> tuple[Path, dict
 
 
 def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    spend = usage_snapshots(cfg)
     running = sorted(key for key, ticket in state["tickets"].items() if ticket["state"] == "running")
     ordered = sorted(state["tickets"].values(), key=order_key)
     ready = [
         ticket["key"] for ticket in ordered
         if ticket["state"] == "pending" and not blockers(state, ticket["key"], cfg)
+        and spend.get(ticket["key"], {}).get("state") != "approval_required"
     ]
     available = max(0, cfg["concurrency_max"] - len(running))
     waiting = [
@@ -438,6 +540,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         "waiting": waiting,
         "autonomous_work_remaining": bool(running or launch),
         "over_capacity": max(0, len(running) - cfg["concurrency_max"]),
+        "spend": spend,
     }
 
 
@@ -518,10 +621,16 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                 )
             marker_jobs.append({"ticket": key, "custom_id": custom_id, "run_ref": run_ref})
             ticket = state["tickets"][key]
+            if ticket["attempts"] > cfg["max_lane_relaunches"]:
+                raise SprintError(
+                    f"ticket {key} exceeded max_lane_relaunches; background batches cannot supply human approval"
+                )
             ticket["state"] = "running"
             ticket["reason"] = ""
             ticket["run_ref"] = run_ref
             ticket["attempts"] += 1
+            ticket["attempt_token"] = "attempt_" + uuid.uuid4().hex
+            marker_jobs[-1]["attempt_token"] = ticket["attempt_token"]
             ticket["history"].append(
                 {"at": now(), "event": "batch-reserved", "batch_id": batch_id, "custom_id": custom_id}
             )
@@ -579,13 +688,31 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         running = sum(1 for value in state["tickets"].values() if value["state"] == "running")
         if running >= cfg["concurrency_max"]:
             raise SprintError(f"concurrency_max={cfg['concurrency_max']} is already reached")
+        if ticket["attempts"] > cfg["max_lane_relaunches"] and not args.human_approval.strip():
+            raise SprintError(
+                f"ticket {key} exceeded max_lane_relaunches={cfg['max_lane_relaunches']}; "
+                "a durable --human-approval reason is required"
+            )
         ticket["state"] = "running"
         ticket["reason"] = ""
         ticket["run_ref"] = args.run_ref
         ticket["attempts"] += 1
-        ticket["history"].append({"at": now(), "event": "reserved", "run_ref": args.run_ref})
+        ticket["attempt_token"] = "attempt_" + uuid.uuid4().hex
+        event = {"at": now(), "event": "reserved", "run_ref": args.run_ref}
+        if args.human_approval.strip():
+            event["human_approval"] = args.human_approval.strip()
+        ticket["history"].append(event)
         save(path, state)
-    emit({"ticket": key, "state": "running", "run_ref": args.run_ref})
+    emit({
+        "ticket": key, "state": "running", "run_ref": args.run_ref,
+        "attempt_token": ticket["attempt_token"], "attempt": ticket["attempts"],
+    })
+
+
+def require_attempt(ticket: dict[str, Any], supplied: str) -> None:
+    expected = str(ticket.get("attempt_token") or "")
+    if not expected or supplied != expected:
+        raise SprintError("attempt token is missing or stale; refusing cross-attempt state mutation")
 
 
 def attach(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
@@ -598,6 +725,7 @@ def attach(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket = state["tickets"].get(key)
         if not ticket or ticket["state"] != "running":
             raise SprintError(f"ticket {key} is not running")
+        require_attempt(ticket, args.attempt_token)
         ticket["run_ref"] = args.run_ref
         ticket["history"].append({"at": now(), "event": "attached", "run_ref": args.run_ref})
         save(path, state)
@@ -616,6 +744,7 @@ def finish(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket = state["tickets"].get(key)
         if not ticket or ticket["state"] != "running":
             raise SprintError(f"ticket {key} is not running")
+        require_attempt(ticket, args.attempt_token)
         ticket["state"] = args.outcome
         ticket["reason"] = args.summary.strip()
         ticket["branch"] = args.branch.strip()
@@ -636,17 +765,22 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         if not ticket or ticket["state"] == "completed" or ticket["state"] == "pending":
             current = ticket["state"] if ticket else "missing"
             raise SprintError(f"ticket {key} cannot be requeued from state {current}")
+        if not args.worker_stopped:
+            raise SprintError("requeue requires --worker-stopped after verifying the prior worker is gone")
+        require_attempt(ticket, args.attempt_token)
         ticket["state"] = "pending"
         ticket["reason"] = args.reason.strip()
         ticket["run_ref"] = ""
         ticket["branch"] = ""
         ticket["pr"] = ""
+        ticket["attempt_token"] = ""
         ticket["history"].append({"at": now(), "event": "requeued", "reason": args.reason.strip()})
         save(path, state)
     emit({"ticket": key, "state": "pending"})
 
 
 def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    spend = usage_snapshots(cfg)
     result: dict[str, Any] = {
         "sprint": state["sprint"],
         "completed": [],
@@ -663,6 +797,9 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
             "pr": ticket["pr"],
             "branch": ticket["branch"],
             "run_ref": ticket["run_ref"],
+            "attempts": ticket.get("attempts", 0),
+            "attempt_token": ticket.get("attempt_token", "") if ticket["state"] == "running" else "",
+            "spend": spend.get(key, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_count": 0, "state": "ok"}),
         }
         if ticket["state"] == "completed":
             result["completed"].append(item)
@@ -678,12 +815,17 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
                 item["reason"] = "; ".join(reasons)
                 result["blocked"].append(item)
             else:
-                item["reason"] = "ready but not launched"
+                item["reason"] = (
+                    "ticket spend pause requires durable human approval"
+                    if item["spend"].get("state") == "approval_required"
+                    else "ready but not launched"
+                )
                 result["user_action"].append(item)
     result["finished"] = not result["running"] and not any(
         ticket["state"] == "pending" and not blockers(state, key, cfg)
         for key, ticket in state["tickets"].items()
     )
+    result["spend"] = spend
     return result
 
 
@@ -715,11 +857,13 @@ def parser() -> argparse.ArgumentParser:
     reserve_parser.add_argument("--sprint", required=True)
     reserve_parser.add_argument("--ticket", required=True)
     reserve_parser.add_argument("--run-ref", required=True)
+    reserve_parser.add_argument("--human-approval", default="")
     reserve_parser.set_defaults(func=reserve)
     attach_parser = commands.add_parser("attach")
     attach_parser.add_argument("--sprint", required=True)
     attach_parser.add_argument("--ticket", required=True)
     attach_parser.add_argument("--run-ref", required=True)
+    attach_parser.add_argument("--attempt-token", required=True)
     attach_parser.set_defaults(func=attach)
     finish_parser = commands.add_parser("finish")
     finish_parser.add_argument("--sprint", required=True)
@@ -728,11 +872,14 @@ def parser() -> argparse.ArgumentParser:
     finish_parser.add_argument("--summary", required=True)
     finish_parser.add_argument("--branch", default="")
     finish_parser.add_argument("--pr", default="")
+    finish_parser.add_argument("--attempt-token", required=True)
     finish_parser.set_defaults(func=finish)
     requeue_parser = commands.add_parser("requeue")
     requeue_parser.add_argument("--sprint", required=True)
     requeue_parser.add_argument("--ticket", required=True)
     requeue_parser.add_argument("--reason", required=True)
+    requeue_parser.add_argument("--attempt-token", required=True)
+    requeue_parser.add_argument("--worker-stopped", action="store_true")
     requeue_parser.set_defaults(func=requeue)
     return result
 

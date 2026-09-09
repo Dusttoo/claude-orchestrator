@@ -5,6 +5,11 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/.."
+PREFLIGHT_REPO="$(mktemp -d)"
+INCOMPLETE_PLUGIN="$(mktemp -d)"
+trap 'rm -rf "$PREFLIGHT_REPO" "$INCOMPLETE_PLUGIN"' EXIT
+mkdir -p "$PREFLIGHT_REPO/.orchestration"
+cp "$ROOT/templates/config.yaml" "$PREFLIGHT_REPO/.orchestration/config.yaml"
 
 fails=0
 ok() { printf 'ok   %s\n' "$1"; }
@@ -34,6 +39,14 @@ check "template exposes optional per-role LLM routes" \
   rg -q '^[[:space:]]+roles:' "$ROOT/templates/config.yaml"
 check "template gives API runs a hard USD ceiling" \
   rg -q '^[[:space:]]+max_usd_per_run:' "$ROOT/templates/config.yaml"
+check "template enables controller authorization for reviewers" \
+  grep -Eq '^require_review_authorization:[[:space:]]*true' "$ROOT/templates/config.yaml"
+check "template sets ticket warning and pause thresholds" \
+  rg -q '^[[:space:]]+pause_usd_per_ticket:' "$ROOT/templates/config.yaml"
+check "template bounds model and reviewer run counts" \
+  rg -q '^[[:space:]]+max_reviewer_runs_per_ticket:' "$ROOT/templates/config.yaml"
+check "template bounds lane relaunches" \
+  grep -Eq '^max_lane_relaunches:[[:space:]]*[0-9]+' "$ROOT/templates/config.yaml"
 check "template requires explicit model pricing" \
   rg -q '^[[:space:]]+pricing:' "$ROOT/templates/config.yaml"
 check "template configures an active Jira sprint by default" \
@@ -84,6 +97,10 @@ check "plugin conformance runner owns worktree-cleanup suite" \
   rg -q 'worktree\.test\.sh' "$ROOT/scripts/run-plugin-conformance.sh"
 check "plugin conformance runner owns host-parity suite" \
   rg -q 'plugin-parity\.test\.sh' "$ROOT/scripts/run-plugin-conformance.sh"
+check "captain preflight accepts this exact plugin and configured repo" \
+  python3 "$ROOT/scripts/captain-preflight.py" --plugin-root "$ROOT" --repo "$PREFLIGHT_REPO" --host codex
+check "captain preflight fails when the active plugin is incomplete" \
+  sh -c '! python3 "$1/scripts/captain-preflight.py" --plugin-root "$2" --repo "$3" --host claude' sh "$ROOT" "$INCOMPLETE_PLUGIN" "$PREFLIGHT_REPO"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi

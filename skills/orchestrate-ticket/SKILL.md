@@ -25,7 +25,10 @@ Before every `design-reviewer`, `implementer`, `code-reviewer`,
 its provider request with `context_pipeline.py payload --config ... --role
 <role>` and pipes it to `scripts/api_agent.py run --request - --config
 .orchestration/config.yaml --role <role>`, including ticket, sprint, and stable
-run identifiers when available. The runner enforces role tools and USD/token
+run identifiers when available. Before each API reviewer run, issue a token with
+`api_agent.py authorize-review --ticket <ticket> --role <role> --head
+<exact-head> --authorized-by ticket-controller` and pass it to `run
+--review-authorization <token>`. The runner enforces role tools and USD/token
 ceilings. Use desktop fallback
 only after proving the API request failed before any provider/run id existed.
 Submitted, timed-out, or uncertain API work remains reserved for reconciliation
@@ -107,8 +110,10 @@ working directory.
    reason. If the planned change touches security-sensitive infrastructure, run
    a fresh pre-code design review with `orchestration-design-reviewer.md`. Open
    its durable counter with `review-ledger.py design-open <ticket-or-change>` and
-   record every result with `design-record --verdict <PASS|FAIL> --evidence
-   <artifact>`. It must
+   record FAIL with `design-record --verdict FAIL --evidence <artifact>`. A PASS
+   must use `design-record --result <json>` with schema version 1, gate
+   `design-review`, verdict, exact `source_sha`, named artifact, and non-empty
+   pass/fail checks. A generic completed message cannot authorize code. It must
    define the trust boundary and impossible guarantees, reject fragile designs,
    audit the matrix, and end `VERDICT: PASS`. A FAIL returns to design until
    `max_design_rounds`; then stop with `design-handoff`. Pass the approved

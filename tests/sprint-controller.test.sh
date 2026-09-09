@@ -61,24 +61,31 @@ json_check "dependency and cycle tickets wait without stopping independent work"
 
 run_ok "first lane reserves atomically" "$CONTROLLER" reserve --sprint 42 --ticket PROJ-1 --run-ref pending-one
 run_ok "second lane reserves atomically" "$CONTROLLER" reserve --sprint 42 --ticket PROJ-3 --run-ref pending-three
+TOKEN1="$("$CONTROLLER" summary --sprint 42 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["attempt_token"] for x in d["running"] if x["key"]=="PROJ-1"))')"
+TOKEN3="$("$CONTROLLER" summary --sprint 42 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["attempt_token"] for x in d["running"] if x["key"]=="PROJ-3"))')"
 run_fail "third reservation is rejected at concurrency_max" "$CONTROLLER" reserve --sprint 42 --ticket PROJ-2 --run-ref should-fail
-run_ok "actual worker reference attaches after launch" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --run-ref codex-task-one
+run_fail "stale worker cannot attach without its attempt token" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --run-ref stale --attempt-token attempt_stale
+run_ok "actual worker reference attaches after launch" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --run-ref codex-task-one --attempt-token "$TOKEN1"
 
 "$CONTROLLER" plan --sprint 42 > "$TMP/restart.json"
 json_check "restart exposes running work for reconciliation" "$TMP/restart.json" 'data["needs_reconcile"] == ["PROJ-1", "PROJ-3"] and data["launch"] == []'
 
-run_ok "completed prerequisite checkpoints immediately" "$CONTROLLER" finish --sprint 42 --ticket PROJ-1 --outcome completed --summary merged --pr 101 --branch feature/one
-run_ok "blocked independent ticket frees its lane" "$CONTROLLER" finish --sprint 42 --ticket PROJ-3 --outcome blocked --summary 'test failure'
+run_ok "completed prerequisite checkpoints immediately" "$CONTROLLER" finish --sprint 42 --ticket PROJ-1 --outcome completed --summary merged --pr 101 --branch feature/one --attempt-token "$TOKEN1"
+run_ok "blocked independent ticket frees its lane" "$CONTROLLER" finish --sprint 42 --ticket PROJ-3 --outcome blocked --summary 'test failure' --attempt-token "$TOKEN3"
 "$CONTROLLER" plan --sprint 42 > "$TMP/plan2.json"
 json_check "completed prerequisite unlocks dependent ticket" "$TMP/plan2.json" 'data["launch"] == ["PROJ-2"]'
 
 run_ok "unlocked ticket reserves" "$CONTROLLER" reserve --sprint 42 --ticket PROJ-2 --run-ref pending-two
+TOKEN2="$("$CONTROLLER" summary --sprint 42 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["attempt_token"] for x in d["running"] if x["key"]=="PROJ-2"))')"
 run_ok "running ticket survives inventory resync" "$CONTROLLER" sync --inventory inventory.json
 "$CONTROLLER" plan --sprint 42 > "$TMP/resync.json"
 json_check "resync does not duplicate a running workflow" "$TMP/resync.json" 'data["needs_reconcile"] == ["PROJ-2"] and "PROJ-2" not in data["launch"]'
-run_ok "lost worker can be explicitly requeued after proof" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker no longer exists'
+run_fail "requeue without stopped-worker proof fails closed" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason missing-proof --attempt-token "$TOKEN2"
+run_ok "lost worker can be explicitly requeued after proof" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker no longer exists' --attempt-token "$TOKEN2" --worker-stopped
 run_ok "requeued ticket can reserve again" "$CONTROLLER" reserve --sprint 42 --ticket PROJ-2 --run-ref codex-task-two
-run_ok "recovered ticket completes" "$CONTROLLER" finish --sprint 42 --ticket PROJ-2 --outcome completed --summary merged --pr 102 --branch feature/two
+TOKEN2B="$("$CONTROLLER" summary --sprint 42 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["attempt_token"] for x in d["running"] if x["key"]=="PROJ-2"))')"
+run_fail "superseded attempt cannot finish replacement" "$CONTROLLER" finish --sprint 42 --ticket PROJ-2 --outcome blocked --summary stale --attempt-token "$TOKEN2"
+run_ok "recovered ticket completes" "$CONTROLLER" finish --sprint 42 --ticket PROJ-2 --outcome completed --summary merged --pr 102 --branch feature/two --attempt-token "$TOKEN2B"
 
 "$CONTROLLER" summary --sprint 42 > "$TMP/summary.json"
 json_check "summary separates completed, blocked, and user action" "$TMP/summary.json" '([x["key"] for x in data["completed"]] == ["PROJ-1", "PROJ-2"] and [x["key"] for x in data["user_action"]] == ["PROJ-8"] and set(x["key"] for x in data["blocked"]) == {"PROJ-3", "PROJ-4", "PROJ-5", "PROJ-6", "PROJ-7"})'
@@ -107,8 +114,9 @@ json_check "unprioritized tickets sort after every ranked ticket" "$TMP/priority
 
 run_ok "priority lane one reserves" "$CONTROLLER" reserve --sprint 43 --ticket PROJ-22 --run-ref p-one
 run_ok "priority lane two reserves" "$CONTROLLER" reserve --sprint 43 --ticket PROJ-23 --run-ref p-two
+TOKEN22="$("$CONTROLLER" summary --sprint 43 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["attempt_token"] for x in d["running"] if x["key"]=="PROJ-22"))')"
 run_fail "priority board still refuses a third lane" "$CONTROLLER" reserve --sprint 43 --ticket PROJ-21 --run-ref p-jump
-run_ok "priority lane one finishes" "$CONTROLLER" finish --sprint 43 --ticket PROJ-22 --outcome completed --summary merged --pr 201 --branch feature/p-one
+run_ok "priority lane one finishes" "$CONTROLLER" finish --sprint 43 --ticket PROJ-22 --outcome completed --summary merged --pr 201 --branch feature/p-one --attempt-token "$TOKEN22"
 "$CONTROLLER" plan --sprint 43 > "$TMP/priority-plan2.json"
 json_check "next lane goes to the ranked ticket, not the unranked one" "$TMP/priority-plan2.json" 'data["launch"] == ["PROJ-20"]'
 
@@ -138,6 +146,10 @@ cat > "$TMP/repo/duplicate.json" <<'JSON'
 {"project":"PROJ","sprint":{"id":"99","name":"bad"},"tickets":[{"key":"PROJ-1","status":"Ready"},{"key":"proj-1","status":"Ready"}]}
 JSON
 run_fail "duplicate normalized Jira keys fail closed" "$CONTROLLER" sync --inventory duplicate.json
+cat > "$TMP/repo/missing-subtask.json" <<'JSON'
+{"project":"PROJ","sprint":{"id":"100","name":"bad child inventory"},"source_query":"q","tickets":[{"key":"PROJ-1","status":"Ready","subtasks":["PROJ-2"]}]}
+JSON
+run_fail "missing referenced Jira subtasks fail closed" "$CONTROLLER" sync --inventory missing-subtask.json
 run_fail "checkpoint directory cannot escape the repository" "$CONTROLLER" --state-dir ../outside sync --inventory inventory.json
 
 cat > "$TMP/repo/batch-inventory.json" <<'JSON'

@@ -26,6 +26,11 @@
 # explicitly migrate to schema_version: 2.
 schema_version: 1
 
+# Reviewer API runs require a single-use controller token bound to ticket, role,
+# and exact commit. Keep enabled; it prevents implementers from creating their
+# own unmetered review loops.
+require_review_authorization: true
+
 # --- LLM execution routing ---------------------------------------------- agent
 # Existing repositories remain on desktop execution unless they opt into API.
 # Provider/model/effort are used only by API routes. A role inherits every
@@ -48,8 +53,12 @@ llm:
   # worktree, so N concurrent lanes share one ceiling instead of getting N.
   budgets:
     max_usd_per_run: 1.00
+    warn_usd_per_ticket: 1.00     # event only; work continues
+    pause_usd_per_ticket: 1.50    # requires durable human approval to continue
     max_usd_per_ticket: 2.00
     max_usd_per_sprint: 20.00
+    max_model_runs_per_ticket: 12 # unique run ids, not provider tool-round calls
+    max_reviewer_runs_per_ticket: 6
     max_output_tokens_per_turn: 4096
     max_tool_rounds: 8
     max_tool_output_chars: 12000
@@ -145,6 +154,10 @@ llm:
 # --- Branch model --------------------------------------------------------- both
 integration_branch: ""          # fill for schema v1, e.g. the branch feature work targets
 production_branch: ""           # fill for schema v1, e.g. the protected release/history target
+
+# Initial launch plus this many recovery launches are automatic. A later launch
+# requires `reserve --human-approval <operator reason>` and records that reason.
+max_lane_relaunches: 2
 
 # --- Merge strategy per target -------------------------------------------- both
 merge_to_integration: merge     # merge | squash. `merge` preserves per-PR history

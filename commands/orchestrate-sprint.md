@@ -9,6 +9,14 @@ On Linux hosts invoke Python scripts with python3; the python alias may be absen
 `${CLAUDE_PLUGIN_ROOT}/scripts/sprint-controller.py` for dependency
 normalization, atomic lane reservation, checkpoints, recovery, and summaries.
 
+0. Run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/captain-preflight.py
+   --plugin-root ${CLAUDE_PLUGIN_ROOT} --repo . --host claude`. Continue only
+   when it returns `status: ready` and `captain_mode: controller-only`. If this
+   script or this exact command is absent, stop as `user_action`: never infer the
+   plugin purpose, invent a similarly named skill, or operate sprint tickets
+   directly. Record its plugin version and runtime fingerprint in the first
+   checkpoint/status event.
+
 1. Read `.orchestration/config.yaml`; validate it with
    `${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py validate-config`.
    Require `ticket.kind: jira`, `ticket.project`, `sprint_id` (overridden by
@@ -39,6 +47,8 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    ticket occupies the configured `blocked_side`; the opposite issue is its
    prerequisite. Fetch each ticket's priority when the project ranks its work.
    Never guess link direction, missing status, or an absent priority.
+   Expand every referenced subtask into its own inventory ticket. Sync rejects
+   any parent whose `subtasks` keys are absent from the inventory.
 
 3. Write the fetched data beneath `sprint_checkpoint_dir` (default
    `.orchestration/.sprint-state`) as JSON:
@@ -62,12 +72,14 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    the prior agent no longer exists. Never duplicate an uncertain run.
    A resolved blocked or user-action ticket may also be explicitly requeued with
    the evidence in `--reason`; completed tickets cannot be requeued.
+   Requeue requires its current `--attempt-token` and `--worker-stopped`.
 
 5. For each key in `plan.launch` — already ordered by `(priority, key)`, so
    launch in that order and never reprioritize locally — first create a unique
    provisional reference and run `reserve --sprint <id> --ticket <key>
    --run-ref <provisional>`. Reserve is the authoritative `concurrency_max`
-   check. Then launch a fresh isolated
+   check. Preserve the returned `attempt_token` and pass it to every attach,
+   finish, or requeue for this lane. Then launch a fresh isolated
    worker that runs `/orchestration:orchestrate <key>` with the freshly fetched
    ticket body and acceptance criteria. On Codex SSH/CLI hosts, if native
    multi-agent tools are unavailable, launch a detached `codex exec
@@ -79,7 +91,7 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    because native subagents are unavailable when the Codex CLI fallback can run.
    If neither launch mechanism exists, record `user_action` and preserve the
    reservation for reconciliation. After a real launch, run `attach --sprint <id>
-   --ticket <key> --run-ref <actual-agent-ref>`.
+   --ticket <key> --run-ref <actual-agent-ref> --attempt-token <token>`.
 
    For a lane explicitly marked `background: true` and `interactive: false`, do
    not start an interactive worker. Use the resolved API route and assemble each
@@ -98,7 +110,7 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
 
 6. On every worker result, immediately run `finish --sprint <id> --ticket <key>
    --outcome completed|blocked|user_action --summary <text> --pr <pr> --branch
-   <branch>`. Completed means the per-ticket pipeline verified its merge;
+   <branch> --attempt-token <token>`. Completed means the per-ticket pipeline verified its merge;
    technical failures are blocked; missing authority, credentials, clarification,
    or external coordination are user action.
 
@@ -112,6 +124,9 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    `max_heavy_processes`. If the API ledger shows sustained throttling for one
    provider, pause new admissions to that provider while preserving reservations
    and letting healthy routes continue; `api_agent.py` owns bounded retries.
+   Treat `spend.state: approval_required` and model/reviewer run-count errors as
+   user actions, never reasons to relaunch. A human may extend a ticket pause
+   boundary only through `api_agent.py approve-ticket-budget`.
 
    In the default event-driven status mode, block on worker wait primitives or
    detached process ids instead of spending model turns polling unchanged

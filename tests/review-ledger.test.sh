@@ -11,12 +11,18 @@ bad() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }
 eq() { if [ "$2" = "$3" ]; then ok "$1"; else printf 'FAIL %s\n     want: [%s]\n     got:  [%s]\n' "$1" "$2" "$3"; fails=$((fails + 1)); fi; }
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+LANE="${TMP}-lane"
+trap 'rm -rf "$TMP" "$LANE"' EXIT
 git -C "$TMP" init -q .
+git -C "$TMP" -c user.name=Test -c user.email=test@example.com commit --allow-empty -qm initial
 mkdir -p "$TMP/.orchestration"
 
 led() { (cd "$TMP" && python3 "$LEDGER" "$@"); }
 field() { python3 -c "import json,sys; v=json.load(sys.stdin)['$1']; print(','.join(v) if isinstance(v,list) else v)"; }
+
+git -C "$TMP" worktree add -qb review-ledger-lane "$LANE"
+(cd "$LANE" && python3 "$LEDGER" open shared-pr >/dev/null)
+eq "linked worktrees share one review ledger" "review" "$(led status shared-pr | field next_action)"
 
 # --- key normalization --------------------------------------------------------
 led open 1 >/dev/null
@@ -136,6 +142,13 @@ led brief 7 | grep -q "REDESIGN REQUIRED" && ok "the brief flags a component nee
 led design-open BL-1 --max-design-rounds 2 >/dev/null
 eq "a failed design returns to redesign" "redesign" "$(led design-record BL-1 --verdict FAIL --evidence 'boundary incomplete' | field next_action)"
 eq "the independent design cap escalates" "escalate-human" "$(led design-record BL-1 --verdict FAIL --evidence 'boundary still incomplete' | field next_action)"
+
+led design-open BL-2 >/dev/null
+HEAD_SHA="$(git -C "$TMP" rev-parse HEAD)"
+cat > "$TMP/design-pass.json" <<JSON
+{"schema_version":1,"gate":"design-review","verdict":"PASS","source_sha":"$HEAD_SHA","artifact":"design/BL-2.md","checks":[{"name":"trust-boundary","status":"pass"}]}
+JSON
+eq "design PASS requires exact-head machine evidence" "implement" "$(led design-record BL-2 --result "$TMP/design-pass.json" | field next_action)"
 led design-handoff BL-1 | grep -q 'No production implementation is authorized' && ok "design handoff blocks implementation" || bad "design handoff blocks implementation"
 
 # --- aliasing merges a drifted key --------------------------------------------
