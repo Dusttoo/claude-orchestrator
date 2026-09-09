@@ -312,13 +312,16 @@ cat > "$TMP/batch-terminal.json" <<JSON
 JSON
 run_fail "hand-authored terminal JSON cannot transition an uncertain batch" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --provider-evidence "$TMP/batch-terminal.json"
 cat > "$TMP/batch-transport.json" <<'JSON'
-{"status":{"id":"msgbatch_test","processing_status":"cancelled"},"result_pages":[]}
+{"submit":{"id":"msgbatch_test","type":"message_batch","processing_status":"in_progress"},"status":{"id":"msgbatch_test","processing_status":"cancelled"},"result_pages":[]}
 JSON
-run_ok "adapter-owned terminal lookup releases reservations" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --provider-batch-id msgbatch_test --test-transport "$TMP/batch-transport.json"
+run_ok "credential-owning adapter submits the prepared batch" "$CONTROLLER" submit-batch --batch "$BATCH_ID" --test-transport "$TMP/batch-transport.json"
+run_fail "caller provider id cannot authorize reconciliation" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --provider-batch-id msgbatch_test --test-transport "$TMP/batch-transport.json"
+run_ok "adapter-owned terminal lookup releases reservations" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --test-transport "$TMP/batch-transport.json"
 run_ok "terminal batch reconciliation is idempotent" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --test-transport "$TMP/batch-transport.json"
 python3 - "$TMP/batch-result.json" <<'PY'
 import json,sys
-result=json.load(open(sys.argv[1])); marker=json.load(open(result["marker"])); marker["status"]="reconciling_failed"
+result=json.load(open(sys.argv[1])); marker=json.load(open(result["marker"])); marker["status"]="reconciling"
+first=next(iter(marker["application_journal"].values())); first["state_applied"]=False
 json.dump(marker,open(result["marker"],"w"),indent=2)
 PY
 run_ok "crash-partial batch reconciliation resumes idempotently" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --test-transport "$TMP/batch-transport.json"
@@ -350,6 +353,35 @@ assert line["method"] == "POST" and line["url"] == "/v1/responses"
 assert marker["endpoint"] == "/v1/batches" and marker["provider"] == "openai"
 PY
 if [ "$?" -eq 0 ]; then ok "OpenAI background lanes serialize to Batch JSONL"; else fail_case "OpenAI background lanes serialize to Batch JSONL"; fi
+OPENAI_BATCH_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["batch_id"])' "$TMP/openai-batch-result.json")"
+cat > "$TMP/openai-nonterminal.json" <<'JSON'
+{"upload":{"id":"file_in","object":"file","purpose":"batch"},"submit":{"id":"batch_openai","object":"batch","status":"validating"},"status":{"id":"batch_openai","object":"batch","status":"in_progress"}}
+JSON
+run_ok "OpenAI adapter owns upload and batch creation" "$CONTROLLER" submit-batch --batch "$OPENAI_BATCH_ID" --test-transport "$TMP/openai-nonterminal.json"
+run_fail "nonterminal OpenAI status preserves reservations" "$CONTROLLER" reconcile-batch --batch "$OPENAI_BATCH_ID" --outcome completed --test-transport "$TMP/openai-nonterminal.json"
+cat > "$TMP/openai-partial.json" <<'JSON'
+{"status":{"id":"batch_openai","object":"batch","status":"completed","input_file_id":"file_in","output_file_id":"file_out","request_counts":{"total":1,"completed":1,"failed":0}},"result_pages":[[]]}
+JSON
+run_fail "partial terminal results preserve reservations" "$CONTROLLER" reconcile-batch --batch "$OPENAI_BATCH_ID" --outcome completed --test-transport "$TMP/openai-partial.json"
+cat > "$TMP/openai-complete.json" <<'JSON'
+{"status":{"id":"batch_openai","object":"batch","status":"completed","input_file_id":"file_in","output_file_id":"file_out","request_counts":{"total":1,"completed":1,"failed":0}},"result_pages":[[{"id":"batch_req_50","custom_id":"PLACEHOLDER","response":{"status_code":200,"request_id":"req_50","body":{"id":"resp_50","object":"response","usage":{"input_tokens":13,"input_tokens_details":{"cached_tokens":4},"output_tokens":9,"output_tokens_details":{"reasoning_tokens":2}}}},"error":null}]]}
+JSON
+python3 - "$TMP/openai-batch-result.json" "$TMP/openai-complete.json" <<'PY'
+import json,sys
+result=json.load(open(sys.argv[1])); marker=json.load(open(result["marker"])); transport=json.load(open(sys.argv[2]))
+transport["result_pages"][0][0]["custom_id"]=marker["jobs"][0]["custom_id"]
+json.dump(transport,open(sys.argv[2],"w"))
+PY
+run_ok "native OpenAI terminal envelope settles nested response usage" "$CONTROLLER" reconcile-batch --batch "$OPENAI_BATCH_ID" --outcome completed --test-transport "$TMP/openai-complete.json"
+python3 - "$TMP/openai-batch-result.json" "$TMP/repo/.orchestration/.llm-usage/usage.jsonl" <<'PY'
+import json,sys
+result=json.load(open(sys.argv[1])); marker=json.load(open(result["marker"])); events=[json.loads(x) for x in open(sys.argv[2])]
+usage=next(x for x in events if x.get("response_id")=="resp_50")
+assert marker["status"] == "completed"
+assert marker["results_sha256"] and marker["terminal_bundle"]["sha256"]
+assert usage["input_tokens"] == 13 and usage["cache_read_tokens"] == 4 and usage["reasoning_tokens"] == 2
+PY
+if [ "$?" -eq 0 ]; then ok "results digest freezes before idempotent settlement"; else fail_case "results digest freezes before idempotent settlement"; fi
 
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi

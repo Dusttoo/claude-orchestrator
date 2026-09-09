@@ -204,10 +204,13 @@ Before launching, resolve the executable because non-interactive SSH shells may 
    of launching interactive workers. The controller rejects interactive jobs,
    atomically reserves the lanes, and writes a provider-native request and
    marker under `.orchestration/.sprint-state/`.
-   Submit Anthropic JSON to `POST /v1/messages/batches`; upload OpenAI JSONL and
-   create `POST /v1/batches`. Reconcile only through `sprint-controller.py reconcile-batch --batch <local-id> --provider-batch-id <provider-id> --outcome completed|failed`.
-   The controller invokes the authenticated provider adapter, downloads the
-   complete terminal result set, and journals each `custom_id` application.
+   Submit only through `sprint-controller.py submit-batch --batch <local-id>`;
+   its authenticated adapter posts Anthropic JSON or uploads OpenAI JSONL and
+   creates the provider batch without exposing credentials or accepting a
+   caller-supplied provider id. Reconcile only through `sprint-controller.py
+   reconcile-batch --batch <local-id> --outcome completed|failed`. The adapter
+   downloads the complete terminal result/error set, freezes its digest, and
+   journals each `custom_id` application.
    Caller-authored terminal JSON is never authoritative.
 
 6. **Checkpoint every outcome.** As workers finish, immediately call:

@@ -76,10 +76,13 @@ Non-interactive background lanes can be prepared with `prepare-batch`. The
 controller accepts only current `plan.launch` tickets explicitly marked as
 background and non-interactive, reserves them under the sprint lock, and writes
 an Anthropic Message Batches JSON request or OpenAI Batch JSONL plus a durable
-marker beneath the configured checkpoint directory. The host submits the batch
-and records its provider id. Reconciliation invokes the provider adapter for
-terminal state and complete results, then applies each `custom_id` idempotently
-before normal per-ticket `finish` calls.
+marker beneath the configured checkpoint directory. `submit-batch` invokes the
+credential-owning adapter, which uploads or submits the immutable request and
+records a content-addressed acceptance receipt. `reconcile-batch` invokes that
+same adapter for terminal state and every native result/error page, freezes a
+content-addressed normalized bundle, and applies each `custom_id` idempotently
+before normal per-ticket `finish` calls. An ambiguous submission, nonterminal
+status, or incomplete result set leaves every affected reservation fenced.
 
 ## Ready ordering
 

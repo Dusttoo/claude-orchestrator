@@ -109,9 +109,12 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    provider-native request plus a durable state marker under
    `.orchestration/.sprint-state/`. Anthropic emits a Message Batches JSON body
    for `POST /v1/messages/batches`; OpenAI emits Batch JSONL for upload and
-   `POST /v1/batches`. Reconcile only through `reconcile-batch --batch <local-id> --provider-batch-id <provider-id> --outcome completed|failed`;
-   its provider adapter owns terminal lookup and complete result download,
-   journaling each `custom_id`. A prepared batch marker is not a completed ticket.
+   `POST /v1/batches`. Run `submit-batch --batch <local-id>` so the authenticated
+   adapter owns upload, submission, and the provider id. Reconcile only through
+   `reconcile-batch --batch <local-id> --outcome completed|failed`; its provider
+   adapter owns terminal lookup and complete result/error download, freezes the
+   normalized digest, and journals each `custom_id`. A prepared or uncertain
+   batch marker is not a completed ticket and its reservations stay fenced.
 
 6. On every worker result, immediately run `finish --sprint <id> --ticket <key>
    --outcome completed|blocked|user_action --summary <text> --pr <pr> --branch
