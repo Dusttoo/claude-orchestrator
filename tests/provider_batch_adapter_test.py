@@ -43,7 +43,7 @@ class ProviderBatchAdapterTests(unittest.TestCase):
                 "reasoning_tokens": 0,
             },
         )
-        self.assertEqual(rows[1]["outcome"], "failed")
+        self.assertEqual(rows[1]["outcome"], "ambiguous")
         self.assertEqual(rows[1]["error"]["type"], "invalid_request")
 
     def test_normalizes_authentic_openai_nested_response_and_usage(self):
@@ -56,7 +56,51 @@ class ProviderBatchAdapterTests(unittest.TestCase):
         self.assertEqual(rows[0]["response_id"], "resp_01")
         self.assertEqual(rows[0]["usage"]["cache_read_tokens"], 4)
         self.assertEqual(rows[0]["usage"]["reasoning_tokens"], 2)
-        self.assertEqual(rows[1]["outcome"], "failed")
+        self.assertEqual(rows[1]["outcome"], "ambiguous")
+
+    def test_releases_only_provider_documented_pre_execution_results(self):
+        anthropic_rows = []
+        for index, result_type in enumerate(("canceled", "expired", "errored")):
+            anthropic_rows.append(
+                {
+                    "custom_id": f"anthropic-{index}",
+                    "result": {"type": result_type, "error": {"type": "api_error"}},
+                }
+            )
+        normalized = adapter.normalize_results(
+            "anthropic",
+            anthropic_rows,
+            {row["custom_id"] for row in anthropic_rows},
+        )
+        by_id = {row["custom_id"]: row for row in normalized}
+        for custom_id in ("anthropic-0", "anthropic-1"):
+            self.assertEqual(by_id[custom_id]["outcome"], "failed")
+            self.assertIs(by_id[custom_id]["provider_proven_nonexecuted"], True)
+        self.assertEqual(by_id["anthropic-2"]["outcome"], "ambiguous")
+        self.assertNotIn("provider_proven_nonexecuted", by_id["anthropic-2"])
+
+        openai_rows = []
+        for index, code in enumerate(
+            ("batch_cancelled", "batch_expired", "request_timeout", "api_error")
+        ):
+            openai_rows.append(
+                {
+                    "id": f"batch_req_{index}",
+                    "custom_id": f"openai-{index}",
+                    "response": None,
+                    "error": {"code": code, "message": code},
+                }
+            )
+        normalized = adapter.normalize_results(
+            "openai", openai_rows, {row["custom_id"] for row in openai_rows}
+        )
+        by_id = {row["custom_id"]: row for row in normalized}
+        for custom_id in ("openai-0", "openai-1"):
+            self.assertEqual(by_id[custom_id]["outcome"], "failed")
+            self.assertIs(by_id[custom_id]["provider_proven_nonexecuted"], True)
+        for custom_id in ("openai-2", "openai-3"):
+            self.assertEqual(by_id[custom_id]["outcome"], "ambiguous")
+            self.assertNotIn("provider_proven_nonexecuted", by_id[custom_id])
 
     def test_rejects_duplicate_missing_and_unknown_custom_ids(self):
         valid = self.fixture("anthropic-batch-results.json")

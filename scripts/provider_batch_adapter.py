@@ -489,12 +489,18 @@ def normalize_results(
                     "response_id": response_id,
                     "usage": normalized_usage,
                 }
-            elif result_type in {"errored", "canceled", "expired"}:
+            elif result_type in {"canceled", "expired"}:
                 item = {
                     "custom_id": custom_id,
                     "outcome": "failed",
                     "error": result.get("error") or {"type": result_type},
                     "provider_proven_nonexecuted": True,
+                }
+            elif result_type == "errored":
+                item = {
+                    "custom_id": custom_id,
+                    "outcome": "ambiguous",
+                    "error": result.get("error") or {"type": result_type},
                 }
             else:
                 raise ValueError(f"result for {custom_id} is not terminal")
@@ -551,12 +557,22 @@ def normalize_results(
                         ),
                     },
                 }
-            elif isinstance(error, dict) and str(error.get("code") or ""):
+            elif (
+                isinstance(error, dict)
+                and str(error.get("code") or "")
+                in {"batch_cancelled", "batch_expired"}
+            ):
                 item = {
                     "custom_id": custom_id,
                     "outcome": "failed",
                     "error": error,
                     "provider_proven_nonexecuted": True,
+                }
+            elif isinstance(error, dict) and str(error.get("code") or ""):
+                item = {
+                    "custom_id": custom_id,
+                    "outcome": "ambiguous",
+                    "error": error,
                 }
             elif (
                 isinstance(response, dict)
