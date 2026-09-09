@@ -73,8 +73,8 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    the prior agent no longer exists. Never duplicate an uncertain run.
    A resolved blocked or user-action ticket may also be explicitly requeued with
    the evidence in `--reason`; completed tickets cannot be requeued.
-   Seal the sanitized fetch and pagination metadata with
-   `jira_inventory_receipt.py` before sync. Requeue requires its current
+   Produce an adapter-owned exact-page artifact with
+   `jira_inventory_fetch.py` before sync. Requeue requires its current
    `--attempt-token` and mechanical process/workspace-lease liveness proof, or
    a separately provisioned single-use operator capability.
 
@@ -82,8 +82,8 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    launch in that order and never reprioritize locally — first create a unique
    provisional reference and run `reserve --sprint <id> --ticket <key>
    --run-ref <provisional>`. Reserve is the authoritative `concurrency_max`
-   check. Preserve the returned `attempt_token` and pass it to every attach,
-   finish, or requeue for this lane. Then launch a fresh isolated
+   check. Preserve the returned `attempt_token` for finish/requeue and the
+   separate one-use `attach_capability` for controller attach. Then launch a fresh isolated
    worker that runs `/orchestration:orchestrate <key>` with the freshly fetched
    ticket body and acceptance criteria. On Codex SSH/CLI hosts, if native
    multi-agent tools are unavailable, launch a detached `codex exec

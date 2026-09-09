@@ -145,7 +145,7 @@ self_check:
         ).stdout.strip()
         permit = subprocess.run(
             [sys.executable, str(ROOT / "scripts/review-ledger.py"), "permit-review", pr,
-             "--ticket", ticket, "--role", role, "--head", head],
+             "--role", role, "--head", head],
             cwd=self.root, check=True, capture_output=True, text=True,
         )
         return json.loads(permit.stdout)["review_phase_permit"]
@@ -1182,16 +1182,16 @@ self_check:
         with self.assertRaisesRegex(api_agent.ReviewPermitError, "does not match"):
             api_agent.consume_review_permit(
                 shared_root=self.root, ledger_dir=".orchestration/.review-ledger", pr="1",
-                token=token, ticket="PROJ-1", role="security-reviewer", head=head, timestamp="now",
+                token=token, role="security-reviewer", head=head, timestamp="now",
             )
         api_agent.consume_review_permit(
             shared_root=self.root, ledger_dir=".orchestration/.review-ledger", pr="1",
-            token=token, ticket="PROJ-1", role="code-reviewer", head=head, timestamp="now",
+            token=token, role="code-reviewer", head=head, timestamp="now",
         )
         with self.assertRaisesRegex(api_agent.ReviewPermitError, "already started"):
             api_agent.consume_review_permit(
                 shared_root=self.root, ledger_dir=".orchestration/.review-ledger", pr="1",
-                token=token, ticket="PROJ-1", role="code-reviewer", head=head, timestamp="later",
+                token=token, role="code-reviewer", head=head, timestamp="later",
             )
 
     def test_explicit_rate_limit_retries_with_same_reservation(self):

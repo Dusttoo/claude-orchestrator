@@ -26,7 +26,7 @@ its provider request with `context_pipeline.py payload --config ... --role
 <role>` and pipes it to `scripts/api_agent.py run --request - --config
 .orchestration/config.yaml --role <role>`, including ticket, sprint, and stable
 run identifiers when available. Before each API reviewer run, issue a phase
-permit with `review-ledger.py permit-review <pr-or-design-id> --ticket <ticket>
+permit with `review-ledger.py permit-review <pr-or-design-id>
 --role <role> --head <full-exact-head>` and pass it to `run --review-pr
 <pr-or-design-id> --review-authorization <token>`. The runner enforces role tools and USD/token
 ceilings. Use desktop fallback

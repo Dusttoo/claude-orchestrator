@@ -29,17 +29,19 @@ json_check() {
   fi
 }
 jira_receipt() {
-  python3 - "$1" <<'PY'
-import hashlib, json, sys
-p=sys.argv[1]; value=json.load(open(p))
-payload={"source":"jira-client","source_query":value["source_query"],
-"subtask_source_query":value["subtask_source_query"],
-"parent_keys":sorted(x["key"].upper() for x in value["tickets"]),
-"child_keys":sorted(x.upper() for x in value["subtask_keys"]),
-"pages":[{"start_at":0,"count":len(value["tickets"])}]}
-value["fetch_receipt"]={**payload,"sha256":hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(",",":")).encode()).hexdigest()}
-json.dump(value,open(p,"w"),indent=2)
+  local inventory="$1" artifact="$1.fetch.json" parents="$1.parents.json" children="$1.children.json"
+  python3 - "$inventory" "$parents" "$children" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1])); parents=sorted(x["key"].upper() for x in value["tickets"])
+children=sorted(x.upper() for x in value["subtask_keys"])
+by_key={x["key"].upper():x for x in value["tickets"]}
+parent_issues=[{"key":key,"fields":{"subtasks":[{"key":x} for x in by_key[key].get("subtasks",[])]}} for key in parents]
+child_issues=[{"key":key,"fields":{"parent":{"key":by_key.get(key,{}).get("parent","")}}} for key in children]
+json.dump([{"startAt":0,"total":len(parents),"isLast":True,"issues":parent_issues}],open(sys.argv[2],"w"))
+json.dump([{"startAt":0,"total":len(children),"isLast":True,"issues":child_issues}],open(sys.argv[3],"w"))
 PY
+  python3 "$ROOT/scripts/jira_inventory_fetch.py" --inventory "$inventory" \
+    --parent-pages "$parents" --child-pages "$children" --artifact "$artifact" --output "$inventory"
 }
 
 mkdir -p "$TMP/repo/.git" "$TMP/repo/.orchestration"
@@ -71,6 +73,30 @@ jira_receipt "$TMP/repo/inventory.json"
 
 cd "$TMP/repo" || exit 1
 run_ok "sync creates normalized durable checkpoint" "$CONTROLLER" sync --inventory inventory.json
+python3 - inventory.json "$TMP/repo/gapped.json" "$TMP/repo/gapped.fetch.json" <<'PY'
+import copy,json,sys
+value=json.load(open(sys.argv[1])); artifact=json.load(open(value["fetch_artifact"]["path"]))
+artifact["queries"][0]["pages"][0]["start_at"]=1
+json.dump(artifact,open(sys.argv[3],"w")); value["fetch_artifact"]["path"]=sys.argv[3]
+json.dump(value,open(sys.argv[2],"w"))
+PY
+run_fail "gapped Jira pagination is rejected" "$CONTROLLER" sync --inventory "$TMP/repo/gapped.json"
+python3 - inventory.json "$TMP/repo/truncated.json" "$TMP/repo/truncated.fetch.json" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1])); artifact=json.load(open(value["fetch_artifact"]["path"]))
+artifact["queries"][0]["pages"][0]["total"]+=1
+json.dump(artifact,open(sys.argv[3],"w")); value["fetch_artifact"]["path"]=sys.argv[3]
+json.dump(value,open(sys.argv[2],"w"))
+PY
+run_fail "Jira pages truncated before provider total are rejected" "$CONTROLLER" sync --inventory "$TMP/repo/truncated.json"
+python3 - inventory.json "$TMP/repo/wrong-items.json" "$TMP/repo/wrong-items.fetch.json" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1])); artifact=json.load(open(value["fetch_artifact"]["path"]))
+artifact["queries"][0]["pages"][0]["item_keys"][0]="PROJ-999"
+json.dump(artifact,open(sys.argv[3],"w")); value["fetch_artifact"]["path"]=sys.argv[3]
+json.dump(value,open(sys.argv[2],"w"))
+PY
+run_fail "Jira page evidence must bind exact item keys" "$CONTROLLER" sync --inventory "$TMP/repo/wrong-items.json"
 "$CONTROLLER" plan --sprint 42 > "$TMP/plan1.json"
 json_check "plan fills exactly two lanes" "$TMP/plan1.json" 'data["launch"] == ["PROJ-1", "PROJ-3"] and data["concurrency_max"] == 2'
 json_check "dependency and cycle tickets wait without stopping independent work" "$TMP/plan1.json" 'len(data["waiting"]) == 4'
@@ -78,10 +104,11 @@ json_check "dependency and cycle tickets wait without stopping independent work"
 "$CONTROLLER" reserve --sprint 42 --ticket PROJ-1 --run-ref pending-one > "$TMP/reserve1.json" && ok "first lane reserves atomically" || bad "first lane reserves atomically"
 "$CONTROLLER" reserve --sprint 42 --ticket PROJ-3 --run-ref pending-three > "$TMP/reserve3.json" && ok "second lane reserves atomically" || bad "second lane reserves atomically"
 TOKEN1="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_token"])' "$TMP/reserve1.json")"
+ATTACH1="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attach_capability"])' "$TMP/reserve1.json")"
 TOKEN3="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_token"])' "$TMP/reserve3.json")"
 run_fail "third reservation is rejected at concurrency_max" "$CONTROLLER" reserve --sprint 42 --ticket PROJ-2 --run-ref should-fail
-run_fail "stale worker cannot attach without its attempt token" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --run-ref stale --attempt-token attempt_stale
-run_ok "actual worker reference attaches after launch" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --run-ref pid:999999 --attempt-token "$TOKEN1"
+run_fail "stale worker cannot attach without its controller capability" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --run-ref stale --attach-capability attach_stale
+run_ok "actual worker reference attaches after launch" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --run-ref pid:999999 --attach-capability "$ATTACH1"
 
 "$CONTROLLER" plan --sprint 42 > "$TMP/restart.json"
 json_check "restart exposes running work for reconciliation" "$TMP/restart.json" 'data["needs_reconcile"] == ["PROJ-1", "PROJ-3"] and data["launch"] == []'
@@ -95,12 +122,17 @@ json_check "completed prerequisite unlocks dependent ticket" "$TMP/plan2.json" '
 
 "$CONTROLLER" reserve --sprint 42 --ticket PROJ-2 --run-ref "pid:$$" > "$TMP/reserve2.json" && ok "unlocked ticket reserves" || bad "unlocked ticket reserves"
 TOKEN2="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_token"])' "$TMP/reserve2.json")"
+ATTACH2="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attach_capability"])' "$TMP/reserve2.json")"
 run_ok "running ticket survives inventory resync" "$CONTROLLER" sync --inventory inventory.json
 "$CONTROLLER" plan --sprint 42 > "$TMP/resync.json"
 json_check "resync does not duplicate a running workflow" "$TMP/resync.json" 'data["needs_reconcile"] == ["PROJ-2"] and "PROJ-2" not in data["launch"]'
 run_fail "requeue without stopped-worker proof fails closed" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason missing-proof --attempt-token "$TOKEN2"
-run_ok "dead worker identity attaches for mechanical proof" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --run-ref pid:999999 --attempt-token "$TOKEN2"
-run_ok "lost worker can be requeued after mechanical proof" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker no longer exists' --attempt-token "$TOKEN2"
+run_fail "worker attempt token cannot rewrite death evidence" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --run-ref pid:999999 --attach-capability "$TOKEN2"
+run_ok "controller attach capability sets display identity once" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --run-ref task-display --attach-capability "$ATTACH2"
+run_fail "controller attach capability is one-use" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --run-ref second-display --attach-capability "$ATTACH2"
+run_fail "live immutable worker identity blocks requeue after display attach" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker no longer exists' --attempt-token "$TOKEN2"
+printf 'recover-once' > .orchestration/operator-recovery.cap
+run_ok "operator can requeue a live mechanically bound worker" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'operator stopped worker' --attempt-token "$TOKEN2" --operator-capability recover-once
 run_ok "pending attempt history survives Jira resync" "$CONTROLLER" sync --inventory inventory.json
 "$CONTROLLER" reserve --sprint 42 --ticket PROJ-2 --run-ref codex-task-two > "$TMP/reserve2b.json" && ok "requeued ticket can reserve again" || bad "requeued ticket can reserve again"
 json_check "relaunch accounting survives pending sync" "$TMP/reserve2b.json" 'data["attempt"] == 2'
@@ -180,6 +212,20 @@ JSON
 run_fail "empty subtasks without an independent child query fail closed" "$CONTROLLER" sync --inventory unproven-empty-subtasks.json
 run_fail "checkpoint directory cannot escape the repository" "$CONTROLLER" --state-dir ../outside sync --inventory inventory.json
 
+cat > "$TMP/repo/relations.json" <<'JSON'
+{"project":"PROJ","sprint":{"id":"102","name":"relations"},"source_query":"sprint = 102","subtask_source_query":"parent in (PROJ-80)","subtask_keys":["PROJ-81"],"tickets":[{"key":"PROJ-80","status":"Ready","dependencies":[],"subtasks":["PROJ-81"]},{"key":"PROJ-81","parent":"PROJ-80","status":"Ready","dependencies":[],"subtasks":[]}]}
+JSON
+jira_receipt "$TMP/repo/relations.json"
+run_ok "adapter evidence binds both directions of Jira child relations" "$CONTROLLER" sync --inventory relations.json
+python3 - relations.json "$TMP/repo/bad-relations.json" "$TMP/repo/bad-relations.fetch.json" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1])); artifact=json.load(open(value["fetch_artifact"]["path"]))
+artifact["child_parents"]["PROJ-81"]="PROJ-999"
+json.dump(artifact,open(sys.argv[3],"w")); value["fetch_artifact"]["path"]=sys.argv[3]
+json.dump(value,open(sys.argv[2],"w"))
+PY
+run_fail "one-way or contradictory Jira relations are rejected" "$CONTROLLER" sync --inventory "$TMP/repo/bad-relations.json"
+
 cat > "$TMP/repo/legacy-inventory.json" <<'JSON'
 {"project":"PROJ","sprint":{"id":"47","name":"legacy running"},"source_query":"q","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-60","status":"Ready","dependencies":[],"subtasks":[]}]}
 JSON
@@ -246,7 +292,18 @@ if [ "$?" -eq 0 ]; then ok "batch request and durable state marker match Anthrop
 "$CONTROLLER" plan --sprint 45 > "$TMP/batch-plan.json"
 json_check "serialized batch jobs atomically reserve their sprint lanes" "$TMP/batch-plan.json" 'data["launch"] == [] and data["running"] == ["PROJ-40", "PROJ-41"]'
 BATCH_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["batch_id"])' "$TMP/batch-result.json")"
-run_ok "failed batch releases its durable reservations" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed
+run_fail "caller failure cannot release uncertain submitted work" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed
+cat > "$TMP/batch-terminal.json" <<JSON
+{"schema_version":1,"provider":"anthropic","batch_id":"$BATCH_ID","provider_batch_id":"msgbatch_test","status":"cancelled","job_ids":["ticket_PROJ_40_$BATCH_ID","ticket_PROJ_41_$BATCH_ID"]}
+JSON
+run_ok "authoritative terminal batch evidence releases reservations" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --provider-evidence "$TMP/batch-terminal.json"
+run_ok "terminal batch reconciliation is idempotent" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --provider-evidence "$TMP/batch-terminal.json"
+python3 - "$TMP/batch-result.json" <<'PY'
+import json,sys
+result=json.load(open(sys.argv[1])); marker=json.load(open(result["marker"])); marker["status"]="reconciling_failed"
+json.dump(marker,open(result["marker"],"w"),indent=2)
+PY
+run_ok "crash-partial batch reconciliation resumes idempotently" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --provider-evidence "$TMP/batch-terminal.json"
 "$CONTROLLER" plan --sprint 45 > "$TMP/batch-retry-plan.json"
 json_check "failed batch lanes return to bounded scheduling" "$TMP/batch-retry-plan.json" 'data["launch"] == ["PROJ-40", "PROJ-41"]'
 

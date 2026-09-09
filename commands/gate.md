@@ -27,8 +27,8 @@ agents; API routes use `context_pipeline.py payload --config ... --role <role>`
 and pipe it to `${CLAUDE_PLUGIN_ROOT}/scripts/api_agent.py run --request -
 --config .orchestration/config.yaml --role <role> --ticket <ticket> --run-id
 <stable-run-id> --review-pr <pr> --review-authorization <token>`. Issue it first
-from the valid ledger phase with `review-ledger.py permit-review <pr> --ticket
-<ticket> --role <role> --head <full-exact-head>`. Desktop fallback is permitted only before provider
+from the valid ledger phase with `review-ledger.py permit-review <pr>
+--role <role> --head <full-exact-head>`. Desktop fallback is permitted only before provider
 acknowledgement; a provider id, timeout after submission, or uncertain state
 must be reconciled and never duplicated.
 
@@ -70,7 +70,7 @@ must be reconciled and never duplicated.
    and advisory findings alike:
 
    ```bash
-   ${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py complete-review <pr> --ticket <ticket> \
+   ${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py complete-review <pr> \
      --role code-reviewer --phase-permit <token> \
      --result .orchestration/.review-results/code-review.json
    ${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py record <pr> --gate code-review \

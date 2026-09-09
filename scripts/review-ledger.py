@@ -210,6 +210,11 @@ def load(path: Path) -> dict[str, Any]:
         value["repair_pending_review"] = False
     value.setdefault("repair_pending_review", False)
     value.setdefault("review_permits", [])
+    value.setdefault("work_subject", {
+        "kind": "jira" if value.get("ticket") else "pr",
+        "id": str(value.get("ticket") or value.get("pr")),
+        "repository": str(shared_repository_root(project_root()).resolve()),
+    })
     value.setdefault(
         "design",
         {"max_rounds": DEFAULT_MAX_DESIGN_ROUNDS, "rounds": [], "escalated": False},
@@ -271,13 +276,49 @@ def max_rounds_for(args: argparse.Namespace) -> int:
     return rounds
 
 
-def new_state(pr: str, max_rounds: int) -> dict[str, Any]:
+def normalized_work_subject(kind: str, identifier: str) -> dict[str, str]:
+    value = str(identifier).strip()
+    if not value:
+        raise LedgerError("work subject id must not be empty")
+    if kind == "jira":
+        value = value.upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*-[0-9]+", value):
+            raise LedgerError("Jira work subject id must be a canonical Jira key")
+    elif kind == "pr":
+        value = re.sub(r"\s+", " ", value)
+    elif kind == "design":
+        value = re.sub(r"\s+", " ", value)
+    else:
+        raise LedgerError(f"unsupported work subject kind: {kind}")
+    return {
+        "kind": kind,
+        "id": value,
+        "repository": str(shared_repository_root(project_root()).resolve()),
+    }
+
+
+def requested_work_subject(args: argparse.Namespace, default_kind: str) -> dict[str, str]:
+    return normalized_work_subject(
+        str(getattr(args, "work_kind", None) or default_kind),
+        str(getattr(args, "work_id", None) or args.pr),
+    )
+
+
+def bind_work_subject(state: dict[str, Any], requested: dict[str, str]) -> None:
+    current = state.get("work_subject")
+    if current is not None and current != requested:
+        raise LedgerError(f"review ledger work subject is immutable: {current}")
+    state["work_subject"] = requested
+
+
+def new_state(pr: str, max_rounds: int, work_subject: dict[str, str]) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "pr": str(pr),
         "created_at": now(),
         "updated_at": now(),
         "max_rounds": max_rounds,
+        "work_subject": work_subject,
         "repair_attempts": [],
         "repair_pending_review": False,
         "review_permits": [],
@@ -361,9 +402,14 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
 def cmd_open(args: argparse.Namespace) -> None:
     path = ledger_path(args)
     rounds = max_rounds_for(args)
+    subject = requested_work_subject(args, "pr")
     with locked(path):
         if path.exists():
             state = load(path)
+            if args.work_kind or args.work_id:
+                bind_work_subject(state, subject)
+            elif state["work_subject"].get("repository") != subject["repository"]:
+                raise LedgerError("review ledger belongs to a different repository")
             # Existing caps are immutable from worker-facing CLI syntax.
             state["max_rounds"] = min(int(state.get("max_rounds", rounds)), rounds)
             _design_state(state)["max_rounds"] = min(
@@ -374,7 +420,7 @@ def cmd_open(args: argparse.Namespace) -> None:
             )
             save(path, state)
         else:
-            state = new_state(args.pr, rounds)
+            state = new_state(args.pr, rounds, subject)
             state["design"]["max_rounds"] = positive_config_int(
                 args, "max_design_rounds", "max_design_rounds", DEFAULT_MAX_DESIGN_ROUNDS
             )
@@ -757,8 +803,14 @@ def cmd_design_open(args: argparse.Namespace) -> None:
     design_rounds = positive_config_int(
         args, "max_design_rounds", "max_design_rounds", DEFAULT_MAX_DESIGN_ROUNDS
     )
+    subject = requested_work_subject(args, "design")
     with locked(path):
-        state = load(path) if path.exists() else new_state(args.pr, rounds)
+        existed = path.exists()
+        state = load(path) if existed else new_state(args.pr, rounds, subject)
+        if args.work_kind or args.work_id or not existed:
+            bind_work_subject(state, subject)
+        elif state["work_subject"].get("repository") != subject["repository"]:
+            raise LedgerError("review ledger belongs to a different repository")
         design = _design_state(state)
         design["max_rounds"] = min(int(design.get("max_rounds", design_rounds)), design_rounds)
         save(path, state)
@@ -873,7 +925,7 @@ def cmd_status(args: argparse.Namespace) -> None:
         }
         for key, component in sorted(state["components"].items())
     }
-    emit({**decide(state), "components": components})
+    emit({**decide(state), "work_subject": state["work_subject"], "components": components})
 
 
 def cmd_brief(args: argparse.Namespace) -> None:
@@ -1079,9 +1131,6 @@ def cmd_escalate(args: argparse.Namespace) -> None:
 
 def cmd_permit_review(args: argparse.Namespace) -> None:
     """Issue one phase capability when durable ledger state allows review."""
-    ticket = str(args.ticket).strip().upper()
-    if not re.fullmatch(r"[A-Z][A-Z0-9_]*-[0-9]+", ticket):
-        raise LedgerError("review permit ticket must be a canonical Jira key")
     try:
         actual_head = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=project_root(), check=True,
@@ -1094,10 +1143,9 @@ def cmd_permit_review(args: argparse.Namespace) -> None:
     path = ledger_path(args)
     with locked(path):
         state = load(path)
-        bound_ticket = str(state.get("ticket") or "")
-        if bound_ticket and bound_ticket != ticket:
-            raise LedgerError(f"review ledger is bound to {bound_ticket}, not {ticket}")
-        state["ticket"] = ticket
+        subject = state.get("work_subject")
+        if not isinstance(subject, dict):
+            raise LedgerError("review ledger has no immutable work subject")
         if args.role == "design-reviewer":
             if _design_plan(state)["next_action"] != "redesign":
                 raise LedgerError("design ledger phase does not permit another reviewer")
@@ -1113,7 +1161,7 @@ def cmd_permit_review(args: argparse.Namespace) -> None:
         token = "phase_" + os.urandom(24).hex()
         state.setdefault("review_permits", []).append({
             "token": token,
-            "ticket": ticket,
+            "work_subject": subject,
             "role": args.role,
             "head": actual_head,
             "issued_at": now(),
@@ -1125,7 +1173,7 @@ def cmd_permit_review(args: argparse.Namespace) -> None:
             "receipt_consumed_at": "",
         })
         save(path, state)
-    emit({"review_phase_permit": token, "ticket": ticket, "role": args.role, "head": actual_head})
+    emit({"review_phase_permit": token, "work_subject": subject, "role": args.role, "head": actual_head})
 
 
 def cmd_complete_review(args: argparse.Namespace) -> None:
@@ -1145,7 +1193,7 @@ def cmd_complete_review(args: argparse.Namespace) -> None:
         root = shared_repository_root(project_root())
         receipt = complete_review_permit(
             shared_root=root, ledger_dir=str(ledger_path(args).parent.relative_to(root)),
-            pr=args.pr, token=args.phase_permit, ticket=args.ticket.upper(), role=args.role,
+            pr=args.pr, token=args.phase_permit, role=args.role,
             head=actual_head, result=result, timestamp=now(), desktop=True,
         )
     except (OSError, subprocess.CalledProcessError, ValueError, ReviewPermitError) as exc:
@@ -1163,6 +1211,8 @@ def parser() -> argparse.ArgumentParser:
     open_parser.add_argument("pr")
     open_parser.add_argument("--max-rounds", help="tighten (never raise) the configured repair cap")
     open_parser.add_argument("--max-design-rounds", help="tighten (never raise) the configured design cap")
+    open_parser.add_argument("--work-kind", choices=("jira", "pr", "design"))
+    open_parser.add_argument("--work-id")
     open_parser.set_defaults(func=cmd_open)
 
     record_parser = commands.add_parser("record", help="record one completed gate round")
@@ -1208,6 +1258,8 @@ def parser() -> argparse.ArgumentParser:
     design_open.add_argument("pr", help="ticket or change identifier")
     design_open.add_argument("--max-rounds")
     design_open.add_argument("--max-design-rounds")
+    design_open.add_argument("--work-kind", choices=("jira", "pr", "design"))
+    design_open.add_argument("--work-id")
     design_open.set_defaults(func=cmd_design_open)
 
     design_record = commands.add_parser("design-record", help="record one pre-code design verdict")
@@ -1218,7 +1270,6 @@ def parser() -> argparse.ArgumentParser:
     design_record.set_defaults(func=cmd_design_record)
     permit = commands.add_parser("permit-review", help="issue a single-use permit for the ledger's current review phase")
     permit.add_argument("pr")
-    permit.add_argument("--ticket", required=True)
     permit.add_argument(
         "--role", required=True,
         choices=("design-reviewer", "code-reviewer", "security-reviewer"),
@@ -1227,7 +1278,6 @@ def parser() -> argparse.ArgumentParser:
     permit.set_defaults(func=cmd_permit_review)
     complete = commands.add_parser("complete-review", help="complete a native review permit after output exists")
     complete.add_argument("pr")
-    complete.add_argument("--ticket", required=True)
     complete.add_argument(
         "--role", required=True,
         choices=("design-reviewer", "code-reviewer", "security-reviewer"),

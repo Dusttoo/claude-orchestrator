@@ -39,7 +39,7 @@ Before each `code-reviewer` or `security-reviewer` pass, resolve its route with
 with `context_pipeline.py payload --config ... --role <role>` and use the
 `api_agent.py run --request -` adapter with the ticket and a stable run id.
 First issue a phase permit from the durable ledger with `review-ledger.py
-permit-review <pr> --ticket <ticket> --role <role> --head <full-exact-head>`;
+permit-review <pr> --role <role> --head <full-exact-head>`;
 pass it to `run --review-pr <pr> --review-authorization <token>`. The ledger
 issues it only while that gate is the permitted next phase, and it cannot be
 reused. This is sequencing, not human authentication.
@@ -47,7 +47,7 @@ Desktop fallback is allowed only before provider
 acknowledgement; submitted, timed-out, or uncertain work must be reconciled
 instead of duplicated.
 For a native desktop reviewer, write its final structured JSON first, then run
-`review-ledger.py complete-review <pr> --ticket <ticket> --role <role>
+`review-ledger.py complete-review <pr> --role <role>
 --phase-permit <token> --result <file>`. API execution creates the same
 completion receipt after successful provider output.
 

@@ -1795,7 +1795,7 @@ class ApiAgent:
                     ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
                     pr=self.review_pr,
                     token=self.review_authorization,
-                    ticket=str(self.ticket), role=self.role, head=head, timestamp=utc_now(),
+                    role=self.role, head=head, timestamp=utc_now(),
                 )
             except ReviewPermitError as exc:
                 raise AgentError(str(exc)) from exc
@@ -1812,7 +1812,7 @@ class ApiAgent:
                         shared_root=self.shared_root,
                         ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
                         pr=str(self.review_pr), token=str(self.review_authorization),
-                        ticket=str(self.ticket), role=self.role, head=review_head, timestamp=utc_now(),
+                        role=self.role, head=review_head, timestamp=utc_now(),
                     )
                 self._save(status="budget_blocked", error=str(exc))
                 raise
@@ -1822,7 +1822,7 @@ class ApiAgent:
                         shared_root=self.shared_root,
                         ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
                         pr=str(self.review_pr), token=str(self.review_authorization),
-                        ticket=str(self.ticket), role=self.role, head=review_head, timestamp=utc_now(),
+                        role=self.role, head=review_head, timestamp=utc_now(),
                     )
                 raise
             calls = tool_calls(self.provider, response)
@@ -1884,7 +1884,7 @@ class ApiAgent:
                             shared_root=self.shared_root,
                             ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
                             pr=str(self.review_pr), token=str(self.review_authorization),
-                            ticket=str(self.ticket), role=self.role,
+                            role=self.role,
                             head=subprocess.run(
                                 ["git", "rev-parse", "HEAD"], cwd=self.root, check=True,
                                 capture_output=True, text=True,

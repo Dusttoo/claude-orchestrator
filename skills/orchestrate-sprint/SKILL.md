@@ -116,9 +116,10 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    query for auditability. The controller rejects duplicate or malformed keys,
    dedupes dependencies, identifies self-links, cycles, incomplete external
    status data, and initially completed/blocked/not-ready Jira states.
-   Before sync, pass the sanitized fetch plus complete pagination metadata
-   through `jira_inventory_receipt.py`; sync rejects caller-authored Jira
-   assertions without that digest-bound receipt.
+   Before sync, pass the sanitized inventory and raw parent/child Jira REST
+   pages through `jira_inventory_fetch.py`. Sync validates the adapter-owned
+   artifact for exact keys, gapless pagination to total/exhaustion, and both
+   directions of every parent-child relation.
 
 4. **Sync and resume.** Run:
 
@@ -154,9 +155,10 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
      --run-id <stable-provider-run-id> --role <implementer-or-sprint-worker>
    ```
 
-   Preserve the `attempt_token` returned by reserve. It fences this worker from
-   every earlier or replacement attempt. API workers must also receive the
-   returned `attempt_capability` and its exact bound worker reference.
+   Preserve the `attempt_token` returned by reserve. It fences worker completion
+   and requeue from every earlier or replacement attempt. The controller also
+   owns the separate one-use `attach_capability`; API workers receive the
+   returned `attempt_capability` and its exact immutable worker reference.
 
    Then launch a fresh isolated worker for that one ticket. Instruct it to use
    `$orchestrate-ticket`, pass the freshly fetched Jira body and acceptance
@@ -165,7 +167,7 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    user action. After launch, replace the provisional reference:
 
    ```text
-   sprint-controller.py attach --sprint <id> --ticket <key> --run-ref <actual-task-or-agent-ref> --attempt-token <token>
+   sprint-controller.py attach --sprint <id> --ticket <key> --run-ref <actual-task-or-agent-ref> --attach-capability <token>
    ```
 
    **Codex host launch contract.** A reservation is not a worker launch. First

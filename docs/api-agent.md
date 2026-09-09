@@ -125,11 +125,11 @@ inside one run do not consume extra run slots. Repository configuration may
 tighten the compiled incident ceilings but cannot raise or disable them. There
 is deliberately no same-user CLI approval bypass.
 
-API reviewer runs require a review-ledger phase permit bound to the ticket,
-role, PR/design ledger, and full exact commit:
+API reviewer runs require a review-ledger phase permit bound to the ledger's
+immutable repository work subject, role, PR/design ledger, and full exact commit:
 
 ```text
-scripts/review-ledger.py permit-review 123 --ticket PROJ-1 \
+scripts/review-ledger.py permit-review 123 \
   --role code-reviewer --head "$(git rev-parse HEAD)"
 # pass the returned token to api_agent.py run --review-pr 123 \
 #   --review-authorization <token>

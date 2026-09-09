@@ -20,12 +20,12 @@ mkdir -p "$TMP/.orchestration"
 led() { (cd "$TMP" && python3 "$LEDGER" "$@"); }
 field() { python3 -c "import json,sys; v=json.load(sys.stdin)['$1']; print(','.join(v) if isinstance(v,list) else v)"; }
 review_record() {
-  local pr="$1" gate="$2" file="$3" ticket="${4:-PROJ-$1}" role
+  local pr="$1" gate="$2" file="$3" role
   role="${gate}-reviewer"
   local head permit
   head="$(git -C "$TMP" rev-parse HEAD)"
-  permit="$(led permit-review "$pr" --ticket "$ticket" --role "$role" --head "$head" | field review_phase_permit)" || return
-  led complete-review "$pr" --ticket "$ticket" --role "$role" --phase-permit "$permit" --result "$file" >/dev/null || return
+  permit="$(led permit-review "$pr" --role "$role" --head "$head" | field review_phase_permit)" || return
+  led complete-review "$pr" --role "$role" --phase-permit "$permit" --result "$file" >/dev/null || return
   led record "$pr" --gate "$gate-review" --result "$file" --head "$head" --phase-permit "$permit"
 }
 record_pass() {
@@ -46,6 +46,21 @@ eq "linked worktrees share one review ledger" "review" "$(led status shared-pr |
 
 # --- key normalization --------------------------------------------------------
 led open 1 >/dev/null
+json_subject="$(led status 1 | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["work_subject"],sort_keys=True))')"
+eq "a no-tracker PR owns an immutable repository-bound subject" \
+  "{\"id\": \"1\", \"kind\": \"pr\", \"repository\": \"$(cd "$TMP" && pwd -P)\"}" "$json_subject"
+if led open 1 --work-kind jira --work-id PROJ-1 >/dev/null 2>&1; then
+  bad "an existing ledger work subject cannot be rebound"
+else ok "an existing ledger work subject cannot be rebound"; fi
+led open jira-work --work-kind jira --work-id proj-101 >/dev/null
+eq "a Jira-backed ledger normalizes its work subject" "PROJ-101" \
+  "$(led status jira-work | python3 -c 'import json,sys; print(json.load(sys.stdin)["work_subject"]["id"])')"
+led open no-tracker-e2e >/dev/null
+cat > "$TMP/no-tracker-pass.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[{"name":"review","status":"pass"}],"findings":[]}
+JSON
+eq "a no-tracker PR completes permit, receipt, and record end to end" "gates-clear" \
+  "$(review_record no-tracker-e2e code "$TMP/no-tracker-pass.json" | field next_action)"
 eq "line numbers are stripped from component keys" \
   "src/auth/session.ts:refreshtoken" \
   "$(led record 1 --gate code-review --verdict FAIL --blocking 'src/auth/session.ts:refreshToken:142' | field accepted_blocking)"
@@ -167,21 +182,24 @@ led design-open BL-1 --max-design-rounds 2 >/dev/null
 eq "a failed design returns to redesign" "redesign" "$(led design-record BL-1 --verdict FAIL --evidence 'boundary incomplete' | field next_action)"
 eq "the independent design cap escalates" "escalate-human" "$(led design-record BL-1 --verdict FAIL --evidence 'boundary still incomplete' | field next_action)"
 
-led design-open BL-2 >/dev/null
+DESIGN_ID='free form architecture'
+led design-open "$DESIGN_ID" >/dev/null
+eq "a free-form design owns a design subject" "design" \
+  "$(led status "$DESIGN_ID" | python3 -c 'import json,sys; print(json.load(sys.stdin)["work_subject"]["kind"])')"
 HEAD_SHA="$(git -C "$TMP" rev-parse HEAD)"
-printf 'reviewed boundary\n' > "$TMP/design-BL-2.md"
-ARTIFACT_SHA="$(shasum -a 256 "$TMP/design-BL-2.md" | awk '{print $1}')"
-PERMIT="$(led permit-review BL-2 --ticket BL-2 --role design-reviewer --head "$HEAD_SHA" | python3 -c 'import json,sys; print(json.load(sys.stdin)["review_phase_permit"])')"
+printf 'reviewed boundary\n' > "$TMP/design-free-form.md"
+ARTIFACT_SHA="$(shasum -a 256 "$TMP/design-free-form.md" | awk '{print $1}')"
+PERMIT="$(led permit-review "$DESIGN_ID" --role design-reviewer --head "$HEAD_SHA" | python3 -c 'import json,sys; print(json.load(sys.stdin)["review_phase_permit"])')"
 cat > "$TMP/design-pass.json" <<JSON
-{"schema_version":1,"gate":"design-review","verdict":"PASS","source_sha":"$HEAD_SHA","artifact":"design-BL-2.md","artifact_sha256":"$ARTIFACT_SHA","phase_permit":"$PERMIT","checks":[{"name":"trust-boundary","status":"pass"}]}
+{"schema_version":1,"gate":"design-review","verdict":"PASS","source_sha":"$HEAD_SHA","artifact":"design-free-form.md","artifact_sha256":"$ARTIFACT_SHA","phase_permit":"$PERMIT","checks":[{"name":"trust-boundary","status":"pass"}]}
 JSON
-led complete-review BL-2 --ticket BL-2 --role design-reviewer --phase-permit "$PERMIT" --result "$TMP/design-pass.json" >/dev/null
+led complete-review "$DESIGN_ID" --role design-reviewer --phase-permit "$PERMIT" --result "$TMP/design-pass.json" >/dev/null
 python3 - "$TMP/design-pass.json" "$TMP/design-short.json" <<'PY'
 import json, sys
 value=json.load(open(sys.argv[1])); value['source_sha']=value['source_sha'][:12]
 json.dump(value, open(sys.argv[2], 'w'))
 PY
-if led design-record BL-2 --result "$TMP/design-short.json" >/dev/null 2>&1; then
+if led design-record "$DESIGN_ID" --result "$TMP/design-short.json" >/dev/null 2>&1; then
   bad "abbreviated design source SHA must fail closed"
 else ok "abbreviated design source SHA fails closed"; fi
 python3 - "$TMP/design-pass.json" "$TMP/design-bad-digest.json" <<'PY'
@@ -189,11 +207,11 @@ import json, sys
 value=json.load(open(sys.argv[1])); value['artifact_sha256']='0'*64
 json.dump(value, open(sys.argv[2], 'w'))
 PY
-if led design-record BL-2 --result "$TMP/design-bad-digest.json" >/dev/null 2>&1; then
+if led design-record "$DESIGN_ID" --result "$TMP/design-bad-digest.json" >/dev/null 2>&1; then
   bad "mismatched design artifact digest must fail closed"
 else ok "mismatched design artifact digest fails closed"; fi
-eq "design PASS requires exact-head machine evidence" "implement" "$(led design-record BL-2 --result "$TMP/design-pass.json" | field next_action)"
-if led permit-review BL-2 --ticket BL-2 --role design-reviewer --head "$HEAD_SHA" >/dev/null 2>&1; then
+eq "free-form design PASS completes end to end" "implement" "$(led design-record "$DESIGN_ID" --result "$TMP/design-pass.json" | field next_action)"
+if led permit-review "$DESIGN_ID" --role design-reviewer --head "$HEAD_SHA" >/dev/null 2>&1; then
   bad "passed design phase must not mint another reviewer permit"
 else ok "passed design phase cannot mint another reviewer permit"; fi
 led design-handoff BL-1 | grep -q 'No production implementation is authorized' && ok "design handoff blocks implementation" || bad "design handoff blocks implementation"

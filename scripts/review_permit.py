@@ -33,7 +33,7 @@ def ledger_path(shared_root: Path, ledger_dir: str, pr: str) -> Path:
 
 def consume(
     *, shared_root: Path, ledger_dir: str, pr: str, token: str,
-    ticket: str, role: str, head: str, timestamp: str,
+    role: str, head: str, timestamp: str,
 ) -> None:
     path = ledger_path(shared_root, ledger_dir, pr)
     lock_path = path.with_suffix(path.suffix + ".lock")
@@ -45,9 +45,9 @@ def consume(
         permit = next((item for item in state.get("review_permits", []) if item.get("token") == token), None)
         if not permit or permit.get("started_at") or permit.get("completion_receipt"):
             raise ReviewPermitError("review phase permit is missing or already started")
-        expected = {"ticket": ticket, "role": role, "head": head.lower()}
+        expected = {"work_subject": state.get("work_subject"), "role": role, "head": head.lower()}
         if any(permit.get(key) != value for key, value in expected.items()):
-            raise ReviewPermitError("review phase permit does not match ticket, role, and exact head")
+            raise ReviewPermitError("review phase permit does not match work subject, role, and exact head")
         current_phase = {
             "round_count": len(state.get("rounds", [])),
             "repair_count": len(state.get("repair_attempts", [])),
@@ -81,7 +81,7 @@ def _save(path: Path, state: dict[str, Any]) -> None:
 
 def complete(
     *, shared_root: Path, ledger_dir: str, pr: str, token: str,
-    ticket: str, role: str, head: str, result: Any, timestamp: str,
+    role: str, head: str, result: Any, timestamp: str,
     desktop: bool = False,
 ) -> str:
     """Create a digest-bound completion receipt after successful review output.
@@ -100,9 +100,9 @@ def complete(
         permit = next((item for item in permits if item.get("token") == token), None)
         if not permit or permit.get("completion_receipt"):
             raise ReviewPermitError("review phase permit is missing or already completed")
-        expected = {"ticket": ticket, "role": role, "head": head.lower()}
+        expected = {"work_subject": state.get("work_subject"), "role": role, "head": head.lower()}
         if any(permit.get(key) != value for key, value in expected.items()):
-            raise ReviewPermitError("review phase permit does not match ticket, role, and exact head")
+            raise ReviewPermitError("review phase permit does not match work subject, role, and exact head")
         current_phase = {
             "round_count": len(state.get("rounds", [])),
             "repair_count": len(state.get("repair_attempts", [])),
@@ -128,7 +128,7 @@ def complete(
 
 def cancel_started(
     *, shared_root: Path, ledger_dir: str, pr: str, token: str,
-    ticket: str, role: str, head: str, timestamp: str,
+    role: str, head: str, timestamp: str,
 ) -> None:
     """Release a started permit only after a known pre-ack rejection."""
     path = ledger_path(shared_root, ledger_dir, pr)
@@ -137,7 +137,7 @@ def cancel_started(
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = json.loads(path.read_text(encoding="utf-8"))
         permit = next((item for item in state.get("review_permits", []) if item.get("token") == token), None)
-        expected = {"ticket": ticket, "role": role, "head": head.lower()}
+        expected = {"work_subject": state.get("work_subject"), "role": role, "head": head.lower()}
         if (
             not permit or any(permit.get(key) != value for key, value in expected.items())
             or not permit.get("started_at") or permit.get("completion_receipt")
