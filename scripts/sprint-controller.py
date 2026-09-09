@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -124,9 +125,13 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
         raise SprintError("concurrency_max must be an integer") from exc
     if concurrency < 1:
         raise SprintError("concurrency_max must be at least 1")
-    configured_dir = Path(config_scalar(config, "sprint_checkpoint_dir", ".orchestration/.sprint-state"))
+    configured_dir = Path(
+        config_scalar(config, "sprint_checkpoint_dir", ".orchestration/.sprint-state")
+    )
     if args.state_dir:
-        raise SprintError("--state-dir overrides are not allowed; use the canonical repository config")
+        raise SprintError(
+            "--state-dir overrides are not allowed; use the canonical repository config"
+        )
     requested_dir = configured_dir
     if requested_dir.is_absolute():
         raise SprintError("sprint checkpoint directory must be repository-relative")
@@ -144,13 +149,23 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
     if max_lane_relaunches < 0:
         raise SprintError("max_lane_relaunches must be at least 0")
     try:
-        warning_budget = min(float(config_scalar_any_depth(config, "warn_usd_per_ticket", "10")) or 10, 10)
-        pause_budget = min(float(config_scalar_any_depth(config, "pause_usd_per_ticket", "20")) or 20, 20)
+        warning_budget = min(
+            float(config_scalar_any_depth(config, "warn_usd_per_ticket", "10")) or 10,
+            10,
+        )
+        pause_budget = min(
+            float(config_scalar_any_depth(config, "pause_usd_per_ticket", "20")) or 20,
+            20,
+        )
         max_model_runs = min(
-            int(config_scalar_any_depth(config, "max_model_runs_per_ticket", "12")) or 12, 12
+            int(config_scalar_any_depth(config, "max_model_runs_per_ticket", "12"))
+            or 12,
+            12,
         )
         max_reviewer_runs = min(
-            int(config_scalar_any_depth(config, "max_reviewer_runs_per_ticket", "6")) or 6, 6
+            int(config_scalar_any_depth(config, "max_reviewer_runs_per_ticket", "6"))
+            or 6,
+            6,
         )
     except ValueError as exc:
         raise SprintError("ticket budgets and run limits must be numbers") from exc
@@ -166,9 +181,20 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
         "pause_usd_per_ticket": pause_budget,
         "max_model_runs_per_ticket": max_model_runs,
         "max_reviewer_runs_per_ticket": max_reviewer_runs,
-        "ready": {x.casefold() for x in config_list(config, "sprint_ready_statuses", DEFAULT_READY)},
-        "done": {x.casefold() for x in config_list(config, "sprint_done_statuses", DEFAULT_DONE)},
-        "blocked": {x.casefold() for x in config_list(config, "sprint_blocked_statuses", DEFAULT_BLOCKED)},
+        "ready": {
+            x.casefold()
+            for x in config_list(config, "sprint_ready_statuses", DEFAULT_READY)
+        },
+        "done": {
+            x.casefold()
+            for x in config_list(config, "sprint_done_statuses", DEFAULT_DONE)
+        },
+        "blocked": {
+            x.casefold()
+            for x in config_list(config, "sprint_blocked_statuses", DEFAULT_BLOCKED)
+        },
+        "allow_test_evidence": bool(getattr(args, "test_only_evidence", False))
+        or os.environ.get("ORCHESTRATION_TEST_MODE") == "1",
     }
 
 
@@ -195,7 +221,9 @@ def normalize_priority(value: Any, key: str) -> int | None:
     try:
         return int(str(value).strip())
     except ValueError as exc:
-        raise SprintError(f"ticket {key} priority must be an integer or omitted") from exc
+        raise SprintError(
+            f"ticket {key} priority must be an integer or omitted"
+        ) from exc
 
 
 def order_key(ticket: dict[str, Any]) -> tuple[int, int, str]:
@@ -217,7 +245,9 @@ def sprint_identity(inventory: dict[str, Any]) -> tuple[str, str]:
         raise SprintError("inventory.sprint must be an object with id and name")
     sprint_id = str(sprint.get("id", "")).strip()
     if not sprint_id:
-        raise SprintError("inventory.sprint.id is required; resolve 'active' to the Jira sprint id")
+        raise SprintError(
+            "inventory.sprint.id is required; resolve 'active' to the Jira sprint id"
+        )
     return sprint_id, str(sprint.get("name", sprint_id)).strip() or sprint_id
 
 
@@ -255,15 +285,25 @@ def load(path: Path) -> dict[str, Any]:
                     "legacy running lane requires explicit recovery; verify the old worker is stopped, "
                     "then run recover-legacy"
                 )
-                ticket.setdefault("history", []).append({"at": now(), "event": "legacy-running-fenced"})
+                ticket.setdefault("history", []).append(
+                    {"at": now(), "event": "legacy-running-fenced"}
+                )
                 ticket["legacy_recovery_pending"] = True
             ticket["attempt_token"] = ""
             ticket["attempt_capability"] = {}
+            ticket["worker_identity"] = str(ticket.get("run_ref") or "")
             ticket.setdefault("subtasks", [])
     if value.get("schema_version") != SCHEMA_VERSION:
         raise SprintError(f"unsupported sprint checkpoint schema in {path}")
     for ticket in value.get("tickets", {}).values():
-        ticket.setdefault("worker_identity", str((ticket.get("attempt_capability") or {}).get("worker") or ticket.get("run_ref") or ""))
+        ticket.setdefault(
+            "worker_identity",
+            str(
+                (ticket.get("attempt_capability") or {}).get("worker")
+                or ticket.get("run_ref")
+                or ""
+            ),
+        )
         ticket.setdefault("attach_capability", "")
         ticket.setdefault("attached_at", "")
     return value
@@ -302,7 +342,9 @@ def write_jsonl(path: Path, values: list[dict[str, Any]]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             for value in values:
-                handle.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+                handle.write(
+                    json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+                )
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
@@ -319,7 +361,10 @@ def initial_state(raw_status: str, cfg: dict[str, Any]) -> tuple[str, str]:
         return "blocked", f"Jira status is {raw_status}"
     if folded in cfg["ready"]:
         return "pending", ""
-    return "user_action", f"Jira status {raw_status!r} is not configured as ready, done, or blocked"
+    return (
+        "user_action",
+        f"Jira status {raw_status!r} is not configured as ready, done, or blocked",
+    )
 
 
 def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
@@ -337,54 +382,108 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
         )
     raw_subtask_keys = raw.get("subtask_keys")
     if not isinstance(raw_subtask_keys, list):
-        raise SprintError("inventory.subtask_keys must be the complete result of subtask_source_query")
+        raise SprintError(
+            "inventory.subtask_keys must be the complete result of subtask_source_query"
+        )
     discovered_subtasks = {normalize_key(key) for key in raw_subtask_keys}
     raw_tickets = raw.get("tickets")
     if not isinstance(raw_tickets, list):
         raise SprintError("inventory.tickets must be an array")
     artifact_ref = raw.get("fetch_artifact")
-    if not isinstance(artifact_ref, dict) or set(artifact_ref) != {"path", "fetch_id"}:
+    if not isinstance(artifact_ref, dict) or set(artifact_ref) != {"path", "sha256"}:
         raise SprintError(
             "inventory.fetch_artifact from the Jira fetch adapter is required; hand-authored receipts are rejected"
         )
     artifact_path = Path(str(artifact_ref["path"])).resolve()
-    if artifact_path != cfg["shared_root"] and cfg["shared_root"] not in artifact_path.parents:
+    if (
+        artifact_path != cfg["shared_root"]
+        and cfg["shared_root"] not in artifact_path.parents
+    ):
         raise SprintError("Jira fetch artifact must stay in the shared repository")
     try:
         artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SprintError(f"cannot read Jira fetch artifact: {exc}") from exc
     if (
-        not isinstance(artifact, dict) or artifact.get("schema_version") != 1
+        not isinstance(artifact, dict)
+        or artifact.get("schema_version") != 2
         or artifact.get("adapter") != "jira-rest-v3"
-        or artifact.get("fetch_id") != artifact_ref["fetch_id"]
     ):
         raise SprintError("Jira fetch artifact identity is invalid")
+    artifact_digest = hashlib.sha256(
+        json.dumps(artifact, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if artifact_ref["sha256"] != artifact_digest:
+        raise SprintError("Jira fetch artifact digest is invalid")
+    if artifact.get("authority") != "provider-network" and not (
+        cfg["allow_test_evidence"] and artifact.get("authority") == "test-only"
+    ):
+        raise SprintError(
+            "test-only or caller-authored Jira evidence cannot authorize production sync"
+        )
+    if artifact.get("authority") == "provider-network" and not cfg.get(
+        "adapter_invoked"
+    ):
+        raise SprintError(
+            "production Jira evidence must be fetched by the controller-owned adapter"
+        )
+    if artifact.get("authority") == "provider-network":
+        approved = str(artifact.get("approved_origin") or "")
+        if not re.fullmatch(r"https://[A-Za-z0-9.-]+(?::[0-9]+)?", approved):
+            raise SprintError("Jira evidence has no approved HTTPS provider origin")
     queries = artifact.get("queries")
     if not isinstance(queries, list) or len(queries) != 2:
-        raise SprintError("Jira fetch artifact requires parent and child query evidence")
+        raise SprintError(
+            "Jira fetch artifact requires parent and child query evidence"
+        )
     by_kind = {item.get("kind"): item for item in queries if isinstance(item, dict)}
     if set(by_kind) != {"parents", "children"}:
         raise SprintError("Jira fetch artifact query kinds are invalid")
 
     def proven_keys(query: dict[str, Any], expected_jql: str) -> list[str]:
-        if query.get("jql") != expected_jql or not isinstance(query.get("pages"), list) or not query["pages"]:
-            raise SprintError("Jira fetch artifact does not bind the exact query and its pages")
+        if (
+            query.get("jql") != expected_jql
+            or not isinstance(query.get("pages"), list)
+            or not query["pages"]
+        ):
+            raise SprintError(
+                "Jira fetch artifact does not bind the exact query and its pages"
+            )
         offset = 0
+        cursor = ""
         keys: list[str] = []
         provider_total: int | None = None
         for index, page in enumerate(query["pages"]):
-            if not isinstance(page, dict) or set(page) != {"start_at", "count", "total", "item_keys", "terminal"}:
-                raise SprintError("Jira fetch pages require exact pagination and item-key fields")
+            if not isinstance(page, dict) or set(page) != {
+                "start_at",
+                "count",
+                "total",
+                "item_keys",
+                "terminal",
+                "cursor_in",
+                "cursor_out",
+                "raw_sha256",
+                "raw_path",
+            }:
+                raise SprintError(
+                    "Jira fetch pages require exact pagination and item-key fields"
+                )
             page_keys = page["item_keys"]
             if (
-                not isinstance(page["start_at"], int) or page["start_at"] != offset
-                or not isinstance(page["count"], int) or page["count"] < 0
-                or not isinstance(page_keys, list) or page["count"] != len(page_keys)
+                not isinstance(page["start_at"], int)
+                or page["start_at"] != offset
+                or not isinstance(page["count"], int)
+                or page["count"] < 0
+                or not isinstance(page_keys, list)
+                or page["count"] != len(page_keys)
                 or not isinstance(page["terminal"], bool)
+                or page["cursor_in"] != cursor
+                or not isinstance(page["cursor_out"], str)
                 or (page["terminal"] and index != len(query["pages"]) - 1)
             ):
-                raise SprintError("Jira fetch pagination is overlapping, gapped, or truncated")
+                raise SprintError(
+                    "Jira fetch pagination is overlapping, gapped, or truncated"
+                )
             if page["total"] is not None:
                 if not isinstance(page["total"], int) or page["total"] < 0:
                     raise SprintError("Jira fetch provider total is invalid")
@@ -393,29 +492,82 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
                 elif provider_total != page["total"]:
                     raise SprintError("Jira fetch provider total changed between pages")
             normalized = [normalize_key(key) for key in page_keys]
+            raw_path = Path(str(page["raw_path"])).resolve()
+            if (
+                raw_path != cfg["shared_root"]
+                and cfg["shared_root"] not in raw_path.parents
+            ):
+                raise SprintError(
+                    "Jira raw response evidence escapes the shared repository"
+                )
+            try:
+                raw_response = json.loads(raw_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise SprintError(
+                    f"cannot read Jira raw response evidence: {exc}"
+                ) from exc
+            raw_digest = hashlib.sha256(
+                json.dumps(raw_response, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            if (
+                raw_digest != page["raw_sha256"]
+                or raw_path.name != f"sha256-{raw_digest}.json"
+            ):
+                raise SprintError("Jira raw response is not content-addressed")
+            if (
+                raw_response.get("startAt") != page["start_at"]
+                and "startAt" in raw_response
+            ) or (
+                str(raw_response.get("nextPageToken") or "") != page["cursor_out"]
+                or page["cursor_in"] != cursor
+                or raw_response.get("total") != page["total"]
+                or bool(raw_response.get("isLast", False)) != page["terminal"]
+                or len(raw_response.get("issues", [])) != page["count"]
+                or [
+                    str(item.get("key", "")).upper()
+                    for item in raw_response.get("issues", [])
+                ]
+                != page_keys
+            ):
+                raise SprintError("Jira page summary does not match its raw response")
             if len(normalized) != len(set(normalized)) or set(normalized) & set(keys):
                 raise SprintError("Jira fetch pages contain duplicate item keys")
             keys.extend(normalized)
             offset += page["count"]
+            cursor = page["cursor_out"]
         last = query["pages"][-1]
-        if not last["terminal"] and (provider_total is None or offset != provider_total):
+        if not last["terminal"] and (
+            provider_total is None or offset != provider_total
+        ):
             raise SprintError("Jira fetch artifact does not prove provider exhaustion")
         if provider_total is not None and offset != provider_total:
             raise SprintError("Jira fetch artifact is truncated before provider total")
         return sorted(keys)
 
-    parent_keys = sorted(normalize_key(item.get("key")) for item in raw_tickets if isinstance(item, dict))
+    parent_keys = sorted(
+        normalize_key(item.get("key")) for item in raw_tickets if isinstance(item, dict)
+    )
     if proven_keys(by_kind["parents"], source_query) != parent_keys:
-        raise SprintError("Jira parent pages do not bind the exact inventory ticket keys")
-    if proven_keys(by_kind["children"], subtask_source_query) != sorted(discovered_subtasks):
-        raise SprintError("Jira child pages do not bind the exact independent child keys")
+        raise SprintError(
+            "Jira parent pages do not bind the exact inventory ticket keys"
+        )
+    if proven_keys(by_kind["children"], subtask_source_query) != sorted(
+        discovered_subtasks
+    ):
+        raise SprintError(
+            "Jira child pages do not bind the exact independent child keys"
+        )
     tickets: dict[str, dict[str, Any]] = {}
     for item in raw_tickets:
         if not isinstance(item, dict):
             raise SprintError("each inventory ticket must be an object")
         key = normalize_key(item.get("key"))
         if not key.startswith(f"{project}-"):
-            raise SprintError(f"sprint ticket {key} is outside configured project {project}")
+            raise SprintError(
+                f"sprint ticket {key} is outside configured project {project}"
+            )
         if key in tickets:
             raise SprintError(f"duplicate ticket in inventory: {key}")
         dependencies: list[str] = []
@@ -435,7 +587,9 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
         if not isinstance(raw_subtasks, list):
             raise SprintError(f"ticket {key} subtasks must be an array")
         for subtask in raw_subtasks:
-            normalized = normalize_key(subtask.get("key") if isinstance(subtask, dict) else subtask)
+            normalized = normalize_key(
+                subtask.get("key") if isinstance(subtask, dict) else subtask
+            )
             if normalized not in subtasks:
                 subtasks.append(normalized)
         raw_status = str(item.get("status", "")).strip()
@@ -461,14 +615,21 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             "history": [],
         }
     missing_subtasks = sorted(
-        {subtask for ticket in tickets.values() for subtask in ticket["subtasks"] if subtask not in tickets}
+        {
+            subtask
+            for ticket in tickets.values()
+            for subtask in ticket["subtasks"]
+            if subtask not in tickets
+        }
     )
     if missing_subtasks:
         raise SprintError(
             "Jira inventory is incomplete; fetch every referenced subtask explicitly: "
             + ", ".join(missing_subtasks)
         )
-    declared_subtasks = {subtask for ticket in tickets.values() for subtask in ticket["subtasks"]}
+    declared_subtasks = {
+        subtask for ticket in tickets.values() for subtask in ticket["subtasks"]
+    }
     if declared_subtasks != discovered_subtasks:
         missing_from_parents = sorted(discovered_subtasks - declared_subtasks)
         missing_from_query = sorted(declared_subtasks - discovered_subtasks)
@@ -478,20 +639,40 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
         )
     absent_children = sorted(discovered_subtasks - set(tickets))
     if absent_children:
-        raise SprintError("Jira child query results are absent from tickets: " + ", ".join(absent_children))
+        raise SprintError(
+            "Jira child query results are absent from tickets: "
+            + ", ".join(absent_children)
+        )
     expected_relations = sorted(
-        {f"{parent}:{child}" for parent, item in tickets.items() for child in item["subtasks"]}
+        {
+            f"{parent}:{child}"
+            for parent, item in tickets.items()
+            for child in item["subtasks"]
+        }
     )
     relations = artifact.get("relations")
-    actual_relations = sorted(
-        {f"{normalize_key(item.get('parent'))}:{normalize_key(item.get('child'))}" for item in relations}
-    ) if isinstance(relations, list) and all(isinstance(item, dict) for item in relations) else []
+    actual_relations = (
+        sorted(
+            {
+                f"{normalize_key(item.get('parent'))}:{normalize_key(item.get('child'))}"
+                for item in relations
+            }
+        )
+        if isinstance(relations, list)
+        and all(isinstance(item, dict) for item in relations)
+        else []
+    )
     child_parents = artifact.get("child_parents")
     expected_child_parents = {
         child: parent for parent, item in tickets.items() for child in item["subtasks"]
     }
-    if actual_relations != expected_relations or child_parents != expected_child_parents:
-        raise SprintError("Jira fetch artifact does not bind bidirectional parent/child relations")
+    if (
+        actual_relations != expected_relations
+        or child_parents != expected_child_parents
+    ):
+        raise SprintError(
+            "Jira fetch artifact does not bind bidirectional parent/child relations"
+        )
     external: dict[str, str] = {}
     raw_external = raw.get("dependency_status", {})
     if not isinstance(raw_external, dict):
@@ -561,7 +742,9 @@ def blockers(state: dict[str, Any], key: str, cfg: dict[str, Any]) -> list[str]:
             continue
         raw_status = state["dependency_status"].get(dependency)
         if raw_status is None:
-            reasons.append(f"dependency {dependency} is outside the sprint and has no fetched status")
+            reasons.append(
+                f"dependency {dependency} is outside the sprint and has no fetched status"
+            )
         elif raw_status.casefold() not in cfg["done"]:
             reasons.append(f"external dependency {dependency} is {raw_status}")
     return sorted(set(reasons))
@@ -584,11 +767,21 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
             open_reservations[str(event["reservation_id"])] = event
             if ticket:
                 item = result.setdefault(
-                    ticket, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_ids": set(), "reviewer_run_ids": set()}
+                    ticket,
+                    {
+                        "spent_usd": 0.0,
+                        "reserved_usd": 0.0,
+                        "run_ids": set(),
+                        "reviewer_run_ids": set(),
+                    },
                 )
                 if event.get("run_id"):
                     item["run_ids"].add(str(event["run_id"]))
-                    if event.get("role") in {"design-reviewer", "code-reviewer", "security-reviewer"}:
+                    if event.get("role") in {
+                        "design-reviewer",
+                        "code-reviewer",
+                        "security-reviewer",
+                    }:
                         item["reviewer_run_ids"].add(str(event["run_id"]))
         elif kind in {"usage", "release"}:
             open_reservations.pop(str(event.get("reservation_id") or ""), None)
@@ -597,20 +790,44 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 pause_events.get(ticket, 0), float(event.get("projected_total_usd", 0))
             )
         if kind == "usage" and ticket:
-            item = result.setdefault(ticket, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_ids": set(), "reviewer_run_ids": set()})
+            item = result.setdefault(
+                ticket,
+                {
+                    "spent_usd": 0.0,
+                    "reserved_usd": 0.0,
+                    "run_ids": set(),
+                    "reviewer_run_ids": set(),
+                },
+            )
             item["spent_usd"] += float(event.get("cost_usd", 0))
             if event.get("run_id"):
                 item["run_ids"].add(str(event["run_id"]))
-                if event.get("role") in {"design-reviewer", "code-reviewer", "security-reviewer"}:
+                if event.get("role") in {
+                    "design-reviewer",
+                    "code-reviewer",
+                    "security-reviewer",
+                }:
                     item["reviewer_run_ids"].add(str(event["run_id"]))
     for event in open_reservations.values():
         ticket = str(event.get("ticket") or "")
         if ticket:
-            item = result.setdefault(ticket, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_ids": set(), "reviewer_run_ids": set()})
+            item = result.setdefault(
+                ticket,
+                {
+                    "spent_usd": 0.0,
+                    "reserved_usd": 0.0,
+                    "run_ids": set(),
+                    "reviewer_run_ids": set(),
+                },
+            )
             item["reserved_usd"] += float(event.get("projected_cost_usd", 0))
             if event.get("run_id"):
                 item["run_ids"].add(str(event["run_id"]))
-                if event.get("role") in {"design-reviewer", "code-reviewer", "security-reviewer"}:
+                if event.get("role") in {
+                    "design-reviewer",
+                    "code-reviewer",
+                    "security-reviewer",
+                }:
                     item["reviewer_run_ids"].add(str(event["run_id"]))
     for ticket, item in result.items():
         item["run_count"] = len(item.pop("run_ids"))
@@ -620,18 +837,47 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
         pause = cfg["pause_usd_per_ticket"]
         warning = cfg["warn_usd_per_ticket"]
         item["state"] = (
-            "operator_action" if (
-                ticket in pause_events or (pause and total > pause)
+            "operator_action"
+            if (
+                ticket in pause_events
+                or (pause and total > pause)
                 or item["run_count"] >= cfg["max_model_runs_per_ticket"]
                 or item["reviewer_run_count"] >= cfg["max_reviewer_runs_per_ticket"]
             )
-            else "warning" if warning and total > warning else "ok"
+            else "warning"
+            if warning and total > warning
+            else "ok"
         )
     return result
 
 
 def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
-    inventory_path = Path(args.inventory)
+    inventory_path = Path(args.inventory or "")
+    if args.inventory_template:
+        template_path = Path(args.inventory_template).resolve()
+        digest = hashlib.sha256(template_path.read_bytes()).hexdigest()[:20]
+        evidence_dir = cfg["state_dir"] / "jira-evidence"
+        inventory_path = evidence_dir / f"inventory-{digest}.json"
+        artifact_path = evidence_dir / f"artifact-{digest}.json"
+        adapter = Path(__file__).with_name("jira_inventory_fetch.py")
+        try:
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(adapter),
+                    "--inventory-template",
+                    str(template_path),
+                    "--artifact",
+                    str(artifact_path),
+                    "--output",
+                    str(inventory_path),
+                ],
+                cwd=cfg["shared_root"],
+                check=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise SprintError("controller-owned Jira fetch failed") from exc
+        cfg = {**cfg, "adapter_invoked": True}
     try:
         raw = json.loads(inventory_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -647,16 +893,29 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             for key, previous in current["tickets"].items():
                 if key not in incoming_keys and previous["state"] == "pending":
                     previous["state"] = "user_action"
-                    previous["reason"] = "ticket disappeared from the refreshed Jira sprint query"
-                    previous["history"].append({"at": now(), "event": "removed-from-query"})
+                    previous["reason"] = (
+                        "ticket disappeared from the refreshed Jira sprint query"
+                    )
+                    previous["history"].append(
+                        {"at": now(), "event": "removed-from-query"}
+                    )
             for key, fresh in incoming["tickets"].items():
                 previous = current["tickets"].get(key)
                 if previous:
                     for field in (
-                        "state", "reason", "run_ref", "branch", "pr", "attempts",
-                        "attempt_token", "history",
-                        "attempt_capability", "legacy_recovery_pending",
-                        "worker_identity", "attach_capability", "attached_at",
+                        "state",
+                        "reason",
+                        "run_ref",
+                        "branch",
+                        "pr",
+                        "attempts",
+                        "attempt_token",
+                        "history",
+                        "attempt_capability",
+                        "legacy_recovery_pending",
+                        "worker_identity",
+                        "attach_capability",
+                        "attached_at",
                     ):
                         if field in previous:
                             fresh[field] = previous[field]
@@ -671,21 +930,33 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         else:
             state = incoming
         save(path, state)
-    emit({"checkpoint": str(path), "sprint": state["sprint"], "tickets": len(state["tickets"])})
+    emit(
+        {
+            "checkpoint": str(path),
+            "sprint": state["sprint"],
+            "tickets": len(state["tickets"]),
+        }
+    )
 
 
-def get_state(args: argparse.Namespace, cfg: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+def get_state(
+    args: argparse.Namespace, cfg: dict[str, Any]
+) -> tuple[Path, dict[str, Any]]:
     path = state_path(cfg["state_dir"], str(args.sprint))
     return path, load(path)
 
 
 def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     spend = usage_snapshots(cfg)
-    running = sorted(key for key, ticket in state["tickets"].items() if ticket["state"] == "running")
+    running = sorted(
+        key for key, ticket in state["tickets"].items() if ticket["state"] == "running"
+    )
     ordered = sorted(state["tickets"].values(), key=order_key)
     ready = [
-        ticket["key"] for ticket in ordered
-        if ticket["state"] == "pending" and not blockers(state, ticket["key"], cfg)
+        ticket["key"]
+        for ticket in ordered
+        if ticket["state"] == "pending"
+        and not blockers(state, ticket["key"], cfg)
         and spend.get(ticket["key"], {}).get("state") != "operator_action"
     ]
     available = max(0, cfg["concurrency_max"] - len(running))
@@ -749,17 +1020,23 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         params = job.get("params")
         if not isinstance(params, dict):
             raise SprintError(f"ticket {key} batch params must be an object")
-        required = ("model", "max_tokens", "messages") if provider == "anthropic" else (
-            "model", "max_output_tokens", "input"
+        required = (
+            ("model", "max_tokens", "messages")
+            if provider == "anthropic"
+            else ("model", "max_output_tokens", "input")
         )
         missing = [name for name in required if name not in params]
         if missing:
-            raise SprintError(f"ticket {key} batch params missing: {', '.join(missing)}")
+            raise SprintError(
+                f"ticket {key} batch params missing: {', '.join(missing)}"
+            )
         if params.get("stream"):
             raise SprintError(f"ticket {key} batch params cannot enable streaming")
         input_key = "messages" if provider == "anthropic" else "input"
         if not isinstance(params.get(input_key), list) or not params[input_key]:
-            raise SprintError(f"ticket {key} batch {input_key} must be a non-empty array")
+            raise SprintError(
+                f"ticket {key} batch {input_key} must be a non-empty array"
+            )
         jobs[key] = params
 
     batch_id = uuid.uuid4().hex[:16]
@@ -773,7 +1050,8 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         unexpected = sorted(set(jobs) - set(launch_order))
         if unexpected:
             raise SprintError(
-                "batch may contain only currently launchable tickets: " + ", ".join(unexpected)
+                "batch may contain only currently launchable tickets: "
+                + ", ".join(unexpected)
             )
         ordered_keys = [key for key in launch_order if key in jobs]
         requests = []
@@ -792,8 +1070,14 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             run_ref = f"{provider}-batch:{batch_id}:{custom_id}"
             run_id = f"batch-{batch_id}-{key}"
             params = jobs[key]
-            output_cap = int(params["max_tokens"] if provider == "anthropic" else params["max_output_tokens"])
-            input_tokens = max(1, len(json.dumps(params, separators=(",", ":")).encode("utf-8")))
+            output_cap = int(
+                params["max_tokens"]
+                if provider == "anthropic"
+                else params["max_output_tokens"]
+            )
+            input_tokens = max(
+                1, len(json.dumps(params, separators=(",", ":")).encode("utf-8"))
+            )
             projected = Pricing.from_config(config, str(params["model"])).worst_case(
                 input_tokens, output_cap
             )
@@ -801,8 +1085,13 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         try:
             for key, custom_id, run_ref, run_id, projected in prepared:
                 reservation_id = usage.reserve(
-                    projected=projected, limits=limits, run_id=run_id, ticket=key,
-                    sprint=str(args.sprint), provider=provider, model=str(jobs[key]["model"]),
+                    projected=projected,
+                    limits=limits,
+                    run_id=run_id,
+                    ticket=key,
+                    sprint=str(args.sprint),
+                    provider=provider,
+                    model=str(jobs[key]["model"]),
                     role="sprint-worker",
                 )
                 reservations.append((reservation_id, run_id))
@@ -810,13 +1099,23 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                     requests.append({"custom_id": custom_id, "params": jobs[key]})
                 else:
                     requests.append(
-                        {"custom_id": custom_id, "method": "POST", "url": "/v1/responses", "body": jobs[key]}
+                        {
+                            "custom_id": custom_id,
+                            "method": "POST",
+                            "url": "/v1/responses",
+                            "body": jobs[key],
+                        }
                     )
-                marker_jobs.append({
-                    "ticket": key, "custom_id": custom_id, "run_ref": run_ref,
-                    "run_id": run_id, "reservation_id": reservation_id,
-                    "projected_cost_usd": str(projected),
-                })
+                marker_jobs.append(
+                    {
+                        "ticket": key,
+                        "custom_id": custom_id,
+                        "run_ref": run_ref,
+                        "run_id": run_id,
+                        "reservation_id": reservation_id,
+                        "projected_cost_usd": str(projected),
+                    }
+                )
         except (AgentError, ValueError) as exc:
             for reservation_id, run_id in reservations:
                 usage.release(reservation_id, run_id, "batch preparation failed")
@@ -834,9 +1133,14 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             ticket["attempt_token"] = "attempt_" + uuid.uuid4().hex
             ticket["attempt_capability"] = {
                 "token": "attemptcap_" + uuid.uuid4().hex,
-                "repository": str(cfg["shared_root"]), "sprint": str(args.sprint),
-                "ticket": key, "role": "sprint-worker", "run_id": run_id,
-                "worker": run_ref, "attempt": ticket["attempts"], "issued_at": now(),
+                "repository": str(cfg["shared_root"]),
+                "sprint": str(args.sprint),
+                "ticket": key,
+                "role": "sprint-worker",
+                "run_id": run_id,
+                "worker": run_ref,
+                "attempt": ticket["attempts"],
+                "issued_at": now(),
             }
             ticket["worker_identity"] = run_ref
             ticket["attach_capability"] = "attachcap_" + uuid.uuid4().hex
@@ -844,10 +1148,17 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             marker_job["attempt_token"] = ticket["attempt_token"]
             marker_job["attempt_capability"] = ticket["attempt_capability"]["token"]
             ticket["history"].append(
-                {"at": now(), "event": "batch-reserved", "batch_id": batch_id, "custom_id": custom_id}
+                {
+                    "at": now(),
+                    "event": "batch-reserved",
+                    "batch_id": batch_id,
+                    "custom_id": custom_id,
+                }
             )
         if not requests:
-            raise SprintError("none of the supplied batch jobs are currently launchable")
+            raise SprintError(
+                "none of the supplied batch jobs are currently launchable"
+            )
         request = {"requests": requests}
         endpoint = "/v1/messages/batches" if provider == "anthropic" else "/v1/batches"
         marker = {
@@ -855,7 +1166,9 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             "batch_id": batch_id,
             "sprint_id": state["sprint"]["id"],
             "provider": provider,
-            "status": "pending_submission" if provider == "anthropic" else "pending_upload",
+            "status": "pending_submission"
+            if provider == "anthropic"
+            else "pending_upload",
             "endpoint": endpoint,
             "request_file": str(request_path),
             "provider_batch_id": "",
@@ -888,33 +1201,95 @@ def reconcile_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     if not marker_path.is_file():
         raise SprintError(f"batch marker not found: {marker_path}")
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    if not args.provider_evidence:
-        raise SprintError(
-            "batch reconciliation requires bound authoritative provider terminal evidence; "
-            "uncertain work remains reserved"
-        )
+    if args.provider_evidence:
+        raise SprintError("caller-authored provider evidence is never authoritative")
+    if not marker.get("provider_batch_id"):
+        if not args.provider_batch_id:
+            raise SprintError(
+                "provider batch id is required before terminal reconciliation"
+            )
+        marker["provider_batch_id"] = args.provider_batch_id
+        marker["status"] = "submitted"
+        write_json(marker_path, marker)
+    elif (
+        args.provider_batch_id and args.provider_batch_id != marker["provider_batch_id"]
+    ):
+        raise SprintError("provider batch identity is immutable")
+    bundle_path = cfg["state_dir"] / f"batch-{args.batch}.terminal.json"
+    adapter = Path(__file__).with_name("provider_batch_fetch.py")
+    command = [
+        sys.executable,
+        str(adapter),
+        "--marker",
+        str(marker_path),
+        "--bundle",
+        str(bundle_path),
+    ]
+    if args.test_transport:
+        if not cfg["allow_test_evidence"]:
+            raise SprintError(
+                "test transport cannot authorize production reconciliation"
+            )
+        command.extend(["--test-transport", args.test_transport])
     try:
-        evidence = json.loads(Path(args.provider_evidence).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SprintError(f"cannot read provider batch evidence: {exc}") from exc
+        subprocess.run(
+            command, cwd=cfg["shared_root"], check=True, capture_output=True, text=True
+        )
+        evidence = json.loads(bundle_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, subprocess.CalledProcessError) as exc:
+        raise SprintError(
+            "provider batch lookup did not produce authoritative terminal evidence; uncertainty remains reserved"
+        ) from exc
     evidence_digest = hashlib.sha256(
         json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     expected_jobs = sorted(str(item["custom_id"]) for item in marker.get("jobs", []))
     if (
-        not isinstance(evidence, dict) or evidence.get("schema_version") != 1
-        or evidence.get("provider") != marker.get("provider")
+        not isinstance(evidence, dict)
+        or evidence.get("schema_version") != 1
+        or evidence.get("adapter") != f"{marker.get('provider')}-batch"
+        or evidence.get("authority")
+        not in (
+            {"provider-network", "test-only"}
+            if cfg["allow_test_evidence"]
+            else {"provider-network"}
+        )
         or evidence.get("batch_id") != marker.get("batch_id")
         or not str(evidence.get("provider_batch_id") or "").strip()
         or sorted(evidence.get("job_ids") or []) != expected_jobs
     ):
-        raise SprintError("provider batch evidence does not bind this provider, batch, and exact job set")
+        raise SprintError(
+            "provider batch evidence does not bind this provider, batch, and exact job set"
+        )
+    if evidence.get("authority") == "provider-network" and not re.fullmatch(
+        r"https://[A-Za-z0-9.-]+(?::[0-9]+)?",
+        str(evidence.get("approved_origin") or ""),
+    ):
+        raise SprintError("provider batch evidence has no approved HTTPS origin")
+    for raw_ref in evidence.get("raw", []):
+        raw_path = Path(str(raw_ref.get("path") or "")).resolve()
+        if (
+            raw_path != cfg["shared_root"]
+            and cfg["shared_root"] not in raw_path.parents
+        ):
+            raise SprintError("provider raw evidence escapes the shared repository")
+        raw_value = json.loads(raw_path.read_text(encoding="utf-8"))
+        raw_digest = hashlib.sha256(
+            json.dumps(raw_value, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        if (
+            raw_ref.get("sha256") != raw_digest
+            or raw_path.name != f"sha256-{raw_digest}.json"
+        ):
+            raise SprintError("provider raw evidence is not content-addressed")
     terminal = {
         "completed": {"completed", "ended"},
         "failed": {"failed", "cancelled", "expired"},
     }[args.outcome]
     if evidence.get("status") not in terminal:
-        raise SprintError(f"provider status {evidence.get('status')!r} is not terminal for {args.outcome}")
+        raise SprintError(
+            f"provider status {evidence.get('status')!r} is not terminal for {args.outcome}"
+        )
     final_status = "completed" if args.outcome == "completed" else "failed"
     if marker.get("status") == final_status:
         if marker.get("provider_evidence_sha256") != evidence_digest:
@@ -922,39 +1297,53 @@ def reconcile_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         emit({"batch_id": args.batch, "status": final_status})
         return
     if marker.get("status") not in {
-        "pending_submission", "pending_upload", "submitted", "reconciling_completed", "reconciling_failed"
+        "pending_submission",
+        "pending_upload",
+        "submitted",
+        "reconciling_completed",
+        "reconciling_failed",
     }:
         raise SprintError("batch is not awaiting reconciliation")
     expected_reconciling = f"reconciling_{args.outcome}"
-    if str(marker.get("status")).startswith("reconciling_") and marker.get("status") != expected_reconciling:
+    if (
+        str(marker.get("status")).startswith("reconciling_")
+        and marker.get("status") != expected_reconciling
+    ):
         raise SprintError("batch is already reconciling a different terminal outcome")
     if marker.get("provider_evidence_sha256") not in {None, "", evidence_digest}:
         raise SprintError("batch terminal evidence changed during reconciliation")
-    marker.update({
-        "status": expected_reconciling,
-        "provider_batch_id": evidence["provider_batch_id"],
-        "provider_terminal_status": evidence["status"],
-        "provider_evidence_sha256": evidence_digest,
-        "updated_at": now(),
-    })
+    marker.update(
+        {
+            "status": expected_reconciling,
+            "provider_batch_id": evidence["provider_batch_id"],
+            "provider_terminal_status": evidence["status"],
+            "provider_evidence_sha256": evidence_digest,
+            "updated_at": now(),
+        }
+    )
     write_json(marker_path, marker)
     usage_ledger = UsageLedger(cfg["shared_root"])
     results: dict[str, dict[str, Any]] = {}
     if args.outcome == "completed":
-        if not args.results:
-            raise SprintError("completed batch reconciliation requires --results")
-        source = json.loads(Path(args.results).read_text(encoding="utf-8"))
-        rows = source.get("jobs") if isinstance(source, dict) else None
+        rows = evidence.get("results")
         if not isinstance(rows, list):
             raise SprintError("batch results require a jobs array")
-        results = {normalize_key(row.get("ticket")): row for row in rows if isinstance(row, dict)}
+        by_custom = {item["custom_id"]: item["ticket"] for item in marker["jobs"]}
+        results = {
+            by_custom[str(row.get("custom_id"))]: row
+            for row in rows
+            if isinstance(row, dict) and str(row.get("custom_id")) in by_custom
+        }
         if set(results) != {item["ticket"] for item in marker["jobs"]}:
-            raise SprintError("batch results must cover every reserved ticket exactly once")
+            raise SprintError(
+                "batch results must cover every reserved ticket exactly once"
+            )
     config = load_yaml(cfg["config"])
     settlements: dict[str, tuple[dict[str, int], str, str]] = {}
     if args.outcome == "completed":
         reservation_events = {
-            str(event.get("reservation_id")): event for event in usage_ledger._events()
+            str(event.get("reservation_id")): event
+            for event in usage_ledger._events()
             if event.get("kind") == "reservation"
         }
         for item in marker["jobs"]:
@@ -964,7 +1353,12 @@ def reconcile_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                 raise SprintError(f"batch result for {item['ticket']} requires usage")
             normalized = {
                 key: int(raw_usage.get(key, 0))
-                for key in ("input_tokens", "cache_write_tokens", "cache_read_tokens", "output_tokens")
+                for key in (
+                    "input_tokens",
+                    "cache_write_tokens",
+                    "cache_read_tokens",
+                    "output_tokens",
+                )
             }
             normalized["reasoning_tokens"] = int(raw_usage.get("reasoning_tokens", 0))
             response_id = str(row.get("response_id") or "")
@@ -974,29 +1368,55 @@ def reconcile_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                     f"batch result for {item['ticket']} requires an open reservation, response_id, and nonzero usage"
                 )
             settlements[item["ticket"]] = (normalized, response_id, str(event["model"]))
+    journal = marker.setdefault("application_journal", {})
     for item in marker["jobs"]:
+        if journal.get(item["custom_id"]) == args.outcome:
+            continue
         if args.outcome == "failed":
-            usage_ledger.release(item["reservation_id"], item["run_id"], "provider batch failed")
+            usage_ledger.release(
+                item["reservation_id"], item["run_id"], "provider batch failed"
+            )
+            journal[item["custom_id"]] = args.outcome
+            write_json(marker_path, marker)
             continue
         normalized, response_id, model = settlements[item["ticket"]]
         usage_ledger.settle(
-            item["reservation_id"], run_id=item["run_id"], ticket=item["ticket"],
-            sprint=str(marker["sprint_id"]), provider=str(marker["provider"]), model=str(model),
-            response_id=response_id, usage=normalized,
-            cost=Pricing.from_config(config, str(model)).actual_cost(normalized), role="sprint-worker",
+            item["reservation_id"],
+            run_id=item["run_id"],
+            ticket=item["ticket"],
+            sprint=str(marker["sprint_id"]),
+            provider=str(marker["provider"]),
+            model=str(model),
+            response_id=response_id,
+            usage=normalized,
+            cost=Pricing.from_config(config, str(model)).actual_cost(normalized),
+            role="sprint-worker",
         )
+        journal[item["custom_id"]] = args.outcome
+        write_json(marker_path, marker)
     if args.outcome == "failed":
         checkpoint = state_path(cfg["state_dir"], str(marker["sprint_id"]))
         with locked(checkpoint):
             state = load(checkpoint)
             for item in marker["jobs"]:
                 ticket = state["tickets"].get(item["ticket"])
-                if ticket and ticket.get("state") == "running" and ticket.get("run_ref") == item["run_ref"]:
-                    ticket.update({
-                        "state": "pending", "reason": "provider batch failed before worker output",
-                        "run_ref": "", "attempt_token": "", "attempt_capability": {},
-                    })
-                    ticket["history"].append({"at": now(), "event": "batch-failed-requeued"})
+                if (
+                    ticket
+                    and ticket.get("state") == "running"
+                    and ticket.get("run_ref") == item["run_ref"]
+                ):
+                    ticket.update(
+                        {
+                            "state": "pending",
+                            "reason": "provider batch failed before worker output",
+                            "run_ref": "",
+                            "attempt_token": "",
+                            "attempt_capability": {},
+                        }
+                    )
+                    ticket["history"].append(
+                        {"at": now(), "event": "batch-failed-requeued"}
+                    )
             save(checkpoint, state)
     marker["status"] = final_status
     marker["updated_at"] = now()
@@ -1015,13 +1435,19 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             raise SprintError(f"ticket {key} is not in the sprint checkpoint")
         ticket = state["tickets"][key]
         if ticket["state"] != "pending":
-            raise SprintError(f"ticket {key} cannot be reserved from state {ticket['state']}")
+            raise SprintError(
+                f"ticket {key} cannot be reserved from state {ticket['state']}"
+            )
         reasons = blockers(state, key, cfg)
         if reasons:
             raise SprintError(f"ticket {key} is blocked: {'; '.join(reasons)}")
-        running = sum(1 for value in state["tickets"].values() if value["state"] == "running")
+        running = sum(
+            1 for value in state["tickets"].values() if value["state"] == "running"
+        )
         if running >= cfg["concurrency_max"]:
-            raise SprintError(f"concurrency_max={cfg['concurrency_max']} is already reached")
+            raise SprintError(
+                f"concurrency_max={cfg['concurrency_max']} is already reached"
+            )
         if ticket["attempts"] > cfg["max_lane_relaunches"]:
             raise SprintError(
                 f"ticket {key} exceeded max_lane_relaunches={cfg['max_lane_relaunches']}; "
@@ -1045,24 +1471,34 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             "issued_at": now(),
         }
         ticket["attempt_capability"] = capability
-        ticket["worker_identity"] = capability["worker"]
+        # Reservation references are provisional routing/display values. Only
+        # the one-use attach transition can establish the actual worker whose
+        # liveness later authorizes an automatic requeue.
+        ticket["worker_identity"] = ""
         ticket["attach_capability"] = "attachcap_" + uuid.uuid4().hex
         ticket["attached_at"] = ""
         event = {"at": now(), "event": "reserved", "run_ref": args.run_ref}
         ticket["history"].append(event)
         save(path, state)
-    emit({
-        "ticket": key, "state": "running", "run_ref": args.run_ref,
-        "attempt_token": ticket["attempt_token"], "attempt_capability": capability["token"],
-        "attach_capability": ticket["attach_capability"],
-        "attempt": ticket["attempts"],
-    })
+    emit(
+        {
+            "ticket": key,
+            "state": "running",
+            "run_ref": args.run_ref,
+            "attempt_token": ticket["attempt_token"],
+            "attempt_capability": capability["token"],
+            "attach_capability": ticket["attach_capability"],
+            "attempt": ticket["attempts"],
+        }
+    )
 
 
 def require_attempt(ticket: dict[str, Any], supplied: str) -> None:
     expected = str(ticket.get("attempt_token") or "")
     if not expected or supplied != expected:
-        raise SprintError("attempt token is missing or stale; refusing cross-attempt state mutation")
+        raise SprintError(
+            "attempt token is missing or stale; refusing cross-attempt state mutation"
+        )
 
 
 def attach(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
@@ -1076,12 +1512,21 @@ def attach(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         if not ticket or ticket["state"] != "running":
             raise SprintError(f"ticket {key} is not running")
         expected = str(ticket.get("attach_capability") or "")
-        if not expected or args.attach_capability != expected or ticket.get("attached_at"):
-            raise SprintError("attach capability is missing, stale, or already consumed")
+        if (
+            not expected
+            or args.attach_capability != expected
+            or ticket.get("attached_at")
+        ):
+            raise SprintError(
+                "attach capability is missing, stale, or already consumed"
+            )
         ticket["run_ref"] = args.run_ref
+        ticket["worker_identity"] = args.run_ref
         ticket["attached_at"] = now()
         ticket["attach_capability"] = ""
-        ticket["history"].append({"at": now(), "event": "attached", "run_ref": args.run_ref})
+        ticket["history"].append(
+            {"at": now(), "event": "attached", "run_ref": args.run_ref}
+        )
         save(path, state)
     emit({"ticket": key, "state": "running", "run_ref": args.run_ref})
 
@@ -1103,7 +1548,9 @@ def finish(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["reason"] = args.summary.strip()
         ticket["branch"] = args.branch.strip()
         ticket["pr"] = args.pr.strip()
-        ticket["history"].append({"at": now(), "event": "finished", "outcome": args.outcome})
+        ticket["history"].append(
+            {"at": now(), "event": "finished", "outcome": args.outcome}
+        )
         save(path, state)
     emit({"ticket": key, "state": args.outcome})
 
@@ -1131,7 +1578,9 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["worker_identity"] = ""
         ticket["attach_capability"] = ""
         ticket["attached_at"] = ""
-        ticket["history"].append({"at": now(), "event": "requeued", "reason": args.reason.strip()})
+        ticket["history"].append(
+            {"at": now(), "event": "requeued", "reason": args.reason.strip()}
+        )
         save(path, state)
     emit({"ticket": key, "state": "pending"})
 
@@ -1146,7 +1595,8 @@ def recover_legacy(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         state = load(path)
         ticket = state["tickets"].get(key)
         if (
-            not ticket or ticket.get("state") != "user_action"
+            not ticket
+            or ticket.get("state") != "user_action"
             or not ticket.get("legacy_recovery_pending")
         ):
             raise SprintError(f"ticket {key} is not a fenced legacy running lane")
@@ -1157,12 +1607,16 @@ def recover_legacy(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["attempt_token"] = ""
         ticket["attempt_capability"] = {}
         ticket["legacy_recovery_pending"] = False
-        ticket["history"].append({"at": now(), "event": "legacy-recovered", "reason": args.reason.strip()})
+        ticket["history"].append(
+            {"at": now(), "event": "legacy-recovered", "reason": args.reason.strip()}
+        )
         save(path, state)
     emit({"ticket": key, "state": "pending", "recovered": True})
 
 
-def require_worker_stopped(ticket: dict[str, Any], operator_token: str, cfg: dict[str, Any]) -> None:
+def require_worker_stopped(
+    ticket: dict[str, Any], operator_token: str, cfg: dict[str, Any]
+) -> None:
     """Use process liveness or consume a separately provisioned operator token."""
     run_ref = str(ticket.get("worker_identity") or "")
     match = re.fullmatch(r"(?:pid|workspace-lease-pid):(\d+)", run_ref)
@@ -1203,7 +1657,10 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
             "branch": ticket["branch"],
             "run_ref": ticket["run_ref"],
             "attempts": ticket.get("attempts", 0),
-            "spend": spend.get(key, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_count": 0, "state": "ok"}),
+            "spend": spend.get(
+                key,
+                {"spent_usd": 0.0, "reserved_usd": 0.0, "run_count": 0, "state": "ok"},
+            ),
         }
         if ticket["state"] == "completed":
             result["completed"].append(item)
@@ -1238,34 +1695,51 @@ def summary(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("--config", help="repo orchestration config (default: .orchestration/config.yaml)")
+    result.add_argument(
+        "--config",
+        help="repo orchestration config (default: .orchestration/config.yaml)",
+    )
     result.add_argument("--state-dir", help="checkpoint directory override")
+    result.add_argument(
+        "--test-only-evidence", action="store_true", help=argparse.SUPPRESS
+    )
     commands = result.add_subparsers(dest="command", required=True)
-    sync_parser = commands.add_parser("sync", help="normalize Jira inventory into a durable checkpoint")
-    sync_parser.add_argument("--inventory", required=True)
+    sync_parser = commands.add_parser(
+        "sync", help="normalize Jira inventory into a durable checkpoint"
+    )
+    inventory_source = sync_parser.add_mutually_exclusive_group(required=True)
+    inventory_source.add_argument("--inventory")
+    inventory_source.add_argument("--inventory-template")
     sync_parser.set_defaults(func=sync)
     for name, func in (("plan", plan), ("summary", summary)):
         command = commands.add_parser(name)
         command.add_argument("--sprint", required=True)
         command.set_defaults(func=func)
     batch_parser = commands.add_parser(
-        "prepare-batch", help="serialize and reserve non-interactive background Message Batch jobs"
+        "prepare-batch",
+        help="serialize and reserve non-interactive background Message Batch jobs",
     )
     batch_parser.add_argument("--sprint", required=True)
     batch_parser.add_argument("--jobs", required=True)
     batch_parser.set_defaults(func=prepare_batch)
     reconcile_batch_parser = commands.add_parser("reconcile-batch")
     reconcile_batch_parser.add_argument("--batch", required=True)
-    reconcile_batch_parser.add_argument("--outcome", required=True, choices=("completed", "failed"))
+    reconcile_batch_parser.add_argument(
+        "--outcome", required=True, choices=("completed", "failed")
+    )
     reconcile_batch_parser.add_argument("--results")
     reconcile_batch_parser.add_argument("--provider-evidence")
+    reconcile_batch_parser.add_argument("--provider-batch-id")
+    reconcile_batch_parser.add_argument("--test-transport", help=argparse.SUPPRESS)
     reconcile_batch_parser.set_defaults(func=reconcile_batch)
     reserve_parser = commands.add_parser("reserve")
     reserve_parser.add_argument("--sprint", required=True)
     reserve_parser.add_argument("--ticket", required=True)
     reserve_parser.add_argument("--run-ref", required=True)
     reserve_parser.add_argument("--run-id")
-    reserve_parser.add_argument("--role", default="sprint-worker", choices=("implementer", "sprint-worker"))
+    reserve_parser.add_argument(
+        "--role", default="sprint-worker", choices=("implementer", "sprint-worker")
+    )
     reserve_parser.add_argument("--worker-ref", default="")
     reserve_parser.set_defaults(func=reserve)
     attach_parser = commands.add_parser("attach")
@@ -1289,7 +1763,9 @@ def parser() -> argparse.ArgumentParser:
     requeue_parser.add_argument("--reason", required=True)
     requeue_parser.add_argument("--attempt-token", required=True)
     requeue_parser.add_argument("--operator-capability", default="")
-    requeue_parser.add_argument("--worker-stopped", action="store_true", help=argparse.SUPPRESS)
+    requeue_parser.add_argument(
+        "--worker-stopped", action="store_true", help=argparse.SUPPRESS
+    )
     requeue_parser.set_defaults(func=requeue)
     recover_parser = commands.add_parser("recover-legacy")
     recover_parser.add_argument("--sprint", required=True)

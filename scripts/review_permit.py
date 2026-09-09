@@ -27,13 +27,36 @@ def safe_pr(value: str) -> str:
 def ledger_path(shared_root: Path, ledger_dir: str, pr: str) -> Path:
     relative = Path(ledger_dir)
     if relative.is_absolute() or ".." in relative.parts:
-        raise ReviewPermitError("review ledger directory must stay in the shared repository")
-    return shared_root / relative / f"pr-{safe_pr(pr)}.json"
+        raise ReviewPermitError(
+            "review ledger directory must stay in the shared repository"
+        )
+    directory = shared_root / relative
+    legacy = directory / f"pr-{safe_pr(pr)}.json"
+    candidates = []
+    for candidate in directory.glob("subject-*.json") if directory.exists() else []:
+        try:
+            state = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        subject = state.get("work_subject")
+        if isinstance(subject, dict) and subject.get("id") == str(pr):
+            candidates.append(candidate)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise ReviewPermitError("review subject is ambiguous")
+    return legacy
 
 
 def consume(
-    *, shared_root: Path, ledger_dir: str, pr: str, token: str,
-    role: str, head: str, timestamp: str,
+    *,
+    shared_root: Path,
+    ledger_dir: str,
+    pr: str,
+    token: str,
+    role: str,
+    head: str,
+    timestamp: str,
 ) -> None:
     path = ledger_path(shared_root, ledger_dir, pr)
     lock_path = path.with_suffix(path.suffix + ".lock")
@@ -42,18 +65,26 @@ def consume(
     with lock_path.open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = json.loads(path.read_text(encoding="utf-8"))
-        permit = next((item for item in state.get("review_permits", []) if item.get("token") == token), None)
+        permit = next(
+            (
+                item
+                for item in state.get("review_permits", [])
+                if item.get("token") == token
+            ),
+            None,
+        )
         if not permit or permit.get("started_at") or permit.get("completion_receipt"):
             raise ReviewPermitError("review phase permit is missing or already started")
-        expected = {"work_subject": state.get("work_subject"), "role": role, "head": head.lower()}
-        if any(permit.get(key) != value for key, value in expected.items()):
-            raise ReviewPermitError("review phase permit does not match work subject, role, and exact head")
-        current_phase = {
-            "round_count": len(state.get("rounds", [])),
-            "repair_count": len(state.get("repair_attempts", [])),
-            "design_round_count": len((state.get("design") or {}).get("rounds", [])),
+        expected = {
+            "work_subject": state.get("work_subject"),
+            "role": role,
+            "head": head.lower(),
         }
-        if any(permit.get(key) != value for key, value in current_phase.items()):
+        if any(permit.get(key) != value for key, value in expected.items()):
+            raise ReviewPermitError(
+                "review phase permit does not match work subject, role, and exact head"
+            )
+        if permit.get("review_generation", 1) != state.get("review_generation", 1):
             raise ReviewPermitError("review phase changed after this permit was issued")
         permit["started_at"] = timestamp
         _save(path, state)
@@ -66,22 +97,29 @@ def canonical_digest(value: Any) -> str:
 
 
 def _save(path: Path, state: dict[str, Any]) -> None:
-        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(state, handle, indent=2, sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_name, path)
-        finally:
-            if os.path.exists(temp_name):
-                os.unlink(temp_name)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
 
 
 def complete(
-    *, shared_root: Path, ledger_dir: str, pr: str, token: str,
-    role: str, head: str, result: Any, timestamp: str,
+    *,
+    shared_root: Path,
+    ledger_dir: str,
+    pr: str,
+    token: str,
+    role: str,
+    head: str,
+    result: Any,
+    timestamp: str,
     desktop: bool = False,
 ) -> str:
     """Create a digest-bound completion receipt after successful review output.
@@ -99,36 +137,49 @@ def complete(
         permits = state.get("review_permits", [])
         permit = next((item for item in permits if item.get("token") == token), None)
         if not permit or permit.get("completion_receipt"):
-            raise ReviewPermitError("review phase permit is missing or already completed")
-        expected = {"work_subject": state.get("work_subject"), "role": role, "head": head.lower()}
-        if any(permit.get(key) != value for key, value in expected.items()):
-            raise ReviewPermitError("review phase permit does not match work subject, role, and exact head")
-        current_phase = {
-            "round_count": len(state.get("rounds", [])),
-            "repair_count": len(state.get("repair_attempts", [])),
-            "design_round_count": len((state.get("design") or {}).get("rounds", [])),
+            raise ReviewPermitError(
+                "review phase permit is missing or already completed"
+            )
+        expected = {
+            "work_subject": state.get("work_subject"),
+            "role": role,
+            "head": head.lower(),
         }
-        if any(permit.get(key) != value for key, value in current_phase.items()):
+        if any(permit.get(key) != value for key, value in expected.items()):
+            raise ReviewPermitError(
+                "review phase permit does not match work subject, role, and exact head"
+            )
+        if permit.get("review_generation", 1) != state.get("review_generation", 1):
             raise ReviewPermitError("review phase changed after this permit was issued")
         if not permit.get("started_at"):
             if not desktop:
-                raise ReviewPermitError("API review permit was not started by the provider runner")
+                raise ReviewPermitError(
+                    "API review permit was not started by the provider runner"
+                )
             permit["started_at"] = timestamp
             permit["execution"] = "desktop"
         receipt = "receipt_" + os.urandom(24).hex()
-        permit.update({
-            "completed_at": timestamp,
-            "completion_receipt": receipt,
-            "result_sha256": digest,
-            "receipt_consumed_at": "",
-        })
+        permit.update(
+            {
+                "completed_at": timestamp,
+                "completion_receipt": receipt,
+                "result_sha256": digest,
+                "receipt_consumed_at": "",
+            }
+        )
         _save(path, state)
     return receipt
 
 
 def cancel_started(
-    *, shared_root: Path, ledger_dir: str, pr: str, token: str,
-    role: str, head: str, timestamp: str,
+    *,
+    shared_root: Path,
+    ledger_dir: str,
+    pr: str,
+    token: str,
+    role: str,
+    head: str,
+    timestamp: str,
 ) -> None:
     """Release a started permit only after a known pre-ack rejection."""
     path = ledger_path(shared_root, ledger_dir, pr)
@@ -136,42 +187,65 @@ def cancel_started(
     with lock_path.open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = json.loads(path.read_text(encoding="utf-8"))
-        permit = next((item for item in state.get("review_permits", []) if item.get("token") == token), None)
-        expected = {"work_subject": state.get("work_subject"), "role": role, "head": head.lower()}
+        permit = next(
+            (
+                item
+                for item in state.get("review_permits", [])
+                if item.get("token") == token
+            ),
+            None,
+        )
+        expected = {
+            "work_subject": state.get("work_subject"),
+            "role": role,
+            "head": head.lower(),
+        }
         if (
-            not permit or any(permit.get(key) != value for key, value in expected.items())
-            or not permit.get("started_at") or permit.get("completion_receipt")
+            not permit
+            or any(permit.get(key) != value for key, value in expected.items())
+            or not permit.get("started_at")
+            or permit.get("completion_receipt")
         ):
-            raise ReviewPermitError("only a started, incomplete matching permit can be cancelled")
+            raise ReviewPermitError(
+                "only a started, incomplete matching permit can be cancelled"
+            )
         permit["cancelled_at"] = timestamp
         permit["receipt_consumed_at"] = timestamp
         _save(path, state)
 
 
 def consume_completion(
-    state: dict[str, Any], *, token: str, role: str, head: str, result: Any, timestamp: str
+    state: dict[str, Any],
+    *,
+    token: str,
+    role: str,
+    head: str,
+    result: Any,
+    timestamp: str,
 ) -> bool:
     digest = canonical_digest(result)
     permit = next(
         (
-            item for item in state.get("review_permits", [])
-            if item.get("token") == token and item.get("role") == role
+            item
+            for item in state.get("review_permits", [])
+            if item.get("token") == token
+            and item.get("role") == role
             and item.get("head") == head.lower()
         ),
         None,
     )
     if (
-        not permit or not permit.get("completion_receipt")
-        or permit.get("receipt_consumed_at") or permit.get("result_sha256") != digest
+        not permit
+        or not permit.get("completion_receipt")
+        or permit.get("receipt_consumed_at")
+        or permit.get("result_sha256") != digest
     ):
         return False
     permit["receipt_consumed_at"] = timestamp
     return True
 
 
-def consumed_permit(
-    state: dict[str, Any], token: str, *, role: str, head: str
-) -> bool:
+def consumed_permit(state: dict[str, Any], token: str, *, role: str, head: str) -> bool:
     return any(
         item.get("token") == token
         and item.get("role") == role

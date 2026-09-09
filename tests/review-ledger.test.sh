@@ -73,6 +73,13 @@ led open cap-test --max-rounds 1 >/dev/null
 led open cap-test --max-rounds 99 >/dev/null
 eq "worker CLI cannot raise a durable repair cap" "1" "$(led status cap-test | field max_rounds)"
 
+led design-open 'free/form' >/dev/null
+led design-open 'free-form' >/dev/null
+eq "sanitized free-form ids retain exact collision-free identity" "free/form" \
+  "$(led status 'free/form' | python3 -c 'import json,sys; print(json.load(sys.stdin)["work_subject"]["id"])')"
+eq "colliding free-form ids own distinct ledgers" "free-form" \
+  "$(led status 'free-form' | python3 -c 'import json,sys; print(json.load(sys.stdin)["work_subject"]["id"])')"
+
 # --- round 1 has full blocking authority --------------------------------------
 led open 2 >/dev/null
 out="$(led record 2 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --blocking 'src/b.ts:bar')"
@@ -99,6 +106,33 @@ led record 4 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/n
 out="$(led record 4 --gate security-review --verdict FAIL --blocking 'src/rls/policy.sql:tenantIsolation')"
 eq "a late security finding is never demoted" "src/rls/policy.sql:tenantisolation" "$(printf '%s' "$out" | field accepted_blocking)"
 eq "a late security finding still fails the gate" "FAIL" "$(printf '%s' "$out" | field effective_verdict)"
+
+led open gate-owned >/dev/null
+led record gate-owned --gate code-review --verdict FAIL --blocking 'src/shared.py:check' >/dev/null
+led record gate-owned --gate security-review --verdict FAIL --blocking 'src/shared.py:check' >/dev/null
+eq "one gate cannot auto-resolve another gate claim" "src/shared.py:check" \
+  "$(led record gate-owned --gate code-review --verdict FAIL | field open_blocking)"
+eq "aggregate resolves only after every owning gate clears its claim" "" \
+  "$(led record gate-owned --gate security-review --verdict FAIL | field open_blocking)"
+
+led open concurrent-permits >/dev/null
+HEAD_CONCURRENT="$(git -C "$TMP" rev-parse HEAD)"
+CODE_PERMIT="$(led permit-review concurrent-permits --role code-reviewer --head "$HEAD_CONCURRENT" | field review_phase_permit)"
+SEC_PERMIT="$(led permit-review concurrent-permits --role security-reviewer --head "$HEAD_CONCURRENT" | field review_phase_permit)"
+cat > "$TMP/concurrent-code.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[{"name":"review","status":"pass"}],"findings":[]}
+JSON
+cat > "$TMP/concurrent-security.json" <<'JSON'
+{"schema_version":1,"gate":"security-review","verdict":"PASS","checks":[{"name":"review","status":"pass"}],"findings":[]}
+JSON
+led complete-review concurrent-permits --role code-reviewer --phase-permit "$CODE_PERMIT" --result "$TMP/concurrent-code.json" >/dev/null
+led record concurrent-permits --gate code-review --result "$TMP/concurrent-code.json" --head "$HEAD_CONCURRENT" --phase-permit "$CODE_PERMIT" >/dev/null
+if led complete-review concurrent-permits --role security-reviewer --phase-permit "$SEC_PERMIT" --result "$TMP/concurrent-security.json" >/dev/null \
+  && led record concurrent-permits --gate security-review --result "$TMP/concurrent-security.json" --head "$HEAD_CONCURRENT" --phase-permit "$SEC_PERMIT" >/dev/null; then
+  ok "concurrent gate permits remain completable and recordable in either order"
+else
+  bad "concurrent gate permits remain completable and recordable in either order"
+fi
 
 # --- explicit repairs, redesign, and the cap ----------------------------------
 led open 5 --max-rounds 2 >/dev/null

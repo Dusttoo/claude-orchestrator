@@ -48,6 +48,12 @@ contains_contract "sprint restart reconciliation" 'needs_reconcile' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "atomic sprint reservation" 'reserve' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "complete attach capability invocation" 'attach --sprint <id> --ticket <key> --run-ref <actual[^>]*> --attach-capability <attach_capability>' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "adapter-owned Jira fetch" 'sync --inventory-template' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "adapter-owned terminal batch reconciliation" 'reconcile-batch.*--provider-batch-id' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "per-ticket workflow dispatch" 'orchestrate' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "three-way sprint summary" 'user-action' \

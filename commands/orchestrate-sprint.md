@@ -65,7 +65,7 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    the next lane, never whether one is actionable: prerequisites,
    `concurrency_max`, and blocked states still apply first.
 
-4. Run `sprint-controller.py sync --inventory <file>`, then
+4. Run `sprint-controller.py sync --inventory-template <file>`, then
    `sprint-controller.py plan --sprint <exact-id>`. Sync preserves completed,
    blocked, user-action, and running records. Before new launches, reconcile
    every `needs_reconcile` agent reference against the real agent and PR. Finish
@@ -73,8 +73,9 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    the prior agent no longer exists. Never duplicate an uncertain run.
    A resolved blocked or user-action ticket may also be explicitly requeued with
    the evidence in `--reason`; completed tickets cannot be requeued.
-   Produce an adapter-owned exact-page artifact with
-   `jira_inventory_fetch.py` before sync. Requeue requires its current
+   Run `sprint-controller.py sync --inventory-template <template>` so the
+   controller-owned adapter performs authenticated approved-origin requests,
+   exhaustive pagination, and content-addressed evidence itself. Requeue requires its current
    `--attempt-token` and mechanical process/workspace-lease liveness proof, or
    a separately provisioned single-use operator capability.
 
@@ -94,8 +95,7 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    task reference before calling `attach`. Do not mark a ticket blocked merely
    because native subagents are unavailable when the Codex CLI fallback can run.
    If neither launch mechanism exists, record `user_action` and preserve the
-   reservation for reconciliation. After a real launch, run `attach --sprint <id>
-   --ticket <key> --run-ref <actual-agent-ref> --attempt-token <token>`.
+   reservation for reconciliation. After a real launch, run `attach --sprint <id> --ticket <key> --run-ref <actual-agent-ref> --attach-capability <attach_capability>`.
 
    For a lane explicitly marked `background: true` and `interactive: false`, do
    not start an interactive worker. Use the resolved API route and assemble each
@@ -109,8 +109,9 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    provider-native request plus a durable state marker under
    `.orchestration/.sprint-state/`. Anthropic emits a Message Batches JSON body
    for `POST /v1/messages/batches`; OpenAI emits Batch JSONL for upload and
-   `POST /v1/batches`. Reconcile results by `custom_id` and finish each ticket
-   normally. A prepared batch marker is not a completed ticket.
+   `POST /v1/batches`. Reconcile only through `reconcile-batch --batch <local-id> --provider-batch-id <provider-id> --outcome completed|failed`;
+   its provider adapter owns terminal lookup and complete result download,
+   journaling each `custom_id`. A prepared batch marker is not a completed ticket.
 
 6. On every worker result, immediately run `finish --sprint <id> --ticket <key>
    --outcome completed|blocked|user_action --summary <text> --pr <pr> --branch

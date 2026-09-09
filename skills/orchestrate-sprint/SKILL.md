@@ -116,15 +116,15 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    query for auditability. The controller rejects duplicate or malformed keys,
    dedupes dependencies, identifies self-links, cycles, incomplete external
    status data, and initially completed/blocked/not-ready Jira states.
-   Before sync, pass the sanitized inventory and raw parent/child Jira REST
-   pages through `jira_inventory_fetch.py`. Sync validates the adapter-owned
-   artifact for exact keys, gapless pagination to total/exhaustion, and both
-   directions of every parent-child relation.
+   For production sync, run `sprint-controller.py sync --inventory-template <template>`.
+   The controller invokes the Jira adapter, which owns authenticated requests,
+   approved-origin enforcement, exhaustive pagination, and content-addressed
+   raw responses. Caller page files or self-sealed fixtures are not evidence.
 
 4. **Sync and resume.** Run:
 
    ```text
-   sprint-controller.py sync --inventory <inventory.json>
+   sprint-controller.py sync --inventory-template <inventory-template.json>
    sprint-controller.py plan --sprint <resolved-jira-sprint-id>
    ```
 
@@ -167,7 +167,7 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    user action. After launch, replace the provisional reference:
 
    ```text
-   sprint-controller.py attach --sprint <id> --ticket <key> --run-ref <actual-task-or-agent-ref> --attach-capability <token>
+   sprint-controller.py attach --sprint <id> --ticket <key> --run-ref <actual-task-or-agent-ref> --attach-capability <attach_capability>
    ```
 
    **Codex host launch contract.** A reservation is not a worker launch. First
@@ -205,8 +205,10 @@ Before launching, resolve the executable because non-interactive SSH shells may 
    atomically reserves the lanes, and writes a provider-native request and
    marker under `.orchestration/.sprint-state/`.
    Submit Anthropic JSON to `POST /v1/messages/batches`; upload OpenAI JSONL and
-   create `POST /v1/batches`. Reconcile asynchronous results by `custom_id` and
-   call `finish` for each ticket. Preparation alone is not completion.
+   create `POST /v1/batches`. Reconcile only through `sprint-controller.py reconcile-batch --batch <local-id> --provider-batch-id <provider-id> --outcome completed|failed`.
+   The controller invokes the authenticated provider adapter, downloads the
+   complete terminal result set, and journals each `custom_id` application.
+   Caller-authored terminal JSON is never authoritative.
 
 6. **Checkpoint every outcome.** As workers finish, immediately call:
 

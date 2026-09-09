@@ -2,6 +2,7 @@
 # sprint-controller.test.sh -- scheduling is bounded, resumable, and continues
 # independent work past blocked tickets.
 set -uo pipefail
+export ORCHESTRATION_TEST_MODE=1
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/.."
@@ -14,7 +15,7 @@ ok() { printf 'ok   %s\n' "$1"; }
 fail_case() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }
 run_ok() {
   local label="$1"; shift
-  if "$@" >/dev/null 2>&1; then ok "$label"; else fail_case "$label"; fi
+  if "$@" >/dev/null; then ok "$label"; else fail_case "$label"; fi
 }
 run_fail() {
   local label="$1"; shift
@@ -29,19 +30,18 @@ json_check() {
   fi
 }
 jira_receipt() {
-  local inventory="$1" artifact="$1.fetch.json" parents="$1.parents.json" children="$1.children.json"
-  python3 - "$inventory" "$parents" "$children" <<'PY'
+  local inventory="$1" artifact="$1.fetch.json" transport="$1.transport.json"
+  python3 - "$inventory" "$transport" <<'PY'
 import json,sys
 value=json.load(open(sys.argv[1])); parents=sorted(x["key"].upper() for x in value["tickets"])
 children=sorted(x.upper() for x in value["subtask_keys"])
 by_key={x["key"].upper():x for x in value["tickets"]}
 parent_issues=[{"key":key,"fields":{"subtasks":[{"key":x} for x in by_key[key].get("subtasks",[])]}} for key in parents]
 child_issues=[{"key":key,"fields":{"parent":{"key":by_key.get(key,{}).get("parent","")}}} for key in children]
-json.dump([{"startAt":0,"total":len(parents),"isLast":True,"issues":parent_issues}],open(sys.argv[2],"w"))
-json.dump([{"startAt":0,"total":len(children),"isLast":True,"issues":child_issues}],open(sys.argv[3],"w"))
+json.dump({"parents":[{"startAt":0,"total":len(parents),"isLast":True,"issues":parent_issues}],"children":[{"startAt":0,"total":len(children),"isLast":True,"issues":child_issues}]},open(sys.argv[2],"w"))
 PY
-  python3 "$ROOT/scripts/jira_inventory_fetch.py" --inventory "$inventory" \
-    --parent-pages "$parents" --child-pages "$children" --artifact "$artifact" --output "$inventory"
+  python3 "$ROOT/scripts/jira_inventory_fetch.py" --inventory-template "$inventory" \
+    --test-transport "$transport" --artifact "$artifact" --output "$inventory"
 }
 
 mkdir -p "$TMP/repo/.git" "$TMP/repo/.orchestration"
@@ -73,6 +73,20 @@ jira_receipt "$TMP/repo/inventory.json"
 
 cd "$TMP/repo" || exit 1
 run_ok "sync creates normalized durable checkpoint" "$CONTROLLER" sync --inventory inventory.json
+if env -u ORCHESTRATION_TEST_MODE "$CONTROLLER" sync --inventory inventory.json >/dev/null 2>&1; then
+  fail_case "test transport cannot authorize production Jira sync"
+else
+  ok "test transport cannot authorize production Jira sync"
+fi
+python3 - inventory.json "$TMP/repo/self-sealed.json" "$TMP/repo/self-sealed.fetch.json" <<'PY'
+import hashlib,json,sys
+value=json.load(open(sys.argv[1])); artifact=json.load(open(value["fetch_artifact"]["path"]))
+artifact["authority"]="provider-network"; artifact["approved_origin"]="https://jira.example"
+json.dump(artifact,open(sys.argv[3],"w"),indent=2,sort_keys=True)
+value["fetch_artifact"]={"path":sys.argv[3],"sha256":hashlib.sha256(json.dumps(artifact,sort_keys=True,separators=(",",":")).encode()).hexdigest()}
+json.dump(value,open(sys.argv[2],"w"))
+PY
+run_fail "self-sealed caller Jira bundle cannot authorize production sync" "$CONTROLLER" sync --inventory "$TMP/repo/self-sealed.json"
 python3 - inventory.json "$TMP/repo/gapped.json" "$TMP/repo/gapped.fetch.json" <<'PY'
 import copy,json,sys
 value=json.load(open(sys.argv[1])); artifact=json.load(open(value["fetch_artifact"]["path"]))
@@ -120,7 +134,7 @@ run_ok "blocked independent ticket frees its lane" "$CONTROLLER" finish --sprint
 "$CONTROLLER" plan --sprint 42 > "$TMP/plan2.json"
 json_check "completed prerequisite unlocks dependent ticket" "$TMP/plan2.json" 'data["launch"] == ["PROJ-2"]'
 
-"$CONTROLLER" reserve --sprint 42 --ticket PROJ-2 --run-ref "pid:$$" > "$TMP/reserve2.json" && ok "unlocked ticket reserves" || bad "unlocked ticket reserves"
+"$CONTROLLER" reserve --sprint 42 --ticket PROJ-2 --run-ref "pid:999999" > "$TMP/reserve2.json" && ok "unlocked ticket reserves with dead provisional identity" || bad "unlocked ticket reserves with dead provisional identity"
 TOKEN2="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_token"])' "$TMP/reserve2.json")"
 ATTACH2="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attach_capability"])' "$TMP/reserve2.json")"
 run_ok "running ticket survives inventory resync" "$CONTROLLER" sync --inventory inventory.json
@@ -128,9 +142,9 @@ run_ok "running ticket survives inventory resync" "$CONTROLLER" sync --inventory
 json_check "resync does not duplicate a running workflow" "$TMP/resync.json" 'data["needs_reconcile"] == ["PROJ-2"] and "PROJ-2" not in data["launch"]'
 run_fail "requeue without stopped-worker proof fails closed" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason missing-proof --attempt-token "$TOKEN2"
 run_fail "worker attempt token cannot rewrite death evidence" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --run-ref pid:999999 --attach-capability "$TOKEN2"
-run_ok "controller attach capability sets display identity once" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --run-ref task-display --attach-capability "$ATTACH2"
+run_ok "controller attach capability establishes actual worker identity once" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --run-ref "pid:$$" --attach-capability "$ATTACH2"
 run_fail "controller attach capability is one-use" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --run-ref second-display --attach-capability "$ATTACH2"
-run_fail "live immutable worker identity blocks requeue after display attach" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker no longer exists' --attempt-token "$TOKEN2"
+run_fail "live attached worker blocks requeue despite dead provisional identity" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker no longer exists' --attempt-token "$TOKEN2"
 printf 'recover-once' > .orchestration/operator-recovery.cap
 run_ok "operator can requeue a live mechanically bound worker" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'operator stopped worker' --attempt-token "$TOKEN2" --operator-capability recover-once
 run_ok "pending attempt history survives Jira resync" "$CONTROLLER" sync --inventory inventory.json
@@ -296,14 +310,18 @@ run_fail "caller failure cannot release uncertain submitted work" "$CONTROLLER" 
 cat > "$TMP/batch-terminal.json" <<JSON
 {"schema_version":1,"provider":"anthropic","batch_id":"$BATCH_ID","provider_batch_id":"msgbatch_test","status":"cancelled","job_ids":["ticket_PROJ_40_$BATCH_ID","ticket_PROJ_41_$BATCH_ID"]}
 JSON
-run_ok "authoritative terminal batch evidence releases reservations" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --provider-evidence "$TMP/batch-terminal.json"
-run_ok "terminal batch reconciliation is idempotent" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --provider-evidence "$TMP/batch-terminal.json"
+run_fail "hand-authored terminal JSON cannot transition an uncertain batch" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --provider-evidence "$TMP/batch-terminal.json"
+cat > "$TMP/batch-transport.json" <<'JSON'
+{"status":{"id":"msgbatch_test","processing_status":"cancelled"},"result_pages":[]}
+JSON
+run_ok "adapter-owned terminal lookup releases reservations" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --provider-batch-id msgbatch_test --test-transport "$TMP/batch-transport.json"
+run_ok "terminal batch reconciliation is idempotent" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --test-transport "$TMP/batch-transport.json"
 python3 - "$TMP/batch-result.json" <<'PY'
 import json,sys
 result=json.load(open(sys.argv[1])); marker=json.load(open(result["marker"])); marker["status"]="reconciling_failed"
 json.dump(marker,open(result["marker"],"w"),indent=2)
 PY
-run_ok "crash-partial batch reconciliation resumes idempotently" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --provider-evidence "$TMP/batch-terminal.json"
+run_ok "crash-partial batch reconciliation resumes idempotently" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --test-transport "$TMP/batch-transport.json"
 "$CONTROLLER" plan --sprint 45 > "$TMP/batch-retry-plan.json"
 json_check "failed batch lanes return to bounded scheduling" "$TMP/batch-retry-plan.json" 'data["launch"] == ["PROJ-40", "PROJ-41"]'
 

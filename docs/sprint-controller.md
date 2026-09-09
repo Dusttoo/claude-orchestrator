@@ -14,19 +14,22 @@ constrains checkpoint paths to the repository, and never executes ticket text.
 Atomic replacement and a file lock coordinate controller processes using the
 same checkpoint. The host must pass arguments without shell interpolation.
 
-The host adapter is responsible for completeness at the external boundaries:
-pagination, Jira link direction, current external dependency statuses, actual
-worker identity, PR state, and verified merge outcome. The controller rejects
-unknown dependencies and duplicate keys rather than inventing those facts.
+Plugin adapters own completeness at external boundaries. The Jira adapter
+performs authenticated requests restricted to its configured HTTPS origin,
+exhausts pagination, and stores content-addressed raw responses. Provider batch
+adapters perform authenticated terminal lookup and complete result download.
+The controller rejects caller-authored receipts, unknown dependencies, and
+duplicate keys rather than inventing those facts.
 
 ## Impossible guarantees
 
-The controller cannot prove that a Jira query was complete, a host-reported run
-reference identifies the intended worker, or a worker actually merged its PR.
-It also cannot protect against a malicious local process or repository owner
-that edits checkpoints directly. File locks coordinate cooperating processes;
-they are not an authorization boundary. GitHub branch protection and the
-plugin's merge guard remain the enforcement boundary for merges.
+The controller cannot protect against a malicious same-UID process or
+repository owner that edits checkpoints directly, and does not pretend a
+locally available signing key creates authentication. It can require provider
+I/O to pass through its adapter boundary and bind raw responses by digest. File
+locks coordinate cooperating processes; they are not an authorization boundary.
+GitHub branch protection and the plugin's merge guard remain the enforcement
+boundary for merges.
 
 Crash recovery cannot safely decide whether an already-launched worker still
 exists. Therefore every launch is reserved first, and restart plans surface all
@@ -73,9 +76,10 @@ Non-interactive background lanes can be prepared with `prepare-batch`. The
 controller accepts only current `plan.launch` tickets explicitly marked as
 background and non-interactive, reserves them under the sprint lock, and writes
 an Anthropic Message Batches JSON request or OpenAI Batch JSONL plus a durable
-marker beneath the configured checkpoint directory. The host submits and
-monitors the batch; results are reconciled by `custom_id` before normal
-per-ticket `finish` calls.
+marker beneath the configured checkpoint directory. The host submits the batch
+and records its provider id. Reconciliation invokes the provider adapter for
+terminal state and complete results, then applies each `custom_id` idempotently
+before normal per-ticket `finish` calls.
 
 ## Ready ordering
 
