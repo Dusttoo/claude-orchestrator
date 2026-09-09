@@ -35,6 +35,9 @@ done
 run_fail "invalid fixture: unsupported schema" "$ENGINE" --config "$FIX/invalid-unsupported-version.yaml" validate-config
 run_fail "invalid fixture: undefined branch role" "$ENGINE" --config "$FIX/invalid-undefined-branch.yaml" validate-config
 run_fail "invalid fixture: undefined adapter" "$ENGINE" --config "$FIX/invalid-undefined-adapter.yaml" validate-config
+cp "$FIX/legacy-v1.yaml" "$TMP/invalid-trust-profile.yaml"
+printf '\nworker_trust_profile: omnipotent-worker\n' >> "$TMP/invalid-trust-profile.yaml"
+run_fail "invalid worker trust profile" "$ENGINE" --config "$TMP/invalid-trust-profile.yaml" validate-config
 
 eq "branch role resolves Gecktopia candidate template" "release/2026.08.05" \
   "$("$ENGINE" --config "$FIX/gecktopia-adr-008.yaml" branch-name candidate --var candidate_id=2026.08.05)"

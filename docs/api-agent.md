@@ -35,7 +35,9 @@ AZURE_ADM_BASE_URL=https://your-resource.openai.azure.com/openai/v1
 
 Only define the provider the repository uses. Optional custom endpoints are
 `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`; `AZURE_ADM_BASE_URL` is required for
-Azure Direct Models. The Azure `model` route value is the deployment name. The
+Azure Direct Models. `ANTHROPIC_BASE_URL` accepts either a host URL or a URL
+already ending in `/v1`; the runner normalizes both to the versioned Messages
+API path. The Azure `model` route value is the deployment name. The
 runner parses this file as data; it does not execute shell syntax or expand
 variables. Only the documented provider names are loaded. Variables already
 supplied by a cloud container or host environment take precedence, making platform secret injection
@@ -95,6 +97,12 @@ bounded.
 `llm.roles.<role>.allowed_tools` may narrow that role's built-in ceiling. It
 cannot grant a reviewer write access or name an unknown tool.
 
+Anthropic tools intentionally omit the provider's `strict` flag because the
+tool schemas use standard constraints outside Anthropic strict mode's accepted
+subset. The tool executor remains the security boundary and independently
+enforces path containment, numeric ranges, list sizes, patch size, allowed
+checks, timeouts, and output limits.
+
 The runner is intentionally text/code-only. Keep `visual-qa` on a desktop route
 until a separately sandboxed image/browser adapter is configured; an API visual
 role fails closed instead of pretending a text-only review inspected the UI.
@@ -108,6 +116,38 @@ the shared ledger, so lanes running in separate worktrees serialize against each
 other rather than against private copies of the limit. Reservations are included in
 run, ticket, and sprint checks, preventing concurrent workers from racing past a
 shared limit. A request that could exceed any configured ceiling is not sent.
+
+Ticket controls are layered: `warn_usd_per_ticket` records an event without
+stopping work, `pause_usd_per_ticket` is a hard operator-action stop, and
+`max_usd_per_ticket` remains the hard ceiling. Unique run IDs are bounded by
+`max_model_runs_per_ticket` and `max_reviewer_runs_per_ticket`; tool rounds
+inside one run do not consume extra run slots. Repository configuration may
+tighten the compiled incident ceilings but cannot raise or disable them. There
+is deliberately no same-user CLI approval bypass.
+
+A host operator may authorize one ticket to continue to an exact absolute
+ceiling with the separately installed root authority. This raises only that
+ticket's cost pause and hard ticket-cost ceiling; run-count, reviewer-count,
+per-run, sprint, and provider breakers remain unchanged. The grant expires and
+cannot be created from repository configuration or by the runtime user. The
+sprint controller activates it with `grant-budget`; API reservations query the
+active grant before every request and stop again at the granted ceiling.
+
+API reviewer runs require a review-ledger phase permit bound to the ledger's
+immutable repository work subject, role, PR/design ledger, and full exact commit:
+
+```text
+scripts/review-ledger.py permit-review 123 \
+  --role code-reviewer --head "$(git rev-parse HEAD)"
+# pass the returned token to api_agent.py run --review-pr 123 \
+#   --review-authorization <token>
+```
+
+Implementer and sprint-worker API routes also require `--attempt-capability`
+and `--worker-ref` exactly as returned and bound by `sprint-controller.py
+reserve`. Reviewer output is usable only after the API runner creates a
+digest-bound completion receipt; native reviewers use `review-ledger.py
+complete-review` after writing their structured result.
 
 After every response, actual uncached input, cache writes, cache reads, output,
 and reasoning usage is recorded under `.orchestration/.llm-usage/usage.jsonl`.
@@ -125,8 +165,10 @@ request stays reconcilable after its worktree is cleaned up.
 
 Tool execution is unaffected and stays sandboxed to the lane's own worktree.
 
-Set `ORCHESTRATION_USAGE_ROOT` to point the ledger somewhere else explicitly --
-for example to hold several repositories to one budget. Outside a git
+Runtime state always resolves from Git's common directory. Environment overrides
+are intentionally ignored because selecting a fresh directory would reset every
+shared enforcement counter.
+Outside a git
 repository the ledger falls back to the `--repo` directory.
 
 ### Reading the ledger

@@ -85,6 +85,14 @@ supports them.
 - **Design before security-sensitive infrastructure.** A pre-code gate records
   trust boundaries, impossible guarantees, failure recovery, rejected fragile
   alternatives, and the adversarial tests that falsify its invariants.
+- **Architecture must fit the authorized boundary.** The design gate identifies
+  invariants that require a root-owned installation, distinct UID, daemon,
+  container, cloud resource, or operational rollout before code starts; those
+  become separately scoped work instead of late review discoveries.
+- **Worker trust is explicit and portable.** `cooperative-worker` covers mistakes,
+  crashes, loops, duplicate execution, and accidental misuse. `isolated-worker`
+  opts into independently owned process and credential isolation. Neither profile
+  relaxes application, tenant, or external-input security.
 - **Reviews batch the whole sweep.** Finding one blocker never ends a review;
   reviewers finish the diff, checklist, and matrix and report all findings once.
 - **A failed repair triggers scoped redesign.** A stable component-key ledger,
@@ -147,6 +155,7 @@ Legacy key blocks:
 | Key | Purpose |
 |---|---|
 | `integration_branch` / `production_branch` | the branch model |
+| `worker_trust_profile` | worker-versus-host assumptions: `cooperative-worker` (portable default) or `isolated-worker` |
 | `llm` / `llm.roles` | global desktop/API route, per-role provider/model/tool overrides, hard budgets, and explicit model pricing |
 | `merge_to_integration` / `merge_to_production` | `merge` or `squash` per target |
 | `ci_checks_integration` / `ci_checks_production` | exact GitHub check-run names that define "CI green" |
@@ -210,7 +219,7 @@ marketplace entry points at `./plugins/claude-orchestrator`, then running:
 codex plugin add claude-orchestrator@personal
 ```
 
-Codex users invoke the same flows in natural language: "orchestrate BL-90 end to
+Codex users invoke the same flows in natural language: "orchestrate PROJ-90 end to
 end", "orchestrate the active sprint", "gate PR 123", "advance the configured
 release transition", or "bootstrap orchestration in this repo". See
 [docs/codex.md](docs/codex.md) for the full marketplace layout and hook trust
@@ -231,7 +240,7 @@ findings; a finding that survives an evidenced repair forces scoped redesign
 before the final attempt. Nothing merges red.
 
 The slash command is the explicit, deterministic entry point. Natural language
-works too: asking to "orchestrate BL-90" or "run this ticket through the
+works too: asking to "orchestrate PROJ-90" or "run this ticket through the
 pipeline" triggers the `orchestrate-ticket` skill, which runs the same flow. Use
 the slash command when you want to be explicit; use plain English when you don't
 want to remember the syntax.

@@ -5,6 +5,11 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/.."
+PREFLIGHT_REPO="$(mktemp -d)"
+INCOMPLETE_PLUGIN="$(mktemp -d)"
+trap 'rm -rf "$PREFLIGHT_REPO" "$INCOMPLETE_PLUGIN"' EXIT
+mkdir -p "$PREFLIGHT_REPO/.orchestration"
+cp "$ROOT/templates/config.yaml" "$PREFLIGHT_REPO/.orchestration/config.yaml"
 
 fails=0
 ok() { printf 'ok   %s\n' "$1"; }
@@ -20,6 +25,8 @@ check_not() {
 
 check "template declares legacy schema by default" \
   grep -Eq '^schema_version:[[:space:]]*1([[:space:]]|$)' "$ROOT/templates/config.yaml"
+check "template defaults to the portable cooperative worker profile" \
+  grep -Eq '^worker_trust_profile:[[:space:]]*cooperative-worker([[:space:]]|$)' "$ROOT/templates/config.yaml"
 check_not "template does not actively enable schema v2" \
   grep -Eq '^schema_version:[[:space:]]*2([[:space:]]|$)' "$ROOT/templates/config.yaml"
 check "template leaves integration branch for repo detection" \
@@ -34,6 +41,15 @@ check "template exposes optional per-role LLM routes" \
   rg -q '^[[:space:]]+roles:' "$ROOT/templates/config.yaml"
 check "template gives API runs a hard USD ceiling" \
   rg -q '^[[:space:]]+max_usd_per_run:' "$ROOT/templates/config.yaml"
+check "reviewers use ledger-issued phase permits without config bypass" \
+  sh -c '! grep -q "require_review_authorization" "$1" && grep -q "permit-review" "$2"' _ \
+  "$ROOT/templates/config.yaml" "$ROOT/skills/gate-pr/SKILL.md"
+check "template sets ticket warning and pause thresholds" \
+  rg -q '^[[:space:]]+pause_usd_per_ticket:' "$ROOT/templates/config.yaml"
+check "template bounds model and reviewer run counts" \
+  rg -q '^[[:space:]]+max_reviewer_runs_per_ticket:' "$ROOT/templates/config.yaml"
+check "template bounds lane relaunches" \
+  grep -Eq '^max_lane_relaunches:[[:space:]]*[0-9]+' "$ROOT/templates/config.yaml"
 check "template requires explicit model pricing" \
   rg -q '^[[:space:]]+pricing:' "$ROOT/templates/config.yaml"
 check "template configures an active Jira sprint by default" \
@@ -84,6 +100,10 @@ check "plugin conformance runner owns worktree-cleanup suite" \
   rg -q 'worktree\.test\.sh' "$ROOT/scripts/run-plugin-conformance.sh"
 check "plugin conformance runner owns host-parity suite" \
   rg -q 'plugin-parity\.test\.sh' "$ROOT/scripts/run-plugin-conformance.sh"
+check "captain preflight accepts this exact plugin and configured repo" \
+  python3 "$ROOT/scripts/captain-preflight.py" --plugin-root "$ROOT" --repo "$PREFLIGHT_REPO" --host codex
+check "captain preflight fails when the active plugin is incomplete" \
+  sh -c '! python3 "$1/scripts/captain-preflight.py" --plugin-root "$2" --repo "$3" --host claude' sh "$ROOT" "$INCOMPLETE_PLUGIN" "$PREFLIGHT_REPO"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi

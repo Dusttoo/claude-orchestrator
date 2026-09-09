@@ -1,6 +1,6 @@
 ---
 name: orchestrate-ticket
-description: Drive one ticket or change end-to-end through the full multi-agent orchestration pipeline (implement in an isolated worktree -> independent code review -> security review when warranted -> optional verification -> merge on green). Use when the user asks in natural language to "orchestrate" a ticket, "run it through the pipeline", "take it end to end", or otherwise wants the gated implement-review-merge flow rather than a plain one-off edit. This is the natural-language entry to the same flow as the Claude /orchestrate command and Codex orchestration skill. Do NOT trigger for an ordinary implementation request ("just fix this", "make this change") where the user did not ask for the full gated pipeline.
+description: Drive one ticket or change end-to-end through the full multi-agent orchestration pipeline (isolated implementation, independent code review, security review when warranted, optional verification, and merge on green). Use when the user asks in natural language to "orchestrate" a ticket, "run it through the pipeline", "take it end to end", or otherwise wants the gated implement-review-merge flow rather than a plain one-off edit. This is the natural-language entry to the same flow as the Claude /orchestrate command and Codex orchestration skill. Do NOT trigger for an ordinary implementation request ("just fix this", "make this change") where the user did not ask for the full gated pipeline.
 ---
 
 # Orchestrate a ticket end to end
@@ -25,7 +25,10 @@ Before every `design-reviewer`, `implementer`, `code-reviewer`,
 its provider request with `context_pipeline.py payload --config ... --role
 <role>` and pipes it to `scripts/api_agent.py run --request - --config
 .orchestration/config.yaml --role <role>`, including ticket, sprint, and stable
-run identifiers when available. The runner enforces role tools and USD/token
+run identifiers when available. Before each API reviewer run, issue a phase
+permit with `review-ledger.py permit-review <pr-or-design-id>
+--role <role> --head <full-exact-head>` and pass it to `run --review-pr
+<pr-or-design-id> --review-authorization <token>`. The runner enforces role tools and USD/token
 ceilings. Use desktop fallback
 only after proving the API request failed before any provider/run id existed.
 Submitted, timed-out, or uncertain API work remains reserved for reconciliation
@@ -107,6 +110,10 @@ working directory.
    `.orchestration/runs/<run-id>/ticket-branch.json` is only a mirror that
    detects disagreement, not the source of run identity. Refuse a mismatch.
 
+   Resolve `worker_trust_profile` now. It applies only to orchestration workers
+   versus the host; it never narrows the application threat model. Do not let a
+   later reviewer silently substitute a stronger profile.
+
 2. **Pre-implementation gates.** Before cutting a branch or editing production
    code, build an adversarial test matrix from the acceptance criteria and the
    existing system. Each row names the attack/failure mode, setup/input, expected
@@ -115,11 +122,20 @@ working directory.
    redirections and pipelines), ignored/untracked files, failed Git or other
    inspection commands, partial execution, cleanup/recovery, permissions,
    concurrency, retries, and hostile inputs; mark a category N/A only with a
-   reason. If the planned change touches security-sensitive infrastructure, run
+   reason. Perform an architecture-feasibility check before implementation:
+   name which repository or operating boundary can enforce every promised
+   invariant. If success requires a root-owned installation, distinct UID,
+   daemon, container, cloud resource, or rollout outside the authorized scope,
+   split or defer that work instead of approving an in-repository approximation.
+   If the planned change touches security-sensitive infrastructure or crosses
+   one of those external boundaries, run
    a fresh pre-code design review with `orchestration-design-reviewer.md`. Open
    its durable counter with `review-ledger.py design-open <ticket-or-change>` and
-   record every result with `design-record --verdict <PASS|FAIL> --evidence
-   <artifact>`. It must
+   record FAIL with `design-record --verdict FAIL --evidence <artifact>`. A PASS
+   must use `design-record --result <json>` with schema version 1, gate
+   `design-review`, verdict, full exact `source_sha`, named repository artifact,
+   its SHA-256 digest, the consumed `phase_permit`, and non-empty pass/fail
+   checks. A generic completed message cannot authorize code. It must
    define the trust boundary and impossible guarantees, reject fragile designs,
    audit the matrix, and end `VERDICT: PASS`. A FAIL returns to design until
    `max_design_rounds`; then stop with `design-handoff`. Pass the approved
@@ -145,13 +161,19 @@ working directory.
    regression check. On any structured FAIL result, require the reviewer to finish its
    full checklist and
    adversarial sweep and return all findings together.
+   A blocking finding must identify a concrete failing input/precondition,
+   production path, wrong outcome/impact, and reproduction or exact falsifying
+   assertion under the configured threat profile. Hypothetical stronger-profile
+   concerns are advisory and must not expand the ticket into infrastructure.
 
    The durable failure ledger owns this loop; do not track it in your own
    context, which compacts. Open it once (`review-ledger.py open <pr>`), paste
    `review-ledger.py brief <pr>` into every reviewer brief, and record every
    completed gate with `review-ledger.py record <pr> --gate <gate> --result
-   .orchestration/.review-results/<gate>.json`. It normalizes each finding's
-   `[component: <path>:<symbol>]` key so a repeated defect actually accumulates
+   .orchestration/.review-results/<gate>.json --head <exact-sha>
+   --phase-permit <token>`. Native reviewers first call `complete-review` on
+   that permit after writing the structured result. It normalizes each finding's
+   bare `<path>:<symbol>` component key so a repeated defect actually accumulates
    strikes, freezes blocking scope after round 1, and returns `next_action`:
 
    - `review` -- after all gates record, generate one `repair-brief`; return its

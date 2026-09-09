@@ -9,11 +9,26 @@ On Linux hosts invoke Python scripts with python3; the python alias may be absen
 `${CLAUDE_PLUGIN_ROOT}/scripts/sprint-controller.py` for dependency
 normalization, atomic lane reservation, checkpoints, recovery, and summaries.
 
+0. Run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/captain-preflight.py
+   --plugin-root ${CLAUDE_PLUGIN_ROOT} --repo . --host claude`. Continue only
+   when it returns `status: ready` and `captain_mode: controller-only`. If this
+   script or this exact command is absent, stop as `user_action`: never infer the
+   plugin purpose, invent a similarly named skill, or operate sprint tickets
+   directly. Record its plugin version and runtime fingerprint in the first
+   checkpoint/status event.
+
 1. Read `.orchestration/config.yaml`; validate it with
    `${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py validate-config`.
-   Require `ticket.kind: jira`, `ticket.project`, `sprint_id` (overridden by
-   `$ARGUMENTS` when supplied), and `concurrency_max >= 1`. Missing Jira access is
-   a user action and no worker may launch.
+   Require `ticket.kind: jira`, `ticket.project`, `sprint_id`, a canonical
+   `jira_base_url`, and `concurrency_max >= 1`. These values are repository
+   policy and cannot be overridden by caller arguments or environment. Missing
+   Jira access is a user action and no worker may launch.
+
+   Resolve `worker_trust_profile` once for the sprint. It applies only to the
+   orchestration worker-versus-host boundary and never weakens application or
+   tenant security. `isolated-worker` requires its independently owned host
+   boundary before launch; do not silently impose that boundary on a
+   `cooperative-worker` repository.
 
    Before each lane launch, resolve `sprint-worker` with
    `${CLAUDE_PLUGIN_ROOT}/scripts/context_pipeline.py route --config
@@ -25,36 +40,33 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    desktop fallback may reuse the provisional reservation only when no
    provider/run id was created. Uncertain API work remains reserved.
 
-2. Resolve `ticket.jira_fields` with
-   `${CLAUDE_PLUGIN_ROOT}/scripts/context_pipeline.py jira-fields`; when absent it
-   defaults to `key,summary,description,status,priority,components,subtasks,issuelinks`.
-   Pass its `fields` value explicitly on every Jira issue/search request. Query
-   Jira for the entire configured project/sprint, paginating to completion, then
-   run every issue response through `context_pipeline.py sanitize-jira` before
-   any ticket data enters model context. Never inject rendered fields, edit-meta,
-   changelogs, render schemas, or avatar links.
-   Resolve `active` to an exact sprint id. Fetch configured dependency links and
-   the statuses of dependencies outside the sprint. With
-   `sprint_dependency_links`, a link is a dependency only when the current
-   ticket occupies the configured `blocked_side`; the opposite issue is its
-   prerequisite. Fetch each ticket's priority when the project ranks its work.
-   Never guess link direction, missing status, or an absent priority.
+2. The controller-owned adapter constructs one entire-sprint JQL query and one
+   independent child JQL query from canonical `ticket.project` and `sprint_id`.
+   It requests only `key,summary,status,priority,subtasks,parent,issuelinks` plus
+   the configured sprint field and rejects returned issues outside that policy.
+   The controller-owned adapter passes the compact fields plus scheduler-required
+   relation and configured `jira_sprint_field` fields, exhausts pagination, and
+   applies `context_pipeline.py sanitize-jira`. It derives exact sprint identity,
+   ticket metadata, relations, and external dependency statuses from
+   authenticated Jira responses. Do not query or normalize Jira in the captain.
 
-3. Write the fetched data beneath `sprint_checkpoint_dir` (default
-   `.orchestration/.sprint-state`) as JSON:
+3. Write an empty JSON inventory template beneath `sprint_checkpoint_dir`
+   (default `.orchestration/.sprint-state`). The adapter ignores caller-authored
+   queries and constructs them from canonical repository policy:
 
    ```json
-   {"project":"PROJ","sprint":{"id":"123","name":"Sprint 12"},"source_query":"exact Jira query","tickets":[{"key":"PROJ-2","summary":"Summary","status":"Ready","priority":2,"url":"https://jira/browse/PROJ-2","dependencies":["PROJ-1"]}],"dependency_status":{"OTHER-9":"Done"}}
+   {}
    ```
 
-   `priority` is optional per ticket: an integer where lower is more urgent, as
+   Caller-authored scheduler values have no authority. Derived `priority` is
+   optional per ticket: an integer where lower is more urgent, as
    Jira itself ranks (Highest = 1). The controller orders ready tickets by
    `(priority, key)`, placing unranked tickets after every ranked one; omit it
    and scheduling is unchanged. Priority decides which actionable ticket takes
    the next lane, never whether one is actionable: prerequisites,
    `concurrency_max`, and blocked states still apply first.
 
-4. Run `sprint-controller.py sync --inventory <file>`, then
+4. Run `sprint-controller.py sync --inventory-template <file>`, then
    `sprint-controller.py plan --sprint <exact-id>`. Sync preserves completed,
    blocked, user-action, and running records. Before new launches, reconcile
    every `needs_reconcile` agent reference against the real agent and PR. Finish
@@ -62,24 +74,44 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    the prior agent no longer exists. Never duplicate an uncertain run.
    A resolved blocked or user-action ticket may also be explicitly requeued with
    the evidence in `--reason`; completed tickets cannot be requeued.
+   Run `sprint-controller.py sync --inventory-template <template>` so the
+   controller-owned adapter performs authenticated approved-origin requests,
+   exhaustive pagination, and content-addressed evidence itself. Requeue requires its current
+   `--attempt-token` and the controller-bound PID/start fingerprint, or
+   a separately provisioned single-use operator capability.
 
 5. For each key in `plan.launch` — already ordered by `(priority, key)`, so
    launch in that order and never reprioritize locally — first create a unique
    provisional reference and run `reserve --sprint <id> --ticket <key>
    --run-ref <provisional>`. Reserve is the authoritative `concurrency_max`
-   check. Then launch a fresh isolated
+   check. Preserve the returned `attempt_token` for finish/requeue and the
+   separate one-use `attach_capability` for controller-owned launch. Then launch a fresh isolated
    worker that runs `/orchestration:orchestrate <key>` with the freshly fetched
    ticket body and acceptance criteria. On Codex SSH/CLI hosts, if native
-   multi-agent tools are unavailable, launch a detached `codex exec
-   --ephemeral --json --sandbox danger-full-access` worker in the repository
-   and record its PID plus output file as the actual run reference. Pass ticket
+   multi-agent tools are unavailable, use `launch-local` to start a detached
+   `codex exec --ephemeral --json --sandbox danger-full-access` worker in the repository.
+   Pass ticket
    text through stdin or a temporary file; never interpolate Jira text into a
-   shell command. A reservation is not a launch: verify a real worker process or
-   task reference before calling `attach`. Do not mark a ticket blocked merely
+   shell command. A reservation is not a launch: consume the returned controller
+   launch evidence with `attach`; native task references with no
+   supported process adapter remain reserved for operator recovery. Do not mark a ticket blocked merely
    because native subagents are unavailable when the Codex CLI fallback can run.
    If neither launch mechanism exists, record `user_action` and preserve the
-   reservation for reconciliation. After a real launch, run `attach --sprint <id>
-   --ticket <key> --run-ref <actual-agent-ref>`.
+   reservation for reconciliation. Launch and attach local work with
+   `launch-local --sprint <id> --ticket <key> --attach-capability <attach_capability> --output <repository-output> [--stdin-file <repository-input>] -- <worker-command>`
+   followed by `attach --sprint <id> --ticket <key> --launch-evidence <launch_evidence>`.
+   The controller records a controller-owned execution unit separately from `run_ref`.
+   Linux uses a cgroup-v2 systemd scope when available so descendant liveness is
+   checked. macOS supervision is cooperative and possible escape requires the
+   distinct host operator recovery authority; repository and same-UID secrets
+   are not authority. Fast exits retain an attachable terminal tombstone.
+   For Codex CLI, pass `--stdin-file <prompt-file>` to `launch-local` and use `-`
+   as the `codex exec` prompt so the file contents, not its pathname, reach stdin.
+   The complete input-bearing form is
+   `launch-local --sprint <id> --ticket <key> --attach-capability <attach_capability> --output <checkpoint-dir>/<run-ref>.jsonl --stdin-file <checkpoint-dir>/<run-ref>.prompt -- <codex-bin> exec --ephemeral --json --sandbox danger-full-access --model <configured-model> --cd <repository> -`.
+   A native task reference is display metadata, not liveness evidence; if no
+   supported adapter exposes its process identity, leave it reserved for
+   explicit operator recovery.
 
    For a lane explicitly marked `background: true` and `interactive: false`, do
    not start an interactive worker. Use the resolved API route and assemble each
@@ -93,12 +125,18 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    provider-native request plus a durable state marker under
    `.orchestration/.sprint-state/`. Anthropic emits a Message Batches JSON body
    for `POST /v1/messages/batches`; OpenAI emits Batch JSONL for upload and
-   `POST /v1/batches`. Reconcile results by `custom_id` and finish each ticket
-   normally. A prepared batch marker is not a completed ticket.
+   `POST /v1/batches`. Run `submit-batch --batch <local-id>` so the authenticated
+   adapter owns upload, submission, and the provider id. Reconcile only through
+   `reconcile-batch --batch <local-id> --outcome completed|failed`; its provider
+   adapter owns terminal lookup and every available result/error download,
+   freezes the normalized digest, and journals each `custom_id`. Successful
+   rows settle, provider-proven nonexecuted rows release, and ambiguous rows
+   stay reserved. A prepared or uncertain batch marker is not a completed
+   ticket and its reservations stay fenced.
 
 6. On every worker result, immediately run `finish --sprint <id> --ticket <key>
    --outcome completed|blocked|user_action --summary <text> --pr <pr> --branch
-   <branch>`. Completed means the per-ticket pipeline verified its merge;
+   <branch> --attempt-token <token>`. Completed means the per-ticket pipeline verified its merge;
    technical failures are blocked; missing authority, credentials, clarification,
    or external coordination are user action.
 
@@ -112,6 +150,16 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    `max_heavy_processes`. If the API ledger shows sustained throttling for one
    provider, pause new admissions to that provider while preserving reservations
    and letting healthy routes continue; `api_agent.py` owns bounded retries.
+   Treat `spend.state: operator_action` and model/reviewer run-count errors as
+   user actions, never reasons to relaunch. A human may extend a ticket pause
+   only through a root-issued, expiring, ticket-scoped capability carrying an
+   exact absolute ceiling. Pipe it into `grant-budget --operator-capability-stdin`;
+   never print, persist, or invent it. The grant
+   raises only that ticket's pause and hard ticket-cost ceiling. It never
+   relaxes per-run/sprint budgets, run-count breakers, gates, or concurrency.
+   A terminal checkpoint missing its attempt token or verified execution-unit
+   identity requires a separate root-issued, attempt-bound capability consumed
+   by `recover-terminal`; there is no same-user CLI bypass.
 
    In the default event-driven status mode, block on worker wait primitives or
    detached process ids instead of spending model turns polling unchanged

@@ -14,31 +14,43 @@ constrains checkpoint paths to the repository, and never executes ticket text.
 Atomic replacement and a file lock coordinate controller processes using the
 same checkpoint. The host must pass arguments without shell interpolation.
 
-The host adapter is responsible for completeness at the external boundaries:
-pagination, Jira link direction, current external dependency statuses, actual
-worker identity, PR state, and verified merge outcome. The controller rejects
-unknown dependencies and duplicate keys rather than inventing those facts.
+Plugin adapters own completeness at external boundaries. The Jira adapter
+performs authenticated requests restricted to canonical `jira_base_url` policy,
+rejects cross-origin redirects before credentials can follow, exhausts parent,
+child, and external-dependency pagination, and stores only sanitized,
+content-addressed responses. It constructs query policy from canonical
+project/sprint configuration; inventory templates carry no authority. All
+scheduler metadata, including sprint identity and dependencies, is derived from
+those authenticated responses. `jira_sprint_field` names the REST field that
+contains the provider's sprint id/name (often a Jira Cloud custom field). Provider batch
+adapters perform authenticated terminal lookup and complete result download.
+The controller rejects caller-authored receipts, unknown dependencies, and
+duplicate keys rather than inventing those facts.
 
 ## Impossible guarantees
 
-The controller cannot prove that a Jira query was complete, a host-reported run
-reference identifies the intended worker, or a worker actually merged its PR.
-It also cannot protect against a malicious local process or repository owner
-that edits checkpoints directly. File locks coordinate cooperating processes;
-they are not an authorization boundary. GitHub branch protection and the
-plugin's merge guard remain the enforcement boundary for merges.
+The controller cannot protect against a malicious same-UID process or
+repository owner that edits checkpoints directly, and does not pretend a
+locally available signing key creates authentication. It can require provider
+I/O to pass through its adapter boundary and bind raw responses by digest. File
+locks coordinate cooperating processes; they are not an authorization boundary.
+GitHub branch protection and the plugin's merge guard remain the enforcement
+boundary for merges.
 
-Crash recovery cannot safely decide whether an already-launched worker still
-exists. Therefore every launch is reserved first, and restart plans surface all
-running reservations as `needs_reconcile`. The host must inspect external state;
-it may requeue only after proving the old worker is gone. This deliberately
-prefers a paused lane over duplicate ticket execution.
+Every launch is reserved first, and restart plans surface all running
+reservations as `needs_reconcile`. `launch-local` starts the process itself and
+records controller-owned evidence bound to the exact repository, sprint,
+ticket, and attempt. `attach` consumes only that evidence; it never accepts a
+caller-supplied PID. Linux `/proc` start ticks or the macOS kernel process start
+time are fingerprinted so PID reuse cannot make a replacement authoritative.
+`run_ref` remains display metadata. Native task labels and tasks without a
+verified adapter require explicit operator recovery. Unknown inspection errors
+also remain fenced; only confirmed absence permits automatic requeue.
 
 ## Context and provider efficiency
 
-Before querying Jira, adapters resolve `ticket.jira_fields` through
-`scripts/context_pipeline.py jira-fields` and pass the emitted comma-separated
-value as Jira's `fields` request parameter. Jira responses pass through
+Before querying Jira, the adapter requests only fields consumed by scheduling
+and passes that fixed allowlist as Jira's `fields` request parameter. Jira responses pass through
 `sanitize-jira`, which allowlists those issue fields and removes rendered/edit
 metadata, changelogs, schemas, and avatar links before ticket data reaches an
 LLM.
@@ -52,9 +64,10 @@ payloads, plus Azure Direct Model Chat Completions payloads, share the same stab
 role brief, repository rules, then the baseline repository map. Ticket data and
 the raw active-branch diff remain in the uncached user message. Anthropic gate
 and on-demand payloads place a provider-native explicit cache breakpoint at the
-selected stable boundary. OpenAI payloads provide a stable `prompt_cache_key`
-and rely on implicit prompt caching, avoiding explicit-only request fields that
-are not accepted by every compatible OpenAI route. Optional `--effort` maps to OpenAI reasoning effort
+selected stable boundary. OpenAI payloads keep the same stable prefix order but
+omit all optional cache-control request fields because supported fields differ
+across live OpenAI-compatible routes. A compatible route may still apply its
+own automatic caching without request metadata. Optional `--effort` maps to OpenAI reasoning effort
 or Anthropic adaptive-thinking effort. Azure Direct Model routes omit the
 provider-specific effort field for cross-model compatibility; fixed
 `budget_tokens` is intentionally not assumed because support differs across
@@ -72,9 +85,29 @@ Non-interactive background lanes can be prepared with `prepare-batch`. The
 controller accepts only current `plan.launch` tickets explicitly marked as
 background and non-interactive, reserves them under the sprint lock, and writes
 an Anthropic Message Batches JSON request or OpenAI Batch JSONL plus a durable
-marker beneath the configured checkpoint directory. The host submits and
-monitors the batch; results are reconciled by `custom_id` before normal
-per-ticket `finish` calls.
+marker beneath the configured checkpoint directory. `submit-batch` invokes the
+credential-owning adapter, which uploads or submits the immutable request and
+records a content-addressed acceptance receipt. `reconcile-batch` invokes that
+same adapter for terminal state and every native result/error page, freezes a
+content-addressed normalized bundle, and applies each `custom_id` idempotently
+before normal per-ticket `finish` calls. An ambiguous submission, nonterminal
+status, or missing terminal row leaves only the unresolved reservations fenced;
+successful rows are settled and provider-proven nonexecuted rows are released.
+
+Batch credentials are bound to the providers' built-in API origins. A custom
+gateway must be approved in the canonical
+`.orchestration/provider-origins.json` operator policy; caller environment base
+URLs are ignored by the batch adapter. The policy maps credential names, never
+credential values, to HTTPS URLs:
+
+```json
+{"schema_version":1,"credentials":{"OPENAI_API_KEY":"https://gateway.example/v1"}}
+```
+
+`inspect-batch` migrates a schema-v1 marker to a fail-closed
+`legacy_uncertain` marker. `recover-legacy-batch --reason ...` records operator
+disposition without releasing its usage reservations; provider uncertainty must
+still be resolved outside the legacy marker before those funds can be reused.
 
 ## Ready ordering
 
@@ -124,6 +157,59 @@ Terminal results are recorded immediately. A refreshed Jira inventory may add
 metadata and tickets, but never overwrites a terminal or running local result.
 Tickets removed from a refreshed query become user action instead of silently
 launching from stale state.
+
+Local workers run inside a controller-owned execution unit. On Linux the
+controller uses a transient user systemd scope backed by cgroup v2 when the host
+provides it, and recovery requires that whole cgroup to be unpopulated. The
+identity binds the boot id, invocation id, cgroup, and exact supervisor birth.
+On macOS `proc_pidinfo` supplies the exact birth identity, but the supervisor
+session is cooperative containment: an escaped descendant cannot be disproved,
+so automatic recovery is disabled. Launch intent precedes process creation and
+the supervisor retains a terminal tombstone, including for workers that exit
+before attach.
+
+Exceptional recovery is delegated to
+`/usr/local/libexec/orchestration-recovery-authority`, which must be owned by a
+root, be non-writable by group/other, and be exposed to the runtime user only
+through the narrow sudo policy installed by
+`scripts/install-operator-authority.sh`. It atomically consumes a
+scope-bound token. If that helper is absent or unsafe, override is disabled;
+there is deliberately no repository, home-directory, or same-UID secret.
+
+## Operator continuations
+
+Repository settings can tighten the built-in `$20` ticket pause but cannot
+relax it. When a reviewed ticket should receive a bounded continuation, root
+issues an expiring capability for an **absolute** total ceiling and pipes it
+directly into the controller so it does not appear in shell history:
+
+```text
+sudo /usr/local/libexec/orchestration-recovery-authority issue-budget \
+  --repository /absolute/repo --ticket PROJ-123 --ceiling-usd 35.08 \
+| python3 /absolute/plugin/scripts/sprint-controller.py grant-budget \
+  --sprint 65 --ticket PROJ-123 --operator-capability-stdin
+```
+
+The active grant changes only the ticket pause and ticket dollar ceiling. It
+does not relax per-run or sprint budgets, run-count/reviewer-count breakers,
+concurrency, review gates, or merge policy. `revoke-budget` removes it early;
+otherwise it expires automatically.
+
+A terminal checkpoint that lost its attempt token or execution-unit identity
+also requires a separate one-shot, attempt-bound capability:
+
+```text
+sudo /usr/local/libexec/orchestration-recovery-authority issue-recovery \
+  --repository /absolute/repo --ticket PROJ-123 --attempt 2 \
+| python3 /absolute/plugin/scripts/sprint-controller.py recover-terminal \
+  --sprint 65 --ticket PROJ-123 --reason 'verified stopped; preserved worktree' \
+  --operator-capability-stdin
+```
+
+Only `blocked` and `user_action` entries can use terminal recovery. The command
+records the reason, consumes the capability exactly once, clears stale launch
+identity, and returns the ticket to `pending`; the next normal `plan`/`reserve`
+creates a fresh fenced attempt.
 
 `concurrency_max` is a ticket-lane limit. The host separately admits local
 builds, full test suites, and browser runs under `max_heavy_processes`; model

@@ -16,6 +16,23 @@ require_text agents/orchestration-design-reviewer.md "Trust boundary" "design ga
 require_text agents/orchestration-design-reviewer.md "Impossible guarantees" "design gate names impossible guarantees"
 require_text agents/orchestration-design-reviewer.md "Rejected alternatives" "design gate rejects fragile alternatives"
 require_text agents/orchestration-design-reviewer.md "Finish every section and the full" "design review batches findings"
+require_text agents/orchestration-design-reviewer.md "Profile and architecture feasibility" \
+  "design gate checks whether the invariant fits the authorized boundary"
+require_text templates/config.yaml "worker_trust_profile: cooperative-worker" \
+  "portable worker trust profile is explicit"
+
+for file in agents/orchestration-design-reviewer.md agents/orchestration-implementer.md agents/orchestration-code-reviewer.md agents/orchestration-security-reviewer.md; do
+  require_text "$file" 'cooperative-worker' "roles understand the cooperative worker profile"
+  require_text "$file" 'isolated-worker' "roles understand the isolated worker profile"
+done
+require_text agents/orchestration-implementer.md "Prove implementation readiness before editing" \
+  "implementer checks feasibility and falsifying tests before code"
+require_text agents/orchestration-implementer.md "bounded implementer preflight" \
+  "implementer performs one pre-review closure pass"
+require_text agents/orchestration-code-reviewer.md "Every blocker must also carry closure evidence" \
+  "code blockers require reproducible evidence"
+require_text agents/orchestration-security-reviewer.md "Blocking evidence threshold" \
+  "security blockers require profile-relevant evidence"
 
 for file in skills/orchestrate-ticket/SKILL.md commands/orchestrate.md skills/scope-ticket/SKILL.md; do
   require_text "$file" "adversarial test matrix" "pre-implementation matrix is required"
@@ -23,8 +40,16 @@ done
 
 for file in agents/orchestration-code-reviewer.md agents/orchestration-security-reviewer.md agents/orchestration-visual-qa.md; do
   require_text "$file" "full" "reviewer completes the full sweep"
-  require_text "$file" "[component:" "review findings identify a stable component"
 done
+
+for file in agents/orchestration-code-reviewer.md agents/orchestration-security-reviewer.md; do
+  require_text "$file" '"component":"src/auth/session.ts:refreshToken"' \
+    "structured component values are bare path-plus-symbol keys"
+  require_text "$file" 'Do not include a `[component: ...]`' \
+    "structured component values exclude the prose wrapper"
+done
+require_text agents/orchestration-visual-qa.md "[component:" \
+  "visual findings identify a stable component"
 
 for file in agents/orchestration-code-reviewer.md agents/orchestration-security-reviewer.md; do
   require_text "$file" "raw unified git diff" "reviewers default to the raw unified diff"
@@ -59,10 +84,10 @@ require_text agents/orchestration-code-reviewer.md "Round 2+ -- scope freeze" \
   "later rounds freeze what may block"
 require_text agents/orchestration-code-reviewer.md "Severity: BLOCKING vs ADVISORY" \
   "reviewer splits blocking from advisory findings"
-require_text agents/orchestration-code-reviewer.md "[component: <path>:<symbol>]" \
-  "component keys are path plus symbol, not free text"
 require_text agents/orchestration-code-reviewer.md "Round 3 or later" \
   "reviewer doubt rule is round-aware"
+require_text scripts/review-ledger.py "investigate-on-doubt" \
+  "first review investigates uncertainty instead of spending a repair cycle on it"
 require_text agents/orchestration-code-reviewer.md "ADVISORY -- report it, do not block" \
   "dead weight is advisory, not a merge blocker"
 require_text agents/orchestration-security-reviewer.md "exempt from the review loop's scope freeze" \

@@ -1,0 +1,21 @@
+[
+  {
+    "id": "batch_req_01",
+    "custom_id": "job-a",
+    "response": {
+      "status_code": 200,
+      "request_id": "req_01",
+      "body": {
+        "id": "resp_01",
+        "object": "response",
+        "usage": {
+          "input_tokens": 13,
+          "input_tokens_details": {"cached_tokens": 4},
+          "output_tokens": 9,
+          "output_tokens_details": {"reasoning_tokens": 2}
+        }
+      }
+    },
+    "error": null
+  }
+]

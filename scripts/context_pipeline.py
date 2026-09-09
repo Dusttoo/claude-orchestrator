@@ -9,7 +9,6 @@ selection, and sanitization before untrusted ticket data reaches an LLM.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 import sys
@@ -42,6 +41,7 @@ DROP_JIRA_KEYS = {
     "self",
 }
 ROUTE_FIELDS = {"execution", "provider", "fallback", "model", "effort", "allowed_tools"}
+WORKER_TRUST_PROFILES = {"cooperative-worker", "isolated-worker"}
 LLM_POLICY_BLOCKS = {"budgets", "pricing"}
 EXECUTIONS = {"desktop", "api"}
 PROVIDERS = {"anthropic", "openai", "azure_adm", "bedrock", "bedrock_mantle"}
@@ -93,7 +93,15 @@ def review_output_schema(gate: str) -> dict[str, Any]:
                     "type": "object", "additionalProperties": False,
                     "required": ["component", "disposition", "severity", "title", "explanation", "regression"],
                     "properties": {
-                        "component": {"type": "string", "minLength": 3, "maxLength": 240},
+                        "component": {
+                            "type": "string",
+                            "minLength": 3,
+                            "maxLength": 240,
+                            "description": (
+                                "Bare repo-relative <path>:<symbol> key; do not include "
+                                "a [component: ...] wrapper or a line number"
+                            ),
+                        },
                         "disposition": {"type": "string", "enum": ["blocking", "advisory"]},
                         "severity": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
                         "title": {"type": "string", "minLength": 1, "maxLength": 120},
@@ -148,13 +156,19 @@ def validate_review_output(value: Any, expected_gate: str) -> dict[str, Any]:
     if not isinstance(findings, list) or len(findings) > 20:
         raise ContextError("review findings must be an array of at most 20 items")
     blocking = 0
+    normalized_findings: list[dict[str, Any]] = []
     required = {"component", "disposition", "severity", "title", "explanation", "regression"}
-    for finding in findings:
-        if not isinstance(finding, dict) or set(finding) != required:
+    for raw_finding in findings:
+        if not isinstance(raw_finding, dict) or set(raw_finding) != required:
             raise ContextError("each finding must contain only the six documented fields")
+        finding = dict(raw_finding)
         component = finding["component"]
         if not isinstance(component, str) or len(component) > 240:
             raise ContextError("finding component must be a string of at most 240 characters")
+        legacy_wrapper = re.fullmatch(r"\[\s*component\s*:\s*(.*?)\s*\]", component, re.IGNORECASE)
+        if legacy_wrapper:
+            component = legacy_wrapper.group(1)
+            finding["component"] = component
         if not re.fullmatch(r"[^\s:][^\s]*:[^\s:][^\s]*", component):
             raise ContextError(f"finding component must be <path>:<symbol>: {component!r}")
         if re.search(r":\d+(?::\d+)?$", component):
@@ -170,13 +184,16 @@ def validate_review_output(value: Any, expected_gate: str) -> dict[str, Any]:
         if not isinstance(finding["regression"], bool):
             raise ContextError("finding regression must be a boolean")
         blocking += finding["disposition"] == "blocking"
+        normalized_findings.append(finding)
     if value["verdict"] == "PASS" and blocking:
         raise ContextError("PASS review cannot contain blocking findings")
     if value["verdict"] == "FAIL" and not blocking:
         raise ContextError("FAIL review requires at least one blocking finding")
     if failing_check and not blocking:
         raise ContextError("failed or unrun checks require a blocking finding with the explanation")
-    return value
+    result = dict(value)
+    result["findings"] = normalized_findings
+    return result
 
 
 def _unquote(value: str) -> str:
@@ -358,6 +375,21 @@ def llm_route_from_config(path: Path, requested_role: str) -> dict[str, Any]:
     return _validate_route(resolved, role)
 
 
+def worker_trust_profile_from_config(path: Path | None) -> str:
+    """Resolve the host-worker threat model without requiring a YAML runtime."""
+    if path is None or not path.is_file():
+        return "cooperative-worker"
+    value = _flat_config_scalar(
+        path.read_text(encoding="utf-8").splitlines(), "worker_trust_profile"
+    )
+    profile = value or "cooperative-worker"
+    if profile not in WORKER_TRUST_PROFILES:
+        raise ContextError(
+            "worker_trust_profile must be cooperative-worker or isolated-worker"
+        )
+    return profile
+
+
 def jira_fields_from_config(path: Path) -> list[str]:
     """Read ticket.jira_fields without requiring a YAML runtime dependency."""
     if not path.is_file():
@@ -476,8 +508,20 @@ def _joined_files(paths: list[str], heading: str) -> str:
 
 def ordered_context(args: argparse.Namespace) -> tuple[list[str], str]:
     """Return the stable prefix sections and dynamic suffix in canonical order."""
+    profile = worker_trust_profile_from_config(
+        Path(args.config) if args.config else None
+    )
+    profile_contract = (
+        "# Orchestration worker trust profile\n"
+        f"Selected profile: {profile}. This profile applies only to orchestration "
+        "workers versus their host/controller. It never weakens the threat model "
+        "for application users, tenants, remote clients, ticket text, or external "
+        "provider responses. Judge findings against this selected profile."
+    )
     stable = [
-        _joined_files(args.role_file, "Global role briefs"),
+        _joined_files(args.role_file, "Global role briefs")
+        + "\n\n"
+        + profile_contract,
         _joined_files(args.rules_file, "Repository rules and conventions"),
     ]
     repo_map = _read_text(args.repo_map)
@@ -532,12 +576,9 @@ def anthropic_payload(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def openai_payload(args: argparse.Namespace) -> dict[str, Any]:
-    """Return an OpenAI Responses API body with an implicitly cached stable prefix."""
+    """Return a route-compatible OpenAI Responses API body."""
     stable, dynamic = ordered_context(args)
     blocks = [{"type": "input_text", "text": text} for text in stable]
-    boundary = args.cache_boundary
-    if boundary == "auto":
-        boundary = "repo-map"
     result: dict[str, Any] = {
         "model": args.model,
         "max_output_tokens": args.max_tokens,
@@ -546,9 +587,6 @@ def openai_payload(args: argparse.Namespace) -> dict[str, Any]:
             {"role": "user", "content": [{"type": "input_text", "text": dynamic}]},
         ],
     }
-    index = 1 if boundary == "rules" else 2
-    cache_source = "\n".join(stable[: index + 1]).encode("utf-8")
-    result["prompt_cache_key"] = "orchestration-" + hashlib.sha256(cache_source).hexdigest()[:24]
     if args.effort:
         result["reasoning"] = {"effort": args.effort}
     if args.mode in REVIEW_MODES:

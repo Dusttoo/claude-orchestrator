@@ -28,6 +28,22 @@ echo "== orchestration preflight =="
 [ -f .orchestration/config.yaml ] || fail "missing .orchestration/config.yaml (copy templates/config.yaml)"
 ok "in repo root with orchestration config"
 
+# Reconcile every pre-0.11 runtime copy across every registered worktree before
+# reporting readiness. Any differing dormant copy is an enforcement conflict,
+# not a warning that a captain may ignore.
+python3 - "$HERE" <<'PY' || fail "legacy runtime state conflicts across git worktrees"
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from runtime_state import migrate_legacy_runtime_dir
+for relative in (
+    ".orchestration/.llm-usage", ".orchestration/.llm-runs",
+    ".orchestration/.review-ledger", ".orchestration/.sprint-state",
+):
+    migrate_legacy_runtime_dir(Path.cwd(), relative)
+PY
+ok "runtime state reconciled across all git worktrees"
+
 # Universal tooling
 command -v git >/dev/null || fail "git not found"
 command -v gh  >/dev/null || fail "gh CLI not found"

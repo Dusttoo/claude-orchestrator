@@ -48,13 +48,25 @@ contains_contract "sprint restart reconciliation" 'needs_reconcile' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "atomic sprint reservation" 'reserve' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "controller-owned local launch" 'launch-local --sprint <id> --ticket <key>' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "launch evidence attach" 'attach --sprint <id> --ticket <key> --launch-evidence <launch_evidence>' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "Codex worker prompt uses controller stdin" '--stdin-file <checkpoint-dir>/<run-ref>\.prompt' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "Codex stdin sentinel" '--cd <repository> -' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "adapter-owned Jira fetch" 'sync --inventory-template' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "adapter-owned provider batch submission" 'submit-batch --batch' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "per-ticket workflow dispatch" 'orchestrate' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "three-way sprint summary" 'user-action' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "optional sprint ticket priority ordering" 'priority' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
-contains_contract "pruned Jira field requests" 'jira_fields' \
+contains_contract "pruned Jira field requests" 'key,summary,status,priority,subtasks,parent,issuelinks' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "sanitized Jira context" 'sanitize-jira' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
@@ -65,6 +77,12 @@ contains_contract "per-role sprint execution routing" 'context_pipeline\.py rout
 contains_contract "budgeted API sprint runner" 'api_agent\.py run' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "event-driven quiet captain" 'sprint_status_heartbeat_minutes' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "root-authorized bounded ticket continuation" 'grant-budget' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "root-authorized terminal recovery" 'recover-terminal' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "operator capability stdin hygiene" 'operator-capability-stdin' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 
 contains_contract "durable review ledger" 'review-ledger\.py' \

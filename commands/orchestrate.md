@@ -29,7 +29,9 @@ native agent launch. An `api` route builds the request with
 `context_pipeline.py payload --config ... --role <role>` and pipes it to
 `${CLAUDE_PLUGIN_ROOT}/scripts/api_agent.py run --request - --config
 .orchestration/config.yaml --role <role>`, including the ticket/sprint/run id
-when available. The runner owns provider submission, limited tools, durable
+when available. Before an API reviewer run, issue a single-use exact-head permit
+with `review-ledger.py permit-review` and pass it to `run --review-pr
+<pr-or-design-id> --review-authorization <token>`. The runner owns provider submission, limited tools, durable
 usage, and budget enforcement. Desktop fallback is legal only when the runner
 proves the API request failed before any provider/run id existed; submitted or
 uncertain work stays reserved for reconciliation and is never duplicated.
@@ -66,16 +68,25 @@ Steps:
    `.orchestration/runs/<run-id>/ticket-branch.json` mirror only detects a
    disagreement; it is not the source of run identity.
 
+   Resolve `worker_trust_profile` now. It applies only to orchestration workers
+   versus the host and never narrows application security. Keep that profile
+   fixed through design, implementation, and review.
+
 2. **Pre-implementation gates.** Before cutting a branch or editing production
    code, create an adversarial test matrix. Every row names the attack/failure
    mode, setup/input, invariant, test layer, and falsifying assertion. Cover all
    relevant parser/interpreter syntax (including shell wrappers, substitutions,
    heredocs, redirections, and pipelines), ignored/untracked files, failed Git
    or other inspection, partial execution, cleanup recovery, permissions,
-   concurrency, retries, and hostile input. N/A requires a reason. For planned
-   security-sensitive infrastructure, launch a fresh
+   concurrency, retries, and hostile input. N/A requires a reason. First perform
+   an architecture-feasibility check: if an invariant requires a root-owned
+   installation, distinct UID, daemon, container, cloud resource, or rollout
+   outside the authorized scope, split or defer it instead of approving a local
+   approximation. For planned security-sensitive infrastructure or an external
+   boundary crossing, launch a fresh
    `orchestration-design-reviewer`. Open `review-ledger.py design-open
-   <ticket-or-change>`, record every verdict with `design-record`, and stop with
+   <ticket-or-change>`, record FAIL with explicit evidence, and record PASS only
+   through `design-record --result <json>` bound to the exact source SHA. Stop with
    `design-handoff` if `max_design_rounds` is spent. It must define the trust boundary and
    impossible guarantees, reject fragile designs, audit the matrix, and return
    `VERDICT: PASS` before implementation.
@@ -97,13 +108,18 @@ Steps:
    full-codebase index; only a named verification or regression may expand scope.
    - Reviewers finish the entire checklist and adversarial sweep and batch all
      findings, even after the first blocker.
+   - A blocker names a concrete failing input/precondition, production path,
+     wrong outcome/impact, and reproduction or exact falsifying assertion under
+     the configured profile. Stronger-profile hypotheticals are advisory.
    - The durable failure ledger owns the loop. Open it once
      (`${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py open <pr>`), paste
      `review-ledger.py brief <pr>` into every reviewer brief, save the JSON under
      `.orchestration/.review-results/`, and record every completed gate with
      `review-ledger.py record <pr> --gate <gate> --result
-     .orchestration/.review-results/<gate>.json`. It normalizes each finding's
-     `[component: <path>:<symbol>]` key, counts strikes across all gates and
+     .orchestration/.review-results/<gate>.json --head <exact-sha>
+     --phase-permit <token>`. Native reviewers first atomically complete that
+     permit with `review-ledger.py complete-review`. It normalizes each finding's
+     bare `<path>:<symbol>` component key, counts strikes across all gates and
      rounds, freezes blocking scope after round 1, and returns `next_action`.
    - `review` first generates one `repair-brief` after all gates record. Give its
      deduplicated stable IDs to a fresh implementer, require root cause/change/

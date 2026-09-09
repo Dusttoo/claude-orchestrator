@@ -1,0 +1,25 @@
+[
+  {
+    "custom_id": "job-a",
+    "result": {
+      "type": "succeeded",
+      "message": {
+        "id": "msg_01",
+        "type": "message",
+        "usage": {
+          "input_tokens": 11,
+          "cache_creation_input_tokens": 3,
+          "cache_read_input_tokens": 5,
+          "output_tokens": 7
+        }
+      }
+    }
+  },
+  {
+    "custom_id": "job-b",
+    "result": {
+      "type": "errored",
+      "error": {"type": "invalid_request", "message": "bad request"}
+    }
+  }
+]
