@@ -294,6 +294,21 @@ ticket:
 # blocked_side identifies the Jira API side occupied by the blocked ticket; the
 # issue on the opposite side is its prerequisite. Adjust for your Jira scheme.
 sprint_id: active
+# Canonical credential trust anchor. This must be repository policy, never a
+# caller-selected environment value.
+jira_base_url: ""
+# Jira Cloud commonly exposes sprint identity through a custom field such as
+# customfield_10020. Configure its exact REST field id here; the adapter derives
+# the checkpoint sprint id/name from this provider field, never from a template.
+jira_sprint_field: sprint
+# Canonical provider priority names, most urgent first. Jira numeric priority
+# ids are opaque record identifiers and are never used as ranks.
+jira_priority_order:
+  - Highest
+  - High
+  - Medium
+  - Low
+  - Lowest
 sprint_dependency_links:
   - type: Blocks
     blocked_side: inward       # inward | outward; Jira default "is blocked by"

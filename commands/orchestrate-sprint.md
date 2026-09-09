@@ -19,9 +19,10 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
 
 1. Read `.orchestration/config.yaml`; validate it with
    `${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-engine.py validate-config`.
-   Require `ticket.kind: jira`, `ticket.project`, `sprint_id` (overridden by
-   `$ARGUMENTS` when supplied), and `concurrency_max >= 1`. Missing Jira access is
-   a user action and no worker may launch.
+   Require `ticket.kind: jira`, `ticket.project`, `sprint_id`, a canonical
+   `jira_base_url`, and `concurrency_max >= 1`. These values are repository
+   policy and cannot be overridden by caller arguments or environment. Missing
+   Jira access is a user action and no worker may launch.
 
    Resolve `worker_trust_profile` once for the sprint. It applies only to the
    orchestration worker-versus-host boundary and never weakens application or
@@ -39,32 +40,26 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    desktop fallback may reuse the provisional reservation only when no
    provider/run id was created. Uncertain API work remains reserved.
 
-2. Resolve `ticket.jira_fields` with
-   `${CLAUDE_PLUGIN_ROOT}/scripts/context_pipeline.py jira-fields`; when absent it
-   defaults to `key,summary,description,status,priority,components,subtasks,issuelinks`.
-   Pass its `fields` value explicitly on every Jira issue/search request. Query
-   Jira for the entire configured project/sprint, paginating to completion, then
-   run every issue response through `context_pipeline.py sanitize-jira` before
-   any ticket data enters model context. Never inject rendered fields, edit-meta,
-   changelogs, render schemas, or avatar links.
-   Resolve `active` to an exact sprint id. Fetch configured dependency links and
-   the statuses of dependencies outside the sprint. With
-   `sprint_dependency_links`, a link is a dependency only when the current
-   ticket occupies the configured `blocked_side`; the opposite issue is its
-   prerequisite. Fetch each ticket's priority when the project ranks its work.
-   Never guess link direction, missing status, or an absent priority.
-   Independently query issues whose parent is in the fetched sprint set. Expand
-   every result into its own inventory ticket and preserve the exact child query
-   and returned keys; this query is mandatory even when it returns zero rows.
+2. The controller-owned adapter constructs one entire-sprint JQL query and one
+   independent child JQL query from canonical `ticket.project` and `sprint_id`.
+   It requests only `key,summary,status,priority,subtasks,parent,issuelinks` plus
+   the configured sprint field and rejects returned issues outside that policy.
+   The controller-owned adapter passes the compact fields plus scheduler-required
+   relation and configured `jira_sprint_field` fields, exhausts pagination, and
+   applies `context_pipeline.py sanitize-jira`. It derives exact sprint identity,
+   ticket metadata, relations, and external dependency statuses from
+   authenticated Jira responses. Do not query or normalize Jira in the captain.
 
-3. Write the fetched data beneath `sprint_checkpoint_dir` (default
-   `.orchestration/.sprint-state`) as JSON:
+3. Write an empty JSON inventory template beneath `sprint_checkpoint_dir`
+   (default `.orchestration/.sprint-state`). The adapter ignores caller-authored
+   queries and constructs them from canonical repository policy:
 
    ```json
-   {"project":"PROJ","sprint":{"id":"123","name":"Sprint 12"},"source_query":"exact Jira query","subtask_source_query":"exact child query","subtask_keys":[],"tickets":[{"key":"PROJ-2","summary":"Summary","status":"Ready","priority":2,"url":"https://jira/browse/PROJ-2","dependencies":["PROJ-1"],"subtasks":[]}],"dependency_status":{"OTHER-9":"Done"}}
+   {}
    ```
 
-   `priority` is optional per ticket: an integer where lower is more urgent, as
+   Caller-authored scheduler values have no authority. Derived `priority` is
+   optional per ticket: an integer where lower is more urgent, as
    Jira itself ranks (Highest = 1). The controller orders ready tickets by
    `(priority, key)`, placing unranked tickets after every ranked one; omit it
    and scheduling is unchanged. Priority decides which actionable ticket takes

@@ -39,15 +39,16 @@ The controller atomically writes under `sprint_checkpoint_dir` (default
 - `sprint_status_update_mode` (default `event`)
 - `sprint_status_heartbeat_minutes` (default `30`; `0` disables heartbeats)
 
-The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
-`sprint_dependency_links` semantically from the same repository config.
+The host reads `ticket.kind`, `ticket.project`, `sprint_id`, `jira_base_url`,
+`jira_priority_order`, and `sprint_dependency_links` semantically from the same
+repository config. Caller environment and CLI values cannot replace that policy.
 
 ## Workflow
 
 1. **Validate configuration.** Read `.orchestration/config.yaml` and run the
    plugin's `orchestration-engine.py validate-config`. Require `ticket.kind:
    jira`, a nonempty `ticket.project`, a `sprint_id` (an exact Jira id/name or
-   `active`), and `concurrency_max >= 1`. If Jira access is unavailable, stop
+   `active`), a canonical `jira_base_url`, and `concurrency_max >= 1`. If Jira access is unavailable, stop
    before launches and report the missing connection as user action.
 
    Resolve `worker_trust_profile` once and keep it fixed for the sprint. It
@@ -64,55 +65,30 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    reuse the provisional reservation only when
    no provider/run id was created; uncertain API work remains reserved.
 
-2. **Query the complete sprint.** Resolve `ticket.jira_fields` with
-   `scripts/context_pipeline.py jira-fields`; when absent it defaults to
-   `key,summary,description,status,priority,components,subtasks,issuelinks`.
-   Pass its `fields` value explicitly on every Jira issue/search request and run
-   responses through `context_pipeline.py sanitize-jira` before model injection,
-   dropping rendered fields, edit-meta, changelogs, render schemas, and avatar
-   links. Use the connected Jira capability or the
-   repository's configured ticket adapter. Query the configured project and
-   sprint, paginate until every issue is fetched, and retrieve the configured
-   dependency link types. A link is a dependency only when the current ticket
-   occupies its configured `blocked_side`; the issue on the opposite side is the
-   prerequisite. Fetch each ticket's priority when the project ranks its work.
-   Resolve `active` to one exact Jira sprint id. Fetch the current status of
-   every dependency outside the sprint. Do not infer a missing page, link
-   direction, or dependency status.
-   Independently query every issue whose parent is in the fetched sprint set.
-   Expand those results into inventory tickets and preserve the exact child
-   query and returned keys. This independent query is mandatory even when it
-   returns zero children; a parent's empty `subtasks` field is not proof of
-   completeness.
+2. **Derive the complete sprint queries.** The controller-owned adapter builds
+   the project/sprint JQL and independent child query from canonical repository
+   policy. It requests only `key,summary,status,priority,subtasks,parent,issuelinks`
+   plus the configured sprint field. Do not request or persist unused
+   description/components data. The controller-owned adapter passes the compact fields plus
+   scheduler-required relation and configured `jira_sprint_field` fields, runs
+   `context_pipeline.py sanitize-jira`, exhausts pagination, derives exact
+   sprint identity, priority, and links, and fetches external dependency status.
+   Do not query or normalize Jira in the captain.
 
-3. **Create an inventory.** Write a temporary JSON file inside the configured
-   checkpoint directory with this exact shape:
+3. **Create an empty adapter input.** Write a temporary JSON file inside the
+   configured checkpoint directory. Query policy comes only from repository
+   configuration:
 
    ```json
-   {
-     "project": "PROJ",
-     "sprint": {"id": "123", "name": "Sprint 12"},
-     "source_query": "the exact Jira query used",
-     "subtask_source_query": "the exact independent parent/child query used",
-     "subtask_keys": ["PROJ-3"],
-     "tickets": [
-       {
-         "key": "PROJ-2",
-         "summary": "Ticket summary",
-         "status": "Ready",
-         "priority": 2,
-         "url": "https://jira.example/browse/PROJ-2",
-         "dependencies": ["PROJ-1"],
-         "subtasks": ["PROJ-3"]
-       }
-     ],
-     "dependency_status": {"OTHER-9": "Done"}
-   }
+   {}
    ```
 
-   `dependencies` means prerequisites of that ticket, never tickets it blocks.
-   `priority` is optional per ticket: map the Jira priority to an integer where
-   lower is more urgent (Jira's own ranking already does this, Highest = 1).
+   Caller-authored project, sprint, ticket, status, priority, relation, and
+   dependency values have no authority. Derived `dependencies` means
+   prerequisites of that ticket, never tickets it blocks.
+   `priority` is optional per ticket: map its name through canonical
+   `jira_priority_order` where the first configured name is rank 1. Never treat
+   the provider's opaque numeric priority record id as a rank.
    The controller fills lanes in `(priority, key)` order, so ties break on key
    and unranked tickets follow every ranked one. Omit it and scheduling is
    unchanged. Priority ranks only which actionable ticket launches next; it

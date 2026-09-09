@@ -15,8 +15,14 @@ Atomic replacement and a file lock coordinate controller processes using the
 same checkpoint. The host must pass arguments without shell interpolation.
 
 Plugin adapters own completeness at external boundaries. The Jira adapter
-performs authenticated requests restricted to its configured HTTPS origin,
-exhausts pagination, and stores content-addressed raw responses. Provider batch
+performs authenticated requests restricted to canonical `jira_base_url` policy,
+rejects cross-origin redirects before credentials can follow, exhausts parent,
+child, and external-dependency pagination, and stores only sanitized,
+content-addressed responses. It constructs query policy from canonical
+project/sprint configuration; inventory templates carry no authority. All
+scheduler metadata, including sprint identity and dependencies, is derived from
+those authenticated responses. `jira_sprint_field` names the REST field that
+contains the provider's sprint id/name (often a Jira Cloud custom field). Provider batch
 adapters perform authenticated terminal lookup and complete result download.
 The controller rejects caller-authored receipts, unknown dependencies, and
 duplicate keys rather than inventing those facts.
@@ -43,9 +49,8 @@ also remain fenced; only confirmed absence permits automatic requeue.
 
 ## Context and provider efficiency
 
-Before querying Jira, adapters resolve `ticket.jira_fields` through
-`scripts/context_pipeline.py jira-fields` and pass the emitted comma-separated
-value as Jira's `fields` request parameter. Jira responses pass through
+Before querying Jira, the adapter requests only fields consumed by scheduling
+and passes that fixed allowlist as Jira's `fields` request parameter. Jira responses pass through
 `sanitize-jira`, which allowlists those issue fields and removes rendered/edit
 metadata, changelogs, schemas, and avatar links before ticket data reaches an
 LLM.

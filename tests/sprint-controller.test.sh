@@ -2,11 +2,10 @@
 # sprint-controller.test.sh -- scheduling is bounded, resumable, and continues
 # independent work past blocked tickets.
 set -uo pipefail
-export ORCHESTRATION_TEST_MODE=1
-
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/.."
-CONTROLLER="$ROOT/scripts/sprint-controller.py"
+CONTROLLER="$ROOT/tests/sprint_controller_test_driver.py"
+CONTROLLER_MODULE="$ROOT/scripts/sprint-controller.py"
 TMP="$(mktemp -d)"
 WORKER_PIDS=""
 trap 'for pid in $WORKER_PIDS; do kill "$pid" 2>/dev/null || true; done; rm -rf "$TMP"' EXIT
@@ -37,12 +36,36 @@ import json,sys
 value=json.load(open(sys.argv[1])); parents=sorted(x["key"].upper() for x in value["tickets"])
 children=sorted(x.upper() for x in value["subtask_keys"])
 by_key={x["key"].upper():x for x in value["tickets"]}
-parent_issues=[{"key":key,"fields":{"subtasks":[{"key":x} for x in by_key[key].get("subtasks",[])]}} for key in parents]
-child_issues=[{"key":key,"fields":{"parent":{"key":by_key.get(key,{}).get("parent","")}}} for key in children]
-json.dump({"parents":[{"startAt":0,"total":len(parents),"isLast":True,"issues":parent_issues}],"children":[{"startAt":0,"total":len(children),"isLast":True,"issues":child_issues}]},open(sys.argv[2],"w"))
+sprint=value["sprint"]
+def fields(item):
+  links=[{"type":{"name":"Blocks"},"outwardIssue":{"key":dep}} for dep in item.get("dependencies",[])]
+  priority=item.get("priority")
+  priority_names={1:"Highest",2:"High",3:"Medium",4:"Low",5:"Lowest"}
+  return {"summary":item.get("summary",""),"status":{"name":item.get("status","")},
+    "priority":({"id":"opaque-"+str(priority),"name":priority_names[int(priority)]} if priority is not None else None),"sprint":sprint,
+    "subtasks":[{"key":x} for x in item.get("subtasks",[])],"issuelinks":links,
+    **({"parent":{"key":item["parent"]}} if item.get("parent") else {})}
+parent_issues=[{"key":key,"fields":fields(by_key[key])} for key in parents]
+child_issues=[{"key":key,"fields":fields(by_key[key])} for key in children]
+external=sorted({dep for item in value["tickets"] for dep in item.get("dependencies",[]) if dep not in by_key})
+transport={"parents":[{"startAt":0,"total":len(parents),"isLast":True,"issues":parent_issues}],
+  "children":[{"startAt":0,"total":len(children),"isLast":True,"issues":child_issues}]}
+if external:
+  statuses=value.get("dependency_status",{})
+  transport["external"]=[{"startAt":0,"total":len(external),"isLast":True,
+    "issues":[{"key":key,"fields":{"status":{"name":statuses.get(key,"")}}} for key in external]}]
+json.dump(transport,open(sys.argv[2],"w"))
 PY
-  python3 "$ROOT/scripts/jira_inventory_fetch.py" --inventory-template "$inventory" \
-    --test-transport "$transport" --artifact "$artifact" --output "$inventory"
+  python3 - "$inventory" "$TMP/repo/.orchestration/config.yaml" <<'PY'
+import json,re,sys
+inventory=json.load(open(sys.argv[1])); path=sys.argv[2]; text=open(path).read()
+text=re.sub(r'(?m)^(  project:)\s*.*$', rf'\1 "{inventory["project"]}"', text)
+text=re.sub(r'(?m)^sprint_id:\s*.*$', f'sprint_id: {inventory["sprint"]["id"]}', text)
+open(path,"w").write(text)
+PY
+  python3 "$ROOT/tests/jira_fixture_driver.py" "$transport" \
+    "$TMP/repo/.orchestration/config.yaml" --inventory-template "$inventory" \
+    --artifact "$artifact" --output "$inventory"
 }
 
 mkdir -p "$TMP/repo/.git" "$TMP/repo/.orchestration"
@@ -61,6 +84,9 @@ export ORCHESTRATION_TEST_RECOVERY_CAP="$TMP/operator-recovery.cap"
 cp "$ROOT/templates/config.yaml" "$TMP/repo/.orchestration/config.yaml"
 sed -i.bak 's/^concurrency_max:.*/concurrency_max: 2/' "$TMP/repo/.orchestration/config.yaml"
 rm "$TMP/repo/.orchestration/config.yaml.bak"
+
+run_fail "public controller CLI cannot enable test evidence" \
+  "$ROOT/scripts/sprint-controller.py" --test-only-evidence sync --inventory missing.json
 
 cat > "$TMP/repo/inventory.json" <<'JSON'
 {
@@ -86,7 +112,17 @@ jira_receipt "$TMP/repo/inventory.json"
 
 cd "$TMP/repo" || exit 1
 run_ok "sync creates normalized durable checkpoint" "$CONTROLLER" sync --inventory inventory.json
-if env -u ORCHESTRATION_TEST_MODE "$CONTROLLER" sync --inventory inventory.json >/dev/null 2>&1; then
+CHECKPOINT="$(find "$TMP/repo/.orchestration/.sprint-state" -name '42-*.json' -print -quit)"
+BEFORE_FAILED_FETCH="$(shasum -a 256 "$CHECKPOINT" | awk '{print $1}')"
+run_fail "production sync fails closed without Jira credentials" env -u JIRA_API_TOKEN -u JIRA_BASE_URL \
+  "$CONTROLLER" sync --inventory-template inventory.json
+AFTER_FAILED_FETCH="$(shasum -a 256 "$CHECKPOINT" | awk '{print $1}')"
+if [ "$BEFORE_FAILED_FETCH" = "$AFTER_FAILED_FETCH" ]; then
+  ok "failed provider inspection preserves the prior checkpoint"
+else
+  fail_case "failed provider inspection preserves the prior checkpoint"
+fi
+if "$ROOT/scripts/sprint-controller.py" sync --inventory inventory.json >/dev/null 2>&1; then
   fail_case "test transport cannot authorize production Jira sync"
 else
   ok "test transport cannot authorize production Jira sync"
@@ -171,7 +207,7 @@ run_fail "live attached worker blocks requeue despite dead provisional identity"
 kill "$PID2" 2>/dev/null || true
 wait "$PID2" 2>/dev/null || true
 run_ok "confirmed process absence permits automatic requeue" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker exited' --attempt-token "$TOKEN2"
-python3 - "$CONTROLLER" "$TMP/repo" <<'PY' && ok "unknown unit inspection, descendant liveness, and identity reuse fail closed" || fail_case "unknown unit inspection, descendant liveness, and identity reuse fail closed"
+python3 - "$CONTROLLER_MODULE" "$TMP/repo" <<'PY' && ok "unknown unit inspection, descendant liveness, and identity reuse fail closed" || fail_case "unknown unit inspection, descendant liveness, and identity reuse fail closed"
 import importlib.util,sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]).parent))
@@ -195,7 +231,7 @@ try: module.require_worker_stopped(ticket, "", cfg)
 except module.SprintError: pass
 else: raise AssertionError("legacy leader-PID identity was treated as descendant proof")
 PY
-python3 - "$CONTROLLER" <<'PY' && ok "macOS process identity uses exact proc_pidinfo birth time" || fail_case "macOS process identity uses exact proc_pidinfo birth time"
+python3 - "$CONTROLLER_MODULE" <<'PY' && ok "macOS process identity uses exact proc_pidinfo birth time" || fail_case "macOS process identity uses exact proc_pidinfo birth time"
 import importlib.util,sys
 from unittest import mock
 from pathlib import Path

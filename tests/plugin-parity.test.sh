@@ -66,7 +66,7 @@ contains_contract "three-way sprint summary" 'user-action' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "optional sprint ticket priority ordering" 'priority' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
-contains_contract "pruned Jira field requests" 'jira_fields' \
+contains_contract "pruned Jira field requests" 'key,summary,status,priority,subtasks,parent,issuelinks' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "sanitized Jira context" 'sanitize-jira' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
