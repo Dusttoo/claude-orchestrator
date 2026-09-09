@@ -29,9 +29,9 @@ native agent launch. An `api` route builds the request with
 `context_pipeline.py payload --config ... --role <role>` and pipes it to
 `${CLAUDE_PLUGIN_ROOT}/scripts/api_agent.py run --request - --config
 .orchestration/config.yaml --role <role>`, including the ticket/sprint/run id
-when available. Before an API reviewer run, issue a single-use exact-head token
-with `api_agent.py authorize-review` and pass it to `run
---review-authorization <token>`. The runner owns provider submission, limited tools, durable
+when available. Before an API reviewer run, issue a single-use exact-head permit
+with `review-ledger.py permit-review` and pass it to `run --review-pr
+<pr-or-design-id> --review-authorization <token>`. The runner owns provider submission, limited tools, durable
 usage, and budget enforcement. Desktop fallback is legal only when the runner
 proves the API request failed before any provider/run id existed; submitted or
 uncertain work stays reserved for reconciliation and is never duplicated.

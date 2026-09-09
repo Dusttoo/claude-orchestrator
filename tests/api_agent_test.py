@@ -85,6 +85,11 @@ class ApiAgentTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "-c", "user.name=Test", "-c",
+             "user.email=test@example.com", "commit", "--allow-empty", "-qm", "initial"],
+            check=True,
+        )
         (self.root / ".orchestration").mkdir()
 
     def tearDown(self):
@@ -127,7 +132,31 @@ self_check:
         )
         return path
 
+    def phase_permit(self, ticket="PROJ-1", role="code-reviewer", pr="1"):
+        ledger_path = self.root / ".orchestration/.review-ledger" / f"pr-{pr}.json"
+        if not ledger_path.exists():
+            subprocess.run(
+                [sys.executable, str(ROOT / "scripts/review-ledger.py"), "open", pr],
+                cwd=self.root, check=True, capture_output=True, text=True,
+            )
+        head = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        permit = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/review-ledger.py"), "permit-review", pr,
+             "--ticket", ticket, "--role", role, "--head", head],
+            cwd=self.root, check=True, capture_output=True, text=True,
+        )
+        return json.loads(permit.stdout)["review_phase_permit"]
+
     def agent(self, transport, provider="anthropic", role="code-reviewer", run_id="test-run"):
+        review = {}
+        if role in {"design-reviewer", "code-reviewer", "security-reviewer"}:
+            review = {
+                "review_authorization": self.phase_permit(role=role),
+                "review_pr": "1",
+            }
         return api_agent.ApiAgent(
             root=self.root,
             config_path=self.config(provider=provider),
@@ -136,6 +165,7 @@ self_check:
             sprint="SPRINT-1",
             run_id=run_id,
             transport=transport,
+            **review,
         )
 
     def test_repository_env_loads_provider_credentials_without_overriding_container(self):
@@ -428,6 +458,8 @@ self_check:
             sprint="SPRINT-1",
             run_id="lane-run",
             transport=self._completed_transport(),
+            review_authorization=self.phase_permit(),
+            review_pr="1",
         )
         lane.run(dict(body))
 
@@ -440,11 +472,32 @@ self_check:
         # Tool sandboxing still resolves to the lane's own checkout.
         self.assertEqual(lane.tool_executor.root, worktree.resolve())
 
-    def test_usage_root_override_redirects_the_ledger(self):
+    def test_usage_root_override_cannot_redirect_the_ledger(self):
         override = Path(self.temp.name) / "elsewhere"
         override.mkdir()
         with mock.patch.dict(os.environ, {"ORCHESTRATION_USAGE_ROOT": str(override)}):
-            self.assertEqual(api_agent.shared_repository_root(self.root), override.resolve())
+            self.assertEqual(api_agent.shared_repository_root(self.root), self.root.resolve())
+
+    def test_conflicting_worktree_runtime_state_fails_closed(self):
+        git = self._commit_initial()
+        worktree = self.root / ".claude" / "worktrees" / "conflict"
+        subprocess.run(
+            git + ["worktree", "add", "-q", str(worktree), "-b", "conflict-lane"],
+            check=True, capture_output=True,
+        )
+        self.config()
+        shared = self.root / ".orchestration/.llm-usage/usage.jsonl"
+        legacy = worktree / ".orchestration/.llm-usage/usage.jsonl"
+        shared.parent.mkdir(parents=True, exist_ok=True)
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        shared.write_text('{"kind":"usage","cost_usd":"1"}\n', encoding="utf-8")
+        legacy.write_text('{"kind":"usage","cost_usd":"2"}\n', encoding="utf-8")
+        with self.assertRaisesRegex(api_agent.AgentError, "conflicting legacy runtime state"):
+            api_agent.ApiAgent(
+                root=worktree, config_path=self.root / ".orchestration/config.yaml",
+                role="implementer", ticket="PROJ-1", sprint="S-1",
+                run_id="conflict", transport=FakeTransport([]),
+            )
 
     def test_shared_root_falls_back_outside_a_repository(self):
         plain = Path(self.temp.name) / "plain"
@@ -638,6 +691,8 @@ self_check:
             sprint=None,
             run_id="openai-run",
             transport=transport,
+            review_authorization=self.phase_permit(ticket="PROJ-5"),
+            review_pr="1",
         )
         result = agent.run(
             {
@@ -972,6 +1027,8 @@ self_check:
             sprint=None,
             run_id="bedrock-openai-run",
             transport=transport,
+            review_authorization=self.phase_permit(ticket="PROJ-5"),
+            review_pr="1",
         )
         result = agent.run(
             {
@@ -1029,34 +1086,73 @@ self_check:
                 ticket="PROJ-1", sprint="S-1", provider="anthropic", model="m", role="implementer",
             )
 
-    def test_ticket_pause_requires_durable_human_approval(self):
+    def test_ticket_pause_is_durable_and_has_no_self_approval_bypass(self):
         ledger = api_agent.UsageLedger(self.root)
         limits = dict(api_agent.DEFAULT_BUDGETS)
         limits["warn_usd_per_ticket"] = api_agent.Decimal("0.05")
         limits["pause_usd_per_ticket"] = api_agent.Decimal("0.10")
-        with self.assertRaisesRegex(api_agent.BudgetError, "approve-ticket-budget"):
+        with self.assertRaisesRegex(api_agent.BudgetError, "operator policy change"):
             ledger.reserve(
                 projected=api_agent.Decimal("0.11"), limits=limits, run_id="costly",
                 ticket="PROJ-9", sprint="S-1", provider="openai", model="m", role="implementer",
             )
-        ledger.approve_ticket_budget(
-            "PROJ-9", api_agent.Decimal("0.20"), "Dusty", "continue this verified repair"
-        )
-        reservation = ledger.reserve(
-            projected=api_agent.Decimal("0.11"), limits=limits, run_id="costly",
-            ticket="PROJ-9", sprint="S-1", provider="openai", model="m", role="implementer",
-        )
-        self.assertTrue(reservation.startswith("resv_"))
+        events = ledger._events()
+        self.assertTrue(any(event.get("kind") == "ticket_budget_pause" for event in events))
+        self.assertFalse(hasattr(ledger, "approve_ticket_budget"))
 
-    def test_review_authorization_is_single_use_and_bound_to_head(self):
-        ledger = api_agent.UsageLedger(self.root)
-        head = "a" * 40
-        token = ledger.issue_review_authorization("PROJ-1", "code-reviewer", head, "controller")
-        with self.assertRaisesRegex(api_agent.AgentError, "does not match"):
-            ledger.consume_review_authorization(token, "PROJ-1", "security-reviewer", head)
-        ledger.consume_review_authorization(token, "PROJ-1", "code-reviewer", head)
-        with self.assertRaisesRegex(api_agent.AgentError, "already consumed"):
-            ledger.consume_review_authorization(token, "PROJ-1", "code-reviewer", head)
+    def test_incident_breakers_are_active_and_config_can_only_tighten(self):
+        legacy = api_agent.budgets_from_config({"llm": {"budgets": {}}})
+        self.assertEqual(legacy["max_model_runs_per_ticket"], 12)
+        self.assertEqual(legacy["max_reviewer_runs_per_ticket"], 6)
+        self.assertEqual(legacy["pause_usd_per_ticket"], api_agent.Decimal("20"))
+        raised = api_agent.budgets_from_config({"llm": {"budgets": {
+            "max_usd_per_run": 999, "max_usd_per_ticket": 999,
+            "max_usd_per_sprint": 9999, "pause_usd_per_ticket": 998,
+            "warn_usd_per_ticket": 10, "max_model_runs_per_ticket": 999,
+            "max_reviewer_runs_per_ticket": 999,
+        }}})
+        self.assertEqual(raised["max_usd_per_ticket"], api_agent.Decimal("30"))
+        self.assertEqual(raised["pause_usd_per_ticket"], api_agent.Decimal("20"))
+        self.assertEqual(raised["max_model_runs_per_ticket"], 12)
+        self.assertEqual(raised["max_reviewer_runs_per_ticket"], 6)
+
+    def test_free_form_accounting_scopes_fail_closed(self):
+        with self.assertRaisesRegex(api_agent.AgentError, "canonical Jira key"):
+            api_agent.normalize_ticket_scope("PROJ-1/../2")
+        with self.assertRaisesRegex(api_agent.AgentError, "sprint must be a canonical id"):
+            api_agent.normalize_sprint_scope("Sprint 1")
+
+    def test_alternate_config_path_is_rejected(self):
+        self.config()
+        alternate = self.root / "alternate.yaml"
+        alternate.write_text("llm: {}\n", encoding="utf-8")
+        with self.assertRaisesRegex(api_agent.AgentError, "alternate orchestration config"):
+            api_agent.ApiAgent(
+                root=self.root, config_path=alternate, role="implementer",
+                ticket="PROJ-1", sprint="S-1", run_id="alternate",
+                transport=FakeTransport([]),
+            )
+
+    def test_review_phase_permit_is_single_use_and_bound_to_head(self):
+        token = self.phase_permit()
+        head = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"], check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        with self.assertRaisesRegex(api_agent.ReviewPermitError, "does not match"):
+            api_agent.consume_review_permit(
+                shared_root=self.root, ledger_dir=".orchestration/.review-ledger", pr="1",
+                token=token, ticket="PROJ-1", role="security-reviewer", head=head, timestamp="now",
+            )
+        api_agent.consume_review_permit(
+            shared_root=self.root, ledger_dir=".orchestration/.review-ledger", pr="1",
+            token=token, ticket="PROJ-1", role="code-reviewer", head=head, timestamp="now",
+        )
+        with self.assertRaisesRegex(api_agent.ReviewPermitError, "already consumed"):
+            api_agent.consume_review_permit(
+                shared_root=self.root, ledger_dir=".orchestration/.review-ledger", pr="1",
+                token=token, ticket="PROJ-1", role="code-reviewer", head=head, timestamp="later",
+            )
 
     def test_explicit_rate_limit_retries_with_same_reservation(self):
         transport = FakeTransport(

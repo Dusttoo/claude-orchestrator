@@ -73,9 +73,11 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    Resolve `active` to one exact Jira sprint id. Fetch the current status of
    every dependency outside the sprint. Do not infer a missing page, link
    direction, or dependency status.
-   Expand every referenced Jira subtask into its own inventory ticket. The
-   controller rejects a parent whose `subtasks` keys are not all present; never
-   silently collapse child work into the parent summary.
+   Independently query every issue whose parent is in the fetched sprint set.
+   Expand those results into inventory tickets and preserve the exact child
+   query and returned keys. This independent query is mandatory even when it
+   returns zero children; a parent's empty `subtasks` field is not proof of
+   completeness.
 
 3. **Create an inventory.** Write a temporary JSON file inside the configured
    checkpoint directory with this exact shape:
@@ -85,6 +87,8 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
      "project": "PROJ",
      "sprint": {"id": "123", "name": "Sprint 12"},
      "source_query": "the exact Jira query used",
+     "subtask_source_query": "the exact independent parent/child query used",
+     "subtask_keys": ["PROJ-3"],
      "tickets": [
        {
          "key": "PROJ-2",
@@ -131,7 +135,8 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    it explicitly with the evidence in `--reason`; completed tickets cannot be
    requeued. A running ticket additionally requires proof that no worker remains.
    Requeue requires its current `--attempt-token` and `--worker-stopped`. After
-   `max_lane_relaunches`, reserve requires a durable `--human-approval` reason.
+   `max_lane_relaunches`, stop for operator policy action; there is no same-user
+   approval flag.
 
 5. **Reserve, then launch.** Launch only keys returned in `plan.launch`, which
    is already ordered by `(priority, key)`; never reorder or reprioritize it
@@ -223,10 +228,9 @@ Before launching, resolve the executable because non-interactive SSH shells may 
    continue. Bounded retries remain owned by `api_agent.py`.
 
    Treat controller `spend` as authoritative. Stop admission when a ticket is
-   `approval_required`; never relaunch to evade a model/reviewer run-count
-   breaker. Only the operator may extend a pause boundary with the durable
-   `api_agent.py approve-ticket-budget` command. Include warning state,
-   projected spend, run count, and approvals in meaningful status updates.
+   `operator_action`; never relaunch to evade a model/reviewer run-count breaker.
+   A pause is a hard stop until reviewed operator policy changes. Include warning
+   state, projected spend, and run count in meaningful status updates.
 
    **Quiet captain contract.** When `sprint_status_update_mode` is `event`, do
    not spend model turns polling, rereading full transcripts, or narrating

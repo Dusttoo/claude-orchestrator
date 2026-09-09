@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -28,7 +29,13 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import context_pipeline
-from runtime_state import shared_repository_root, working_repository_root
+from review_permit import consumed_permit
+from runtime_state import (
+    RuntimeStateError,
+    canonical_config_path,
+    migrate_legacy_runtime_dir,
+    working_repository_root,
+)
 
 
 SCHEMA_VERSION = 1
@@ -197,6 +204,7 @@ def load(path: Path) -> dict[str, Any]:
         ]
         value["repair_pending_review"] = False
     value.setdefault("repair_pending_review", False)
+    value.setdefault("review_permits", [])
     value.setdefault(
         "design",
         {"max_rounds": DEFAULT_MAX_DESIGN_ROUNDS, "rounds": [], "escalated": False},
@@ -207,12 +215,15 @@ def load(path: Path) -> dict[str, Any]:
 def ledger_path(args: argparse.Namespace) -> Path:
     root = project_root()
     if args.ledger_dir:
-        directory = Path(args.ledger_dir)
-    else:
-        cfg = Path(args.config) if args.config else root / ".orchestration/config.yaml"
-        directory = Path(config_scalar(cfg, "review_ledger_dir", DEFAULT_LEDGER_DIR))
-    if not directory.is_absolute():
-        directory = shared_repository_root(root) / directory
+        raise LedgerError("--ledger-dir overrides are not allowed; use the canonical repository config")
+    try:
+        cfg = canonical_config_path(root, args.config)
+        relative = Path(config_scalar(cfg, "review_ledger_dir", DEFAULT_LEDGER_DIR))
+        if relative.is_absolute():
+            raise LedgerError("review_ledger_dir must be repository-relative")
+        directory = migrate_legacy_runtime_dir(root, relative)
+    except RuntimeStateError as exc:
+        raise LedgerError(str(exc)) from exc
     pr = re.sub(r"[^A-Za-z0-9_.-]", "-", str(args.pr)).strip("-")
     if not pr:
         raise LedgerError(f"invalid pr identifier: {args.pr!r}")
@@ -260,6 +271,7 @@ def new_state(pr: str, max_rounds: int) -> dict[str, Any]:
         "max_rounds": max_rounds,
         "repair_attempts": [],
         "repair_pending_review": False,
+        "review_permits": [],
         "design": {
             "max_rounds": DEFAULT_MAX_DESIGN_ROUNDS,
             "rounds": [],
@@ -740,13 +752,16 @@ def cmd_design_record(args: argparse.Namespace) -> None:
             artifact = json.loads(Path(args.result).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise LedgerError(f"invalid design result: {exc}") from exc
-        required = {"schema_version", "gate", "verdict", "source_sha", "artifact", "checks"}
+        required = {
+            "schema_version", "gate", "verdict", "source_sha", "artifact",
+            "artifact_sha256", "checks", "phase_permit",
+        }
         if set(artifact) != required or artifact.get("schema_version") != 1:
             raise LedgerError("design result requires exactly schema_version=1, gate, verdict, source_sha, artifact, checks")
         if artifact.get("gate") != "design-review" or artifact.get("verdict") not in {"PASS", "FAIL"}:
             raise LedgerError("design result gate/verdict is invalid")
-        if not re.fullmatch(r"[0-9a-fA-F]{7,64}", str(artifact.get("source_sha") or "")):
-            raise LedgerError("design result source_sha must be a commit id")
+        if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", str(artifact.get("source_sha") or "")):
+            raise LedgerError("design result source_sha must be a full commit id")
         if not str(artifact.get("artifact") or "").strip() or not isinstance(artifact.get("checks"), list) or not artifact["checks"]:
             raise LedgerError("design result requires a named artifact and non-empty checks")
         if any(not isinstance(item, dict) or item.get("status") not in {"pass", "fail"} for item in artifact["checks"]):
@@ -760,10 +775,19 @@ def cmd_design_record(args: argparse.Namespace) -> None:
             ).stdout.strip().lower()
         except (OSError, subprocess.CalledProcessError) as exc:
             raise LedgerError("cannot verify design result against repository HEAD") from exc
-        if not actual_head.startswith(str(artifact["source_sha"]).lower()):
+        if actual_head != str(artifact["source_sha"]).lower():
             raise LedgerError(
                 f"design result source {artifact['source_sha']} does not match current HEAD {actual_head}"
             )
+        artifact_path = (project_root() / str(artifact["artifact"])).resolve()
+        root = project_root()
+        if artifact_path != root and root not in artifact_path.parents:
+            raise LedgerError("design artifact escapes the repository")
+        if not artifact_path.is_file():
+            raise LedgerError("design artifact must be an existing repository file")
+        digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        if artifact.get("artifact_sha256") != digest:
+            raise LedgerError("design artifact digest does not match the reviewed artifact")
         args.verdict = artifact["verdict"]
         args.evidence = artifact["artifact"]
     elif args.verdict == "PASS":
@@ -773,6 +797,11 @@ def cmd_design_record(args: argparse.Namespace) -> None:
     path = ledger_path(args)
     with locked(path):
         state = load(path)
+        if artifact and not consumed_permit(
+            state, str(artifact["phase_permit"]), role="design-reviewer",
+            head=str(artifact["source_sha"]),
+        ):
+            raise LedgerError("design result is not bound to a consumed design-review phase permit")
         design = _design_state(state)
         plan = _design_plan(state)
         if plan["next_action"] == ACTION_ESCALATE:
@@ -1026,6 +1055,41 @@ def cmd_escalate(args: argparse.Namespace) -> None:
         emit({"escalated": True, "reason": args.reason, **decide(state)})
 
 
+def cmd_permit_review(args: argparse.Namespace) -> None:
+    """Issue one phase capability when durable ledger state allows review."""
+    ticket = str(args.ticket).strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*-[0-9]+", ticket):
+        raise LedgerError("review permit ticket must be a canonical Jira key")
+    try:
+        actual_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=project_root(), check=True,
+            capture_output=True, text=True,
+        ).stdout.strip().lower()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise LedgerError("cannot bind review permit to repository HEAD") from exc
+    if args.head.lower() != actual_head:
+        raise LedgerError("review permit head must exactly match the full repository HEAD")
+    path = ledger_path(args)
+    with locked(path):
+        state = load(path)
+        if args.role == "design-reviewer":
+            if _design_plan(state)["next_action"] != "redesign":
+                raise LedgerError("design ledger phase does not permit another reviewer")
+        elif decide(state)["next_action"] != ACTION_REVIEW:
+            raise LedgerError("review ledger phase does not permit another reviewer")
+        token = "phase_" + os.urandom(24).hex()
+        state.setdefault("review_permits", []).append({
+            "token": token,
+            "ticket": ticket,
+            "role": args.role,
+            "head": actual_head,
+            "issued_at": now(),
+            "consumed_at": "",
+        })
+        save(path, state)
+    emit({"review_phase_permit": token, "ticket": ticket, "role": args.role, "head": actual_head})
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--config", help="repo orchestration config (default: .orchestration/config.yaml)")
@@ -1088,6 +1152,15 @@ def parser() -> argparse.ArgumentParser:
     design_record.add_argument("--verdict", choices=("PASS", "FAIL"))
     design_record.add_argument("--evidence")
     design_record.set_defaults(func=cmd_design_record)
+    permit = commands.add_parser("permit-review", help="issue a single-use permit for the ledger's current review phase")
+    permit.add_argument("pr")
+    permit.add_argument("--ticket", required=True)
+    permit.add_argument(
+        "--role", required=True,
+        choices=("design-reviewer", "code-reviewer", "security-reviewer"),
+    )
+    permit.add_argument("--head", required=True)
+    permit.set_defaults(func=cmd_permit_review)
 
     resolve_parser = commands.add_parser("resolve", help="manually close a component")
     resolve_parser.add_argument("pr")

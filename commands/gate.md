@@ -26,9 +26,9 @@ Before each `code-reviewer` or `security-reviewer` launch, resolve its route wit
 agents; API routes use `context_pipeline.py payload --config ... --role <role>`
 and pipe it to `${CLAUDE_PLUGIN_ROOT}/scripts/api_agent.py run --request -
 --config .orchestration/config.yaml --role <role> --ticket <ticket> --run-id
-<stable-run-id> --review-authorization <token>`. Issue it first with
-`api_agent.py authorize-review --ticket <ticket> --role <role> --head
-<exact-head> --authorized-by gate-controller`. Desktop fallback is permitted only before provider
+<stable-run-id> --review-pr <pr> --review-authorization <token>`. Issue it first
+from the valid ledger phase with `review-ledger.py permit-review <pr> --ticket
+<ticket> --role <role> --head <full-exact-head>`. Desktop fallback is permitted only before provider
 acknowledgement; a provider id, timeout after submission, or uncertain state
 must be reconciled and never duplicated.
 

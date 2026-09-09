@@ -145,10 +145,40 @@ eq "the independent design cap escalates" "escalate-human" "$(led design-record 
 
 led design-open BL-2 >/dev/null
 HEAD_SHA="$(git -C "$TMP" rev-parse HEAD)"
+printf 'reviewed boundary\n' > "$TMP/design-BL-2.md"
+ARTIFACT_SHA="$(shasum -a 256 "$TMP/design-BL-2.md" | awk '{print $1}')"
+PERMIT="$(led permit-review BL-2 --ticket BL-2 --role design-reviewer --head "$HEAD_SHA" | python3 -c 'import json,sys; print(json.load(sys.stdin)["review_phase_permit"])')"
+python3 - "$ROOT/scripts" "$TMP" "$PERMIT" "$HEAD_SHA" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from review_permit import consume
+consume(shared_root=Path(sys.argv[2]), ledger_dir='.orchestration/.review-ledger', pr='BL-2',
+        token=sys.argv[3], ticket='BL-2', role='design-reviewer', head=sys.argv[4], timestamp='now')
+PY
 cat > "$TMP/design-pass.json" <<JSON
-{"schema_version":1,"gate":"design-review","verdict":"PASS","source_sha":"$HEAD_SHA","artifact":"design/BL-2.md","checks":[{"name":"trust-boundary","status":"pass"}]}
+{"schema_version":1,"gate":"design-review","verdict":"PASS","source_sha":"$HEAD_SHA","artifact":"design-BL-2.md","artifact_sha256":"$ARTIFACT_SHA","phase_permit":"$PERMIT","checks":[{"name":"trust-boundary","status":"pass"}]}
 JSON
+python3 - "$TMP/design-pass.json" "$TMP/design-short.json" <<'PY'
+import json, sys
+value=json.load(open(sys.argv[1])); value['source_sha']=value['source_sha'][:12]
+json.dump(value, open(sys.argv[2], 'w'))
+PY
+if led design-record BL-2 --result "$TMP/design-short.json" >/dev/null 2>&1; then
+  bad "abbreviated design source SHA must fail closed"
+else ok "abbreviated design source SHA fails closed"; fi
+python3 - "$TMP/design-pass.json" "$TMP/design-bad-digest.json" <<'PY'
+import json, sys
+value=json.load(open(sys.argv[1])); value['artifact_sha256']='0'*64
+json.dump(value, open(sys.argv[2], 'w'))
+PY
+if led design-record BL-2 --result "$TMP/design-bad-digest.json" >/dev/null 2>&1; then
+  bad "mismatched design artifact digest must fail closed"
+else ok "mismatched design artifact digest fails closed"; fi
 eq "design PASS requires exact-head machine evidence" "implement" "$(led design-record BL-2 --result "$TMP/design-pass.json" | field next_action)"
+if led permit-review BL-2 --ticket BL-2 --role design-reviewer --head "$HEAD_SHA" >/dev/null 2>&1; then
+  bad "passed design phase must not mint another reviewer permit"
+else ok "passed design phase cannot mint another reviewer permit"; fi
 led design-handoff BL-1 | grep -q 'No production implementation is authorized' && ok "design handoff blocks implementation" || bad "design handoff blocks implementation"
 
 # --- aliasing merges a drifted key --------------------------------------------
@@ -162,6 +192,9 @@ cat > "$TMP/.orchestration/.review-ledger/pr-legacy.json" <<'JSON'
 {"schema_version":1,"pr":"legacy","created_at":"2026-01-01T00:00:00+00:00","updated_at":"2026-01-01T00:00:00+00:00","max_rounds":2,"rounds":[{"round":1,"gate":"code-review","scope_mode":"full-authority","claimed_verdict":"FAIL","effective_verdict":"FAIL","recorded_at":"2026-01-01T00:00:00+00:00","blocking":["src/a.ts:foo"],"advisory":[],"resolved":[]}],"components":{"src/a.ts:foo":{"key":"src/a.ts:foo","display":"src/a.ts:foo","strikes":1,"status":"open","first_round":1,"last_round":1,"rounds":[1],"gates":["code-review"],"redesigned_at_strike":0}},"escalated":false}
 JSON
 eq "v0.7 failed passes retain their spent repair budget" "1" "$(led status legacy | field fix_cycles)"
+if led --ledger-dir "$TMP/fresh-ledger" open escape >/dev/null 2>&1; then
+  bad "absolute review ledger override must fail closed"
+else ok "absolute review ledger override fails closed"; fi
 
 echo
 if [ "$fails" -eq 0 ]; then echo "review ledger tests passed"; else echo "$fails FAILED"; fi

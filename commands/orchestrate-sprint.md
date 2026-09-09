@@ -47,14 +47,15 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    ticket occupies the configured `blocked_side`; the opposite issue is its
    prerequisite. Fetch each ticket's priority when the project ranks its work.
    Never guess link direction, missing status, or an absent priority.
-   Expand every referenced subtask into its own inventory ticket. Sync rejects
-   any parent whose `subtasks` keys are absent from the inventory.
+   Independently query issues whose parent is in the fetched sprint set. Expand
+   every result into its own inventory ticket and preserve the exact child query
+   and returned keys; this query is mandatory even when it returns zero rows.
 
 3. Write the fetched data beneath `sprint_checkpoint_dir` (default
    `.orchestration/.sprint-state`) as JSON:
 
    ```json
-   {"project":"PROJ","sprint":{"id":"123","name":"Sprint 12"},"source_query":"exact Jira query","tickets":[{"key":"PROJ-2","summary":"Summary","status":"Ready","priority":2,"url":"https://jira/browse/PROJ-2","dependencies":["PROJ-1"]}],"dependency_status":{"OTHER-9":"Done"}}
+   {"project":"PROJ","sprint":{"id":"123","name":"Sprint 12"},"source_query":"exact Jira query","subtask_source_query":"exact child query","subtask_keys":[],"tickets":[{"key":"PROJ-2","summary":"Summary","status":"Ready","priority":2,"url":"https://jira/browse/PROJ-2","dependencies":["PROJ-1"],"subtasks":[]}],"dependency_status":{"OTHER-9":"Done"}}
    ```
 
    `priority` is optional per ticket: an integer where lower is more urgent, as
@@ -124,9 +125,9 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    `max_heavy_processes`. If the API ledger shows sustained throttling for one
    provider, pause new admissions to that provider while preserving reservations
    and letting healthy routes continue; `api_agent.py` owns bounded retries.
-   Treat `spend.state: approval_required` and model/reviewer run-count errors as
+   Treat `spend.state: operator_action` and model/reviewer run-count errors as
    user actions, never reasons to relaunch. A human may extend a ticket pause
-   boundary only through `api_agent.py approve-ticket-budget`.
+   boundary is a hard operator-action stop with no same-user CLI bypass.
 
    In the default event-driven status mode, block on worker wait primitives or
    detached process ids instead of spending model turns polling unchanged

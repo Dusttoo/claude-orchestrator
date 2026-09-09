@@ -23,7 +23,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from runtime_state import shared_repository_root, working_repository_root
+from runtime_state import (
+    RuntimeStateError,
+    canonical_config_path,
+    migrate_legacy_runtime_dir,
+    shared_repository_root,
+    working_repository_root,
+)
 
 
 SCHEMA_VERSION = 2
@@ -106,7 +112,10 @@ def config_list(path: Path, key: str, default: list[str]) -> list[str]:
 def settings(args: argparse.Namespace) -> dict[str, Any]:
     root = project_root()
     shared_root = shared_repository_root(root)
-    config = Path(args.config).resolve() if args.config else root / ".orchestration/config.yaml"
+    try:
+        config = canonical_config_path(root, args.config)
+    except RuntimeStateError as exc:
+        raise SprintError(str(exc)) from exc
     try:
         concurrency = int(config_scalar(config, "concurrency_max", "2"))
     except ValueError as exc:
@@ -114,10 +123,16 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
     if concurrency < 1:
         raise SprintError("concurrency_max must be at least 1")
     configured_dir = Path(config_scalar(config, "sprint_checkpoint_dir", ".orchestration/.sprint-state"))
-    requested_dir = Path(args.state_dir) if args.state_dir else configured_dir
+    if args.state_dir:
+        raise SprintError("--state-dir overrides are not allowed; use the canonical repository config")
+    requested_dir = configured_dir
     if requested_dir.is_absolute():
         raise SprintError("sprint checkpoint directory must be repository-relative")
-    state_dir = (shared_root / requested_dir).resolve()
+    try:
+        state_dir = migrate_legacy_runtime_dir(root, requested_dir)
+        migrate_legacy_runtime_dir(root, ".orchestration/.llm-usage")
+    except RuntimeStateError as exc:
+        raise SprintError(str(exc)) from exc
     if state_dir != shared_root and shared_root not in state_dir.parents:
         raise SprintError("sprint checkpoint directory escapes the repository")
     try:
@@ -127,8 +142,8 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
     if max_lane_relaunches < 0:
         raise SprintError("max_lane_relaunches must be at least 0")
     try:
-        warning_budget = float(config_scalar_any_depth(config, "warn_usd_per_ticket", "0"))
-        pause_budget = float(config_scalar_any_depth(config, "pause_usd_per_ticket", "0"))
+        warning_budget = min(float(config_scalar_any_depth(config, "warn_usd_per_ticket", "10")) or 10, 10)
+        pause_budget = min(float(config_scalar_any_depth(config, "pause_usd_per_ticket", "20")) or 20, 20)
     except ValueError as exc:
         raise SprintError("ticket warning and pause budgets must be numbers") from exc
     return {
@@ -222,7 +237,14 @@ def load(path: Path) -> dict[str, Any]:
     if value.get("schema_version") == 1:
         value["schema_version"] = SCHEMA_VERSION
         for ticket in value.get("tickets", {}).values():
-            ticket.setdefault("attempt_token", "")
+            if ticket.get("state") == "running":
+                ticket["state"] = "user_action"
+                ticket["reason"] = (
+                    "legacy running lane requires explicit recovery; verify the old worker is stopped, "
+                    "then run recover-legacy"
+                )
+                ticket.setdefault("history", []).append({"at": now(), "event": "legacy-running-fenced"})
+            ticket["attempt_token"] = ""
             ticket.setdefault("subtasks", [])
     if value.get("schema_version") != SCHEMA_VERSION:
         raise SprintError(f"unsupported sprint checkpoint schema in {path}")
@@ -290,6 +312,15 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
     source_query = str(raw.get("source_query", "")).strip()
     if not source_query:
         raise SprintError("inventory.source_query is required for auditability")
+    subtask_source_query = str(raw.get("subtask_source_query", "")).strip()
+    if not subtask_source_query:
+        raise SprintError(
+            "inventory.subtask_source_query is required; fetch sprint children independently"
+        )
+    raw_subtask_keys = raw.get("subtask_keys")
+    if not isinstance(raw_subtask_keys, list):
+        raise SprintError("inventory.subtask_keys must be the complete result of subtask_source_query")
+    discovered_subtasks = {normalize_key(key) for key in raw_subtask_keys}
     raw_tickets = raw.get("tickets")
     if not isinstance(raw_tickets, list):
         raise SprintError("inventory.tickets must be an array")
@@ -311,7 +342,11 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             if normalized not in dependencies:
                 dependencies.append(normalized)
         subtasks: list[str] = []
-        raw_subtasks = item.get("subtasks", [])
+        if "subtasks" not in item:
+            raise SprintError(
+                f"ticket {key} omits subtasks; Jira inventory must explicitly include an empty or complete array"
+            )
+        raw_subtasks = item["subtasks"]
         if not isinstance(raw_subtasks, list):
             raise SprintError(f"ticket {key} subtasks must be an array")
         for subtask in raw_subtasks:
@@ -345,6 +380,17 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             "Jira inventory is incomplete; fetch every referenced subtask explicitly: "
             + ", ".join(missing_subtasks)
         )
+    declared_subtasks = {subtask for ticket in tickets.values() for subtask in ticket["subtasks"]}
+    if declared_subtasks != discovered_subtasks:
+        missing_from_parents = sorted(discovered_subtasks - declared_subtasks)
+        missing_from_query = sorted(declared_subtasks - discovered_subtasks)
+        raise SprintError(
+            "Jira subtask inventory disagrees with the independent child query; "
+            f"unlinked query results={missing_from_parents}, absent query results={missing_from_query}"
+        )
+    absent_children = sorted(discovered_subtasks - set(tickets))
+    if absent_children:
+        raise SprintError("Jira child query results are absent from tickets: " + ", ".join(absent_children))
     external: dict[str, str] = {}
     raw_external = raw.get("dependency_status", {})
     if not isinstance(raw_external, dict):
@@ -356,6 +402,8 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
         "project": project,
         "sprint": {"id": sprint_id, "name": sprint_name},
         "source_query": source_query,
+        "subtask_source_query": subtask_source_query,
+        "subtask_keys": sorted(discovered_subtasks),
         "tickets": tickets,
         "dependency_status": external,
         "created_at": now(),
@@ -424,7 +472,7 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
     if not path.is_file():
         return result
     open_reservations: dict[str, dict[str, Any]] = {}
-    approvals: dict[str, float] = {}
+    pause_events: dict[str, float] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -441,8 +489,10 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                     item["run_ids"].add(str(event["run_id"]))
         elif kind in {"usage", "release"}:
             open_reservations.pop(str(event.get("reservation_id") or ""), None)
-        if kind == "ticket_budget_approval" and ticket:
-            approvals[ticket] = max(approvals.get(ticket, 0), float(event["approved_up_to_usd"]))
+        if kind == "ticket_budget_pause" and ticket:
+            pause_events[ticket] = max(
+                pause_events.get(ticket, 0), float(event.get("projected_total_usd", 0))
+            )
         if kind == "usage" and ticket:
             item = result.setdefault(ticket, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_ids": set()})
             item["spent_usd"] += float(event.get("cost_usd", 0))
@@ -457,11 +507,10 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
         item["run_count"] = len(item.pop("run_ids"))
         total = item["spent_usd"] + item["reserved_usd"]
         item["projected_total_usd"] = round(total, 6)
-        item["approved_up_to_usd"] = approvals.get(ticket, 0)
         pause = cfg["pause_usd_per_ticket"]
         warning = cfg["warn_usd_per_ticket"]
         item["state"] = (
-            "approval_required" if pause and total > pause and approvals.get(ticket, 0) < total
+            "operator_action" if ticket in pause_events or (pause and total > pause)
             else "warning" if warning and total > warning else "ok"
         )
     return result
@@ -498,6 +547,8 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             current["project"] = incoming["project"]
             current["sprint"] = incoming["sprint"]
             current["source_query"] = incoming["source_query"]
+            current["subtask_source_query"] = incoming["subtask_source_query"]
+            current["subtask_keys"] = incoming["subtask_keys"]
             current["dependency_status"] = incoming["dependency_status"]
             state = current
         else:
@@ -518,7 +569,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     ready = [
         ticket["key"] for ticket in ordered
         if ticket["state"] == "pending" and not blockers(state, ticket["key"], cfg)
-        and spend.get(ticket["key"], {}).get("state") != "approval_required"
+        and spend.get(ticket["key"], {}).get("state") != "operator_action"
     ]
     available = max(0, cfg["concurrency_max"] - len(running))
     waiting = [
@@ -688,10 +739,10 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         running = sum(1 for value in state["tickets"].values() if value["state"] == "running")
         if running >= cfg["concurrency_max"]:
             raise SprintError(f"concurrency_max={cfg['concurrency_max']} is already reached")
-        if ticket["attempts"] > cfg["max_lane_relaunches"] and not args.human_approval.strip():
+        if ticket["attempts"] > cfg["max_lane_relaunches"]:
             raise SprintError(
                 f"ticket {key} exceeded max_lane_relaunches={cfg['max_lane_relaunches']}; "
-                "a durable --human-approval reason is required"
+                "operator policy change is required"
             )
         ticket["state"] = "running"
         ticket["reason"] = ""
@@ -699,8 +750,6 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["attempts"] += 1
         ticket["attempt_token"] = "attempt_" + uuid.uuid4().hex
         event = {"at": now(), "event": "reserved", "run_ref": args.run_ref}
-        if args.human_approval.strip():
-            event["human_approval"] = args.human_approval.strip()
         ticket["history"].append(event)
         save(path, state)
     emit({
@@ -779,6 +828,29 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     emit({"ticket": key, "state": "pending"})
 
 
+def recover_legacy(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    """Requeue a fenced schema-v1 lane after external process verification."""
+    path = state_path(cfg["state_dir"], str(args.sprint))
+    key = normalize_key(args.ticket)
+    if not args.reason.strip():
+        raise SprintError("legacy recovery reason must not be empty")
+    with locked(path):
+        state = load(path)
+        ticket = state["tickets"].get(key)
+        if (
+            not ticket or ticket.get("state") != "user_action"
+            or not any(item.get("event") == "legacy-running-fenced" for item in ticket.get("history", []))
+        ):
+            raise SprintError(f"ticket {key} is not a fenced legacy running lane")
+        ticket["state"] = "pending"
+        ticket["reason"] = args.reason.strip()
+        ticket["run_ref"] = ""
+        ticket["attempt_token"] = ""
+        ticket["history"].append({"at": now(), "event": "legacy-recovered", "reason": args.reason.strip()})
+        save(path, state)
+    emit({"ticket": key, "state": "pending", "recovered": True})
+
+
 def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     spend = usage_snapshots(cfg)
     result: dict[str, Any] = {
@@ -798,7 +870,6 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
             "branch": ticket["branch"],
             "run_ref": ticket["run_ref"],
             "attempts": ticket.get("attempts", 0),
-            "attempt_token": ticket.get("attempt_token", "") if ticket["state"] == "running" else "",
             "spend": spend.get(key, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_count": 0, "state": "ok"}),
         }
         if ticket["state"] == "completed":
@@ -817,7 +888,7 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
             else:
                 item["reason"] = (
                     "ticket spend pause requires durable human approval"
-                    if item["spend"].get("state") == "approval_required"
+                    if item["spend"].get("state") == "operator_action"
                     else "ready but not launched"
                 )
                 result["user_action"].append(item)
@@ -857,7 +928,6 @@ def parser() -> argparse.ArgumentParser:
     reserve_parser.add_argument("--sprint", required=True)
     reserve_parser.add_argument("--ticket", required=True)
     reserve_parser.add_argument("--run-ref", required=True)
-    reserve_parser.add_argument("--human-approval", default="")
     reserve_parser.set_defaults(func=reserve)
     attach_parser = commands.add_parser("attach")
     attach_parser.add_argument("--sprint", required=True)
@@ -881,6 +951,11 @@ def parser() -> argparse.ArgumentParser:
     requeue_parser.add_argument("--attempt-token", required=True)
     requeue_parser.add_argument("--worker-stopped", action="store_true")
     requeue_parser.set_defaults(func=requeue)
+    recover_parser = commands.add_parser("recover-legacy")
+    recover_parser.add_argument("--sprint", required=True)
+    recover_parser.add_argument("--ticket", required=True)
+    recover_parser.add_argument("--reason", required=True)
+    recover_parser.set_defaults(func=recover_legacy)
     return result
 
 

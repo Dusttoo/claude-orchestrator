@@ -39,8 +39,9 @@ check "template exposes optional per-role LLM routes" \
   rg -q '^[[:space:]]+roles:' "$ROOT/templates/config.yaml"
 check "template gives API runs a hard USD ceiling" \
   rg -q '^[[:space:]]+max_usd_per_run:' "$ROOT/templates/config.yaml"
-check "template enables controller authorization for reviewers" \
-  grep -Eq '^require_review_authorization:[[:space:]]*true' "$ROOT/templates/config.yaml"
+check "reviewers use ledger-issued phase permits without config bypass" \
+  sh -c '! grep -q "require_review_authorization" "$1" && grep -q "permit-review" "$2"' _ \
+  "$ROOT/templates/config.yaml" "$ROOT/skills/gate-pr/SKILL.md"
 check "template sets ticket warning and pause thresholds" \
   rg -q '^[[:space:]]+pause_usd_per_ticket:' "$ROOT/templates/config.yaml"
 check "template bounds model and reviewer run counts" \
