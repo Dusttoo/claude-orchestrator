@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request
 
 
@@ -50,6 +51,46 @@ class JiraInventoryFetchTest(unittest.TestCase):
             jira.network_fetcher("https://trusted.example")
         handler = opener.call_args.args[0]
         self.assertEqual(handler.approved_origin, "https://trusted.example")
+
+    def test_network_fetcher_uses_cursor_pagination_without_start_at(self) -> None:
+        class Response:
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def geturl(self) -> str:
+                return self.url
+
+            def read(self) -> bytes:
+                return b'{"issues":[],"isLast":true}'
+
+        class Opener:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+
+            def open(self, request, timeout):
+                self.urls.append(request.full_url)
+                return Response(request.full_url)
+
+        opener = Opener()
+        with (
+            mock.patch.dict(jira.os.environ, {"JIRA_API_TOKEN": "secret"}),
+            mock.patch.object(jira, "build_opener", return_value=opener),
+        ):
+            fetch = jira.network_fetcher("https://jira.example")
+            fetch("parents", "project = PROJ", 0, 100, "", ["key"])
+            fetch("parents", "project = PROJ", 100, 100, "cursor-2", ["key"])
+        first = parse_qs(urlparse(opener.urls[0]).query)
+        second = parse_qs(urlparse(opener.urls[1]).query)
+        self.assertNotIn("startAt", first)
+        self.assertNotIn("nextPageToken", first)
+        self.assertEqual(second["nextPageToken"], ["cursor-2"])
+        self.assertNotIn("startAt", second)
 
     def test_cross_origin_redirect_is_rejected_before_authorization_can_follow(
         self,
@@ -198,6 +239,18 @@ class JiraInventoryFetchTest(unittest.TestCase):
             jira.sprint_value(issue, "sprint", "active"), ("42", "Current")
         )
 
+    def test_numeric_sprint_policy_matches_only_the_provider_id(self) -> None:
+        issue = {
+            "key": "PROJ-1",
+            "fields": {
+                "sprint": [
+                    {"id": "41", "name": "42", "state": "closed"},
+                    {"id": "42", "name": "Current", "state": "active"},
+                ]
+            },
+        }
+        self.assertEqual(jira.sprint_value(issue, "sprint", "42"), ("42", "Current"))
+
     def test_priority_uses_configured_names_not_opaque_ids(self) -> None:
         issue = {"fields": {"priority": {"id": "999", "name": "Highest"}}}
         self.assertEqual(jira.priority_rank(issue, ["Highest", "High"]), 1)
@@ -233,6 +286,44 @@ class JiraInventoryFetchTest(unittest.TestCase):
         ):
             jira.exhaustive(
                 lambda *_: next(responses), "q", "parents", Path(temporary), ["key"]
+            )
+
+    def test_page_and_item_bounds_are_falsified_at_the_boundary(self) -> None:
+        page_calls = 0
+
+        def page_fetch(*_args):
+            nonlocal page_calls
+            page_calls += 1
+            return {
+                "startAt": page_calls - 1,
+                "isLast": False,
+                "nextPageToken": f"cursor-{page_calls}",
+                "issues": [{"key": f"PROJ-{page_calls}"}],
+            }
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(jira, "MAX_PAGES", 2),
+            self.assertRaisesRegex(ValueError, "page or item bound"),
+        ):
+            jira.exhaustive(page_fetch, "q", "parents", Path(temporary), ["key"])
+        self.assertEqual(page_calls, 2)
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(jira, "MAX_ITEMS", 1),
+            self.assertRaisesRegex(ValueError, "item bound"),
+        ):
+            jira.exhaustive(
+                lambda *_: {
+                    "startAt": 0,
+                    "isLast": True,
+                    "issues": [{"key": "PROJ-1"}, {"key": "PROJ-2"}],
+                },
+                "q",
+                "parents",
+                Path(temporary),
+                ["key"],
             )
 
     def test_public_cli_has_no_fixture_or_base_url_authority_switch(self) -> None:

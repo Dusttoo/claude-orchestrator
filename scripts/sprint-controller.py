@@ -121,9 +121,7 @@ def config_list(path: Path, key: str, default: list[str]) -> list[str]:
     return values or default
 
 
-def settings(
-    args: argparse.Namespace, *, allow_test_evidence: bool = False
-) -> dict[str, Any]:
+def settings(args: argparse.Namespace) -> dict[str, Any]:
     root = project_root()
     shared_root = shared_repository_root(root)
     try:
@@ -204,7 +202,7 @@ def settings(
             x.casefold()
             for x in config_list(config, "sprint_blocked_statuses", DEFAULT_BLOCKED)
         },
-        "allow_test_evidence": allow_test_evidence,
+        "allow_test_evidence": False,
     }
 
 
@@ -2576,18 +2574,6 @@ def main() -> int:
     args = parser().parse_args()
     try:
         cfg = settings(args)
-        args.func(args, cfg)
-        return 0
-    except SprintError as exc:
-        print(f"sprint-controller: {exc}", file=sys.stderr)
-        return 2
-
-
-def main_for_test(argv: list[str] | None = None) -> int:
-    """In-process test seam for non-authoritative fixture evidence."""
-    args = parser().parse_args(argv)
-    try:
-        cfg = settings(args, allow_test_evidence=True)
         args.func(args, cfg)
         return 0
     except SprintError as exc:

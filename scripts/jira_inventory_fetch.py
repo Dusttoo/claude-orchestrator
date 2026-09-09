@@ -146,7 +146,8 @@ def network_fetcher(base_url: str) -> Fetch:
             "fields": ",".join(fields),
             "maxResults": max_results,
         }
-        query["nextPageToken" if cursor else "startAt"] = cursor or start_at
+        if cursor:
+            query["nextPageToken"] = cursor
         request = Request(
             endpoint + "?" + urlencode(query),
             headers={
@@ -296,15 +297,22 @@ def sprint_value(
         ]
     else:
         wanted = sprint_policy.strip().casefold()
-        matches = [
-            item
-            for item in memberships
-            if wanted
-            in {
-                str(item.get("id", "")).strip().casefold(),
-                str(item.get("name", "")).strip().casefold(),
-            }
-        ]
+        if re.fullmatch(r"[0-9]+", wanted):
+            matches = [
+                item
+                for item in memberships
+                if str(item.get("id", "")).strip().casefold() == wanted
+            ]
+        else:
+            matches = [
+                item
+                for item in memberships
+                if wanted
+                in {
+                    str(item.get("id", "")).strip().casefold(),
+                    str(item.get("name", "")).strip().casefold(),
+                }
+            ]
     if len(matches) != 1:
         raise ValueError(
             f"Jira issue {issue_key(issue)} does not prove exactly one configured current sprint"

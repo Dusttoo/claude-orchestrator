@@ -5,6 +5,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/.."
 CONTROLLER="$ROOT/tests/sprint_controller_test_driver.py"
+CONTROLLER_MODULE="$ROOT/scripts/sprint-controller.py"
 TMP="$(mktemp -d)"
 WORKER_PIDS=""
 trap 'for pid in $WORKER_PIDS; do kill "$pid" 2>/dev/null || true; done; rm -rf "$TMP"' EXIT
@@ -206,7 +207,7 @@ run_fail "live attached worker blocks requeue despite dead provisional identity"
 kill "$PID2" 2>/dev/null || true
 wait "$PID2" 2>/dev/null || true
 run_ok "confirmed process absence permits automatic requeue" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker exited' --attempt-token "$TOKEN2"
-python3 - "$CONTROLLER" "$TMP/repo" <<'PY' && ok "unknown unit inspection, descendant liveness, and identity reuse fail closed" || fail_case "unknown unit inspection, descendant liveness, and identity reuse fail closed"
+python3 - "$CONTROLLER_MODULE" "$TMP/repo" <<'PY' && ok "unknown unit inspection, descendant liveness, and identity reuse fail closed" || fail_case "unknown unit inspection, descendant liveness, and identity reuse fail closed"
 import importlib.util,sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]).parent))
@@ -230,7 +231,7 @@ try: module.require_worker_stopped(ticket, "", cfg)
 except module.SprintError: pass
 else: raise AssertionError("legacy leader-PID identity was treated as descendant proof")
 PY
-python3 - "$CONTROLLER" <<'PY' && ok "macOS process identity uses exact proc_pidinfo birth time" || fail_case "macOS process identity uses exact proc_pidinfo birth time"
+python3 - "$CONTROLLER_MODULE" <<'PY' && ok "macOS process identity uses exact proc_pidinfo birth time" || fail_case "macOS process identity uses exact proc_pidinfo birth time"
 import importlib.util,sys
 from unittest import mock
 from pathlib import Path

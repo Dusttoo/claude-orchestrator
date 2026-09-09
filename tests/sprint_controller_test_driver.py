@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -16,4 +17,13 @@ assert SPEC and SPEC.loader
 controller = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(controller)
 
-raise SystemExit(controller.main_for_test(sys.argv[1:]))
+os.environ["ORCHESTRATION_TEST_MODE"] = "1"
+args = controller.parser().parse_args(sys.argv[1:])
+try:
+    config = controller.settings(args)
+    config["allow_test_evidence"] = True
+    args.func(args, config)
+except controller.SprintError as exc:
+    print(f"sprint-controller test driver: {exc}", file=sys.stderr)
+    raise SystemExit(2) from exc
+raise SystemExit(0)
