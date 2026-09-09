@@ -74,6 +74,12 @@ cat > "$TMP/operator-authority-helper" <<'SH'
 set -eu
 command="$1"; shift
 [ "$1" = --scope ] && [ -n "$2" ]
+python3 - "$2" <<'PY'
+import json,re,sys
+scope=json.loads(sys.argv[1])
+assert isinstance(scope,dict)
+assert re.fullmatch(r'[A-Z][A-Z0-9_]*-[0-9]+',str(scope.get('ticket') or ''))
+PY
 case "$command" in
   budget-ceiling)
     [ -f "${ORCHESTRATION_TEST_BUDGET_ACTIVE:?}" ] || exit 3
@@ -417,6 +423,17 @@ fi
 "$CONTROLLER" plan --sprint 47 > "$TMP/terminal-plan.json"
 json_check "authorized terminal lane is launchable below its granted ceiling" "$TMP/terminal-plan.json" '"PROJ-61" in data["launch"] and data["spend"]["PROJ-61"]["state"] != "operator_action"'
 run_fail "terminal recovery capability is one-shot" "$CONTROLLER" recover-terminal --sprint 47 --ticket PROJ-61 --reason replay --operator-capability terminal-recovery-once
+
+python3 - "$TMP/repo/.orchestration/.llm-usage/usage.jsonl" <<'PY'
+import json,sys
+from pathlib import Path
+p=Path(sys.argv[1])
+with p.open('a') as out:
+  out.write(json.dumps({'kind':'usage','reservation_id':'legacy-pr','run_id':'legacy-pr','ticket':'1802','cost_usd':'0.01'})+'\n')
+  out.write(json.dumps({'kind':'usage','reservation_id':'legacy-smoke','run_id':'legacy-smoke','ticket':'SMOKE-TEST','cost_usd':'0.01'})+'\n')
+PY
+"$CONTROLLER" summary --sprint 47 > "$TMP/legacy-label-summary.json"
+json_check "legacy non-ticket accounting labels remain reportable without authority lookup" "$TMP/legacy-label-summary.json" 'data["spend"]["1802"]["spent_usd"] == 0.01 and data["spend"]["SMOKE-TEST"]["spent_usd"] == 0.01'
 
 cat > "$TMP/repo/fast-exit.json" <<'JSON'
 {"project":"PROJ","sprint":{"id":"49","name":"fast exit"},"source_query":"q","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-90","status":"Ready","dependencies":[],"subtasks":[]}]}

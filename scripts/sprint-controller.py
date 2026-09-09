@@ -925,10 +925,15 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
         total = item["spent_usd"] + item["reserved_usd"]
         item["projected_total_usd"] = round(total, 6)
         pause = cfg["pause_usd_per_ticket"]
-        try:
-            grant_ceiling = authorized_budget_ceiling(cfg["shared_root"], ticket)
-        except AuthorityError as exc:
-            raise SprintError(str(exc)) from exc
+        grant_ceiling = None
+        # Older ledgers may contain PR numbers, smoke-test labels, and other
+        # non-Jira accounting buckets. Preserve their spend in reports, but do
+        # not present them to the root authority as ticket scopes.
+        if re.fullmatch(r"[A-Z][A-Z0-9_]*-[0-9]+", ticket):
+            try:
+                grant_ceiling = authorized_budget_ceiling(cfg["shared_root"], ticket)
+            except AuthorityError as exc:
+                raise SprintError(str(exc)) from exc
         if grant_ceiling is not None:
             pause = max(pause, float(grant_ceiling))
         warning = cfg["warn_usd_per_ticket"]
