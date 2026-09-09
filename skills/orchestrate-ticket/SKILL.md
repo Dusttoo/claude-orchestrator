@@ -144,7 +144,9 @@ working directory.
    context, which compacts. Open it once (`review-ledger.py open <pr>`), paste
    `review-ledger.py brief <pr>` into every reviewer brief, and record every
    completed gate with `review-ledger.py record <pr> --gate <gate> --result
-   .orchestration/.review-results/<gate>.json`. It normalizes each finding's
+   .orchestration/.review-results/<gate>.json --head <exact-sha>
+   --phase-permit <token>`. Native reviewers first call `complete-review` on
+   that permit after writing the structured result. It normalizes each finding's
    bare `<path>:<symbol>` component key so a repeated defect actually accumulates
    strikes, freezes blocking scope after round 1, and returns `next_action`:
 

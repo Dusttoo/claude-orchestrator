@@ -46,6 +46,10 @@ reused. This is sequencing, not human authentication.
 Desktop fallback is allowed only before provider
 acknowledgement; submitted, timed-out, or uncertain work must be reconciled
 instead of duplicated.
+For a native desktop reviewer, write its final structured JSON first, then run
+`review-ledger.py complete-review <pr> --ticket <ticket> --role <role>
+--phase-permit <token> --result <file>`. API execution creates the same
+completion receipt after successful provider output.
 
 1. Read `.orchestration/config.yaml` and run
    `orchestration-engine.py validate-config`. For `schema_version: 2`, use
@@ -84,7 +88,8 @@ instead of duplicated.
 5. Wait for both launched reviewers, then record every completed gate through the
    ledger, blocking and advisory findings
    alike: `review-ledger.py record <pr> --gate code-review --result
-   .orchestration/.review-results/code-review.json`. The validated JSON carries
+   .orchestration/.review-results/code-review.json --head <exact-sha>
+   --phase-permit <token>`. The validated JSON carries
    disposition, severity, regression, and explanation. The ledger increments strikes, auto-resolves components this gate
    no longer reports, demotes out-of-scope new findings in a frozen round, and
    returns `next_action`. Its `effective_verdict` governs, not the claimed one.

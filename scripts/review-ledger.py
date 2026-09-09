@@ -29,11 +29,16 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import context_pipeline
-from review_permit import consumed_permit
+from review_permit import (
+    ReviewPermitError,
+    complete as complete_review_permit,
+    consume_completion,
+)
 from runtime_state import (
     RuntimeStateError,
     canonical_config_path,
     migrate_legacy_runtime_dir,
+    shared_repository_root,
     working_repository_root,
 )
 
@@ -231,10 +236,14 @@ def ledger_path(args: argparse.Namespace) -> Path:
 
 
 def positive_config_int(args: argparse.Namespace, cli_name: str, key: str, default: int) -> int:
-    override = getattr(args, cli_name, None)
-    cfg = Path(args.config) if args.config else project_root() / ".orchestration/config.yaml"
-    value = str(override) if override is not None else config_scalar(cfg, key, str(default))
     try:
+        cfg = canonical_config_path(project_root(), args.config)
+    except RuntimeStateError as exc:
+        raise LedgerError(str(exc)) from exc
+    configured = config_scalar(cfg, key, str(default))
+    override = getattr(args, cli_name, None)
+    try:
+        value = str(min(int(configured), int(override))) if override is not None else configured
         result = int(value)
     except ValueError as exc:
         raise LedgerError(f"{key} must be an integer, got {value!r}") from exc
@@ -244,15 +253,15 @@ def positive_config_int(args: argparse.Namespace, cli_name: str, key: str, defau
 
 
 def max_rounds_for(args: argparse.Namespace) -> int:
-    if getattr(args, "max_rounds", None):
-        value = str(args.max_rounds)
-    else:
-        cfg = Path(args.config) if args.config else project_root() / ".orchestration/config.yaml"
-        # max_review_rounds is the v0.7 compatibility alias. New repositories
-        # distinguish pre-code design rounds from post-code repair attempts.
-        value = config_scalar(cfg, "max_repair_cycles", "")
-        if not value:
-            value = config_scalar(cfg, "max_review_rounds", str(DEFAULT_MAX_REPAIR_CYCLES))
+    try:
+        cfg = canonical_config_path(project_root(), args.config)
+    except RuntimeStateError as exc:
+        raise LedgerError(str(exc)) from exc
+    value = config_scalar(cfg, "max_repair_cycles", "")
+    if not value:
+        value = config_scalar(cfg, "max_review_rounds", str(DEFAULT_MAX_REPAIR_CYCLES))
+    if getattr(args, "max_rounds", None) is not None:
+        value = str(min(int(value), int(args.max_rounds)))
     try:
         rounds = int(value)
     except ValueError as exc:
@@ -355,15 +364,14 @@ def cmd_open(args: argparse.Namespace) -> None:
     with locked(path):
         if path.exists():
             state = load(path)
-            if getattr(args, "max_rounds", None):
-                state["max_rounds"] = rounds
-            if getattr(args, "max_design_rounds", None):
-                _design_state(
-                    state,
-                    positive_config_int(
-                        args, "max_design_rounds", "max_design_rounds", DEFAULT_MAX_DESIGN_ROUNDS
-                    ),
-                )
+            # Existing caps are immutable from worker-facing CLI syntax.
+            state["max_rounds"] = min(int(state.get("max_rounds", rounds)), rounds)
+            _design_state(state)["max_rounds"] = min(
+                int(_design_state(state)["max_rounds"]),
+                positive_config_int(
+                    args, "max_design_rounds", "max_design_rounds", DEFAULT_MAX_DESIGN_ROUNDS
+                ),
+            )
             save(path, state)
         else:
             state = new_state(args.pr, rounds)
@@ -420,9 +428,22 @@ def cmd_record(args: argparse.Namespace) -> None:
         }
     elif not args.verdict:
         raise LedgerError("record requires either --result or --verdict")
+    elif args.verdict == "PASS":
+        raise LedgerError("review PASS requires a structured --result and completion receipt")
     path = ledger_path(args)
     with locked(path):
         state = load(path)
+        if args.result:
+            role = {
+                "code-review": "code-reviewer", "security-review": "security-reviewer"
+            }.get(args.gate)
+            if not role or not args.phase_permit or not args.head:
+                raise LedgerError("structured review record requires --phase-permit and exact --head")
+            if not consume_completion(
+                state, token=args.phase_permit, role=role, head=args.head,
+                result=structured, timestamp=now(),
+            ):
+                raise LedgerError("review result lacks a matching single-use provider completion receipt")
         plan = decide(state)
         if plan["next_action"] == ACTION_ESCALATE:
             raise LedgerError(
@@ -738,7 +759,8 @@ def cmd_design_open(args: argparse.Namespace) -> None:
     )
     with locked(path):
         state = load(path) if path.exists() else new_state(args.pr, rounds)
-        _design_state(state, design_rounds)
+        design = _design_state(state)
+        design["max_rounds"] = min(int(design.get("max_rounds", design_rounds)), design_rounds)
         save(path, state)
         emit({"ledger": str(path), **_design_plan(state)})
 
@@ -797,11 +819,11 @@ def cmd_design_record(args: argparse.Namespace) -> None:
     path = ledger_path(args)
     with locked(path):
         state = load(path)
-        if artifact and not consumed_permit(
-            state, str(artifact["phase_permit"]), role="design-reviewer",
-            head=str(artifact["source_sha"]),
+        if artifact and not consume_completion(
+            state, token=str(artifact["phase_permit"]), role="design-reviewer",
+            head=str(artifact["source_sha"]), result=artifact, timestamp=now(),
         ):
-            raise LedgerError("design result is not bound to a consumed design-review phase permit")
+            raise LedgerError("design result lacks a matching single-use reviewer completion receipt")
         design = _design_state(state)
         plan = _design_plan(state)
         if plan["next_action"] == ACTION_ESCALATE:
@@ -1072,11 +1094,22 @@ def cmd_permit_review(args: argparse.Namespace) -> None:
     path = ledger_path(args)
     with locked(path):
         state = load(path)
+        bound_ticket = str(state.get("ticket") or "")
+        if bound_ticket and bound_ticket != ticket:
+            raise LedgerError(f"review ledger is bound to {bound_ticket}, not {ticket}")
+        state["ticket"] = ticket
         if args.role == "design-reviewer":
             if _design_plan(state)["next_action"] != "redesign":
                 raise LedgerError("design ledger phase does not permit another reviewer")
         elif decide(state)["next_action"] != ACTION_REVIEW:
             raise LedgerError("review ledger phase does not permit another reviewer")
+        active = [
+            item for item in state.get("review_permits", [])
+            if item.get("role") == args.role and item.get("head") == actual_head
+            and not item.get("receipt_consumed_at")
+        ]
+        if active:
+            raise LedgerError("the current gate already has an outstanding phase permit")
         token = "phase_" + os.urandom(24).hex()
         state.setdefault("review_permits", []).append({
             "token": token,
@@ -1084,10 +1117,40 @@ def cmd_permit_review(args: argparse.Namespace) -> None:
             "role": args.role,
             "head": actual_head,
             "issued_at": now(),
-            "consumed_at": "",
+            "round_count": len(state.get("rounds", [])),
+            "repair_count": len(state.get("repair_attempts", [])),
+            "design_round_count": len((state.get("design") or {}).get("rounds", [])),
+            "started_at": "",
+            "completion_receipt": "",
+            "receipt_consumed_at": "",
         })
         save(path, state)
     emit({"review_phase_permit": token, "ticket": ticket, "role": args.role, "head": actual_head})
+
+
+def cmd_complete_review(args: argparse.Namespace) -> None:
+    """Atomically attest a native desktop review only after its result exists."""
+    try:
+        result = json.loads(Path(args.result).read_text(encoding="utf-8"))
+        gate = {"code-reviewer": "code-review", "security-reviewer": "security-review"}.get(args.role)
+        if gate:
+            context_pipeline.validate_review_output(result, gate)
+    except (OSError, json.JSONDecodeError, context_pipeline.ContextError) as exc:
+        raise LedgerError(f"invalid completed review result: {exc}") from exc
+    try:
+        actual_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=project_root(), check=True,
+            capture_output=True, text=True,
+        ).stdout.strip().lower()
+        root = shared_repository_root(project_root())
+        receipt = complete_review_permit(
+            shared_root=root, ledger_dir=str(ledger_path(args).parent.relative_to(root)),
+            pr=args.pr, token=args.phase_permit, ticket=args.ticket.upper(), role=args.role,
+            head=actual_head, result=result, timestamp=now(), desktop=True,
+        )
+    except (OSError, subprocess.CalledProcessError, ValueError, ReviewPermitError) as exc:
+        raise LedgerError(str(exc)) from exc
+    emit({"completion_receipt": receipt, "head": actual_head, "role": args.role})
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1098,8 +1161,8 @@ def parser() -> argparse.ArgumentParser:
 
     open_parser = commands.add_parser("open", help="create or report the ledger for a PR")
     open_parser.add_argument("pr")
-    open_parser.add_argument("--max-rounds", help="override the configured round cap")
-    open_parser.add_argument("--max-design-rounds", help="override the configured design-round cap")
+    open_parser.add_argument("--max-rounds", help="tighten (never raise) the configured repair cap")
+    open_parser.add_argument("--max-design-rounds", help="tighten (never raise) the configured design cap")
     open_parser.set_defaults(func=cmd_open)
 
     record_parser = commands.add_parser("record", help="record one completed gate round")
@@ -1120,6 +1183,7 @@ def parser() -> argparse.ArgumentParser:
         help="a new key that is a regression in the delta, so it keeps blocking authority",
     )
     record_parser.add_argument("--head", help="exact reviewed commit; required after record-repair")
+    record_parser.add_argument("--phase-permit", help="single-use permit with a completed review receipt")
     record_parser.set_defaults(func=cmd_record)
 
     for name, func, helptext in (
@@ -1161,6 +1225,16 @@ def parser() -> argparse.ArgumentParser:
     )
     permit.add_argument("--head", required=True)
     permit.set_defaults(func=cmd_permit_review)
+    complete = commands.add_parser("complete-review", help="complete a native review permit after output exists")
+    complete.add_argument("pr")
+    complete.add_argument("--ticket", required=True)
+    complete.add_argument(
+        "--role", required=True,
+        choices=("design-reviewer", "code-reviewer", "security-reviewer"),
+    )
+    complete.add_argument("--phase-permit", required=True)
+    complete.add_argument("--result", required=True)
+    complete.set_defaults(func=cmd_complete_review)
 
     resolve_parser = commands.add_parser("resolve", help="manually close a component")
     resolve_parser.add_argument("pr")

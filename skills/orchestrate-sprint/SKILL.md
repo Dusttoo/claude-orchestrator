@@ -116,6 +116,9 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    query for auditability. The controller rejects duplicate or malformed keys,
    dedupes dependencies, identifies self-links, cycles, incomplete external
    status data, and initially completed/blocked/not-ready Jira states.
+   Before sync, pass the sanitized fetch plus complete pagination metadata
+   through `jira_inventory_receipt.py`; sync rejects caller-authored Jira
+   assertions without that digest-bound receipt.
 
 4. **Sync and resume.** Run:
 
@@ -134,7 +137,9 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    If a previously blocked or user-action ticket becomes safe to retry, requeue
    it explicitly with the evidence in `--reason`; completed tickets cannot be
    requeued. A running ticket additionally requires proof that no worker remains.
-   Requeue requires its current `--attempt-token` and `--worker-stopped`. After
+   Requeue requires its current `--attempt-token` plus mechanically dead
+   `pid:`/`workspace-lease-pid:` identity, or a separately provisioned
+   single-use operator recovery capability. After
    `max_lane_relaunches`, stop for operator policy action; there is no same-user
    approval flag.
 
@@ -145,11 +150,13 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    prerequisite completion:
 
    ```text
-   sprint-controller.py reserve --sprint <id> --ticket <key> --run-ref <provisional-ref>
+   sprint-controller.py reserve --sprint <id> --ticket <key> --run-ref <provisional-ref> \
+     --run-id <stable-provider-run-id> --role <implementer-or-sprint-worker>
    ```
 
    Preserve the `attempt_token` returned by reserve. It fences this worker from
-   every earlier or replacement attempt.
+   every earlier or replacement attempt. API workers must also receive the
+   returned `attempt_capability` and its exact bound worker reference.
 
    Then launch a fresh isolated worker for that one ticket. Instruct it to use
    `$orchestrate-ticket`, pass the freshly fetched Jira body and acceptance

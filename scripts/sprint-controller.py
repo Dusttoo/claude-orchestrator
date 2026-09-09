@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from api_agent import AgentError, Pricing, UsageLedger, budgets_from_config, load_yaml
+
 from runtime_state import (
     RuntimeStateError,
     canonical_config_path,
@@ -144,8 +146,16 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
     try:
         warning_budget = min(float(config_scalar_any_depth(config, "warn_usd_per_ticket", "10")) or 10, 10)
         pause_budget = min(float(config_scalar_any_depth(config, "pause_usd_per_ticket", "20")) or 20, 20)
+        max_model_runs = min(
+            int(config_scalar_any_depth(config, "max_model_runs_per_ticket", "12")) or 12, 12
+        )
+        max_reviewer_runs = min(
+            int(config_scalar_any_depth(config, "max_reviewer_runs_per_ticket", "6")) or 6, 6
+        )
     except ValueError as exc:
-        raise SprintError("ticket warning and pause budgets must be numbers") from exc
+        raise SprintError("ticket budgets and run limits must be numbers") from exc
+    if max_model_runs < 1 or max_reviewer_runs < 1:
+        raise SprintError("model and reviewer run limits must be positive")
     return {
         "config": config,
         "concurrency_max": concurrency,
@@ -154,6 +164,8 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
         "max_lane_relaunches": max_lane_relaunches,
         "warn_usd_per_ticket": warning_budget,
         "pause_usd_per_ticket": pause_budget,
+        "max_model_runs_per_ticket": max_model_runs,
+        "max_reviewer_runs_per_ticket": max_reviewer_runs,
         "ready": {x.casefold() for x in config_list(config, "sprint_ready_statuses", DEFAULT_READY)},
         "done": {x.casefold() for x in config_list(config, "sprint_done_statuses", DEFAULT_DONE)},
         "blocked": {x.casefold() for x in config_list(config, "sprint_blocked_statuses", DEFAULT_BLOCKED)},
@@ -244,7 +256,9 @@ def load(path: Path) -> dict[str, Any]:
                     "then run recover-legacy"
                 )
                 ticket.setdefault("history", []).append({"at": now(), "event": "legacy-running-fenced"})
+                ticket["legacy_recovery_pending"] = True
             ticket["attempt_token"] = ""
+            ticket["attempt_capability"] = {}
             ticket.setdefault("subtasks", [])
     if value.get("schema_version") != SCHEMA_VERSION:
         raise SprintError(f"unsupported sprint checkpoint schema in {path}")
@@ -324,6 +338,33 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
     raw_tickets = raw.get("tickets")
     if not isinstance(raw_tickets, list):
         raise SprintError("inventory.tickets must be an array")
+    receipt = raw.get("fetch_receipt")
+    if not isinstance(receipt, dict):
+        raise SprintError(
+            "inventory.fetch_receipt from the Jira fetch adapter is required; caller assertions are insufficient"
+        )
+    parent_keys = sorted(normalize_key(item.get("key")) for item in raw_tickets if isinstance(item, dict))
+    receipt_payload = {
+        "source": receipt.get("source"),
+        "source_query": source_query,
+        "subtask_source_query": subtask_source_query,
+        "parent_keys": parent_keys,
+        "child_keys": sorted(discovered_subtasks),
+        "pages": receipt.get("pages"),
+    }
+    if receipt_payload["source"] != "jira-client" or not isinstance(receipt_payload["pages"], list) or not receipt_payload["pages"]:
+        raise SprintError("Jira fetch receipt requires source=jira-client and complete pagination metadata")
+    if any(
+        not isinstance(page, dict) or not isinstance(page.get("start_at"), int)
+        or not isinstance(page.get("count"), int) or page.get("count", -1) < 0
+        for page in receipt_payload["pages"]
+    ):
+        raise SprintError("Jira fetch receipt pagination metadata is invalid")
+    digest = hashlib.sha256(
+        json.dumps(receipt_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if receipt.get("sha256") != digest:
+        raise SprintError("Jira fetch receipt does not bind the query, pagination, parents, and children")
     tickets: dict[str, dict[str, Any]] = {}
     for item in raw_tickets:
         if not isinstance(item, dict):
@@ -483,10 +524,12 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
             open_reservations[str(event["reservation_id"])] = event
             if ticket:
                 item = result.setdefault(
-                    ticket, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_ids": set()}
+                    ticket, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_ids": set(), "reviewer_run_ids": set()}
                 )
                 if event.get("run_id"):
                     item["run_ids"].add(str(event["run_id"]))
+                    if event.get("role") in {"design-reviewer", "code-reviewer", "security-reviewer"}:
+                        item["reviewer_run_ids"].add(str(event["run_id"]))
         elif kind in {"usage", "release"}:
             open_reservations.pop(str(event.get("reservation_id") or ""), None)
         if kind == "ticket_budget_pause" and ticket:
@@ -494,23 +537,34 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 pause_events.get(ticket, 0), float(event.get("projected_total_usd", 0))
             )
         if kind == "usage" and ticket:
-            item = result.setdefault(ticket, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_ids": set()})
+            item = result.setdefault(ticket, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_ids": set(), "reviewer_run_ids": set()})
             item["spent_usd"] += float(event.get("cost_usd", 0))
+            if event.get("run_id"):
+                item["run_ids"].add(str(event["run_id"]))
+                if event.get("role") in {"design-reviewer", "code-reviewer", "security-reviewer"}:
+                    item["reviewer_run_ids"].add(str(event["run_id"]))
     for event in open_reservations.values():
         ticket = str(event.get("ticket") or "")
         if ticket:
-            item = result.setdefault(ticket, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_ids": set()})
+            item = result.setdefault(ticket, {"spent_usd": 0.0, "reserved_usd": 0.0, "run_ids": set(), "reviewer_run_ids": set()})
             item["reserved_usd"] += float(event.get("projected_cost_usd", 0))
             if event.get("run_id"):
                 item["run_ids"].add(str(event["run_id"]))
+                if event.get("role") in {"design-reviewer", "code-reviewer", "security-reviewer"}:
+                    item["reviewer_run_ids"].add(str(event["run_id"]))
     for ticket, item in result.items():
         item["run_count"] = len(item.pop("run_ids"))
+        item["reviewer_run_count"] = len(item.pop("reviewer_run_ids"))
         total = item["spent_usd"] + item["reserved_usd"]
         item["projected_total_usd"] = round(total, 6)
         pause = cfg["pause_usd_per_ticket"]
         warning = cfg["warn_usd_per_ticket"]
         item["state"] = (
-            "operator_action" if ticket in pause_events or (pause and total > pause)
+            "operator_action" if (
+                ticket in pause_events or (pause and total > pause)
+                or item["run_count"] >= cfg["max_model_runs_per_ticket"]
+                or item["reviewer_run_count"] >= cfg["max_reviewer_runs_per_ticket"]
+            )
             else "warning" if warning and total > warning else "ok"
         )
     return result
@@ -537,12 +591,14 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                     previous["history"].append({"at": now(), "event": "removed-from-query"})
             for key, fresh in incoming["tickets"].items():
                 previous = current["tickets"].get(key)
-                if previous and previous["state"] in TERMINAL | {"running"}:
+                if previous:
                     for field in (
                         "state", "reason", "run_ref", "branch", "pr", "attempts",
                         "attempt_token", "history",
+                        "attempt_capability", "legacy_recovery_pending",
                     ):
-                        fresh[field] = previous[field]
+                        if field in previous:
+                            fresh[field] = previous[field]
                 current["tickets"][key] = fresh
             current["project"] = incoming["project"]
             current["sprint"] = incoming["sprint"]
@@ -661,27 +717,68 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ordered_keys = [key for key in launch_order if key in jobs]
         requests = []
         marker_jobs = []
+        config = load_yaml(cfg["config"])
+        limits = budgets_from_config(config)
+        usage = UsageLedger(cfg["shared_root"])
+        reservations: list[tuple[str, str]] = []
+        prepared = []
         for key in ordered_keys:
-            custom_id = f"ticket_{key.replace('-', '_')}_{batch_id}"
-            run_ref = f"anthropic-batch:{batch_id}:{custom_id}"
-            if provider == "anthropic":
-                requests.append({"custom_id": custom_id, "params": jobs[key]})
-            else:
-                requests.append(
-                    {"custom_id": custom_id, "method": "POST", "url": "/v1/responses", "body": jobs[key]}
-                )
-            marker_jobs.append({"ticket": key, "custom_id": custom_id, "run_ref": run_ref})
-            ticket = state["tickets"][key]
-            if ticket["attempts"] > cfg["max_lane_relaunches"]:
+            if state["tickets"][key]["attempts"] > cfg["max_lane_relaunches"]:
                 raise SprintError(
                     f"ticket {key} exceeded max_lane_relaunches; background batches cannot supply human approval"
                 )
+            custom_id = f"ticket_{key.replace('-', '_')}_{batch_id}"
+            run_ref = f"{provider}-batch:{batch_id}:{custom_id}"
+            run_id = f"batch-{batch_id}-{key}"
+            params = jobs[key]
+            output_cap = int(params["max_tokens"] if provider == "anthropic" else params["max_output_tokens"])
+            input_tokens = max(1, len(json.dumps(params, separators=(",", ":")).encode("utf-8")))
+            projected = Pricing.from_config(config, str(params["model"])).worst_case(
+                input_tokens, output_cap
+            )
+            prepared.append((key, custom_id, run_ref, run_id, projected))
+        try:
+            for key, custom_id, run_ref, run_id, projected in prepared:
+                reservation_id = usage.reserve(
+                    projected=projected, limits=limits, run_id=run_id, ticket=key,
+                    sprint=str(args.sprint), provider=provider, model=str(jobs[key]["model"]),
+                    role="sprint-worker",
+                )
+                reservations.append((reservation_id, run_id))
+                if provider == "anthropic":
+                    requests.append({"custom_id": custom_id, "params": jobs[key]})
+                else:
+                    requests.append(
+                        {"custom_id": custom_id, "method": "POST", "url": "/v1/responses", "body": jobs[key]}
+                    )
+                marker_jobs.append({
+                    "ticket": key, "custom_id": custom_id, "run_ref": run_ref,
+                    "run_id": run_id, "reservation_id": reservation_id,
+                    "projected_cost_usd": str(projected),
+                })
+        except (AgentError, ValueError) as exc:
+            for reservation_id, run_id in reservations:
+                usage.release(reservation_id, run_id, "batch preparation failed")
+            raise SprintError(f"batch budget reservation failed: {exc}") from exc
+        for marker_job in marker_jobs:
+            key = marker_job["ticket"]
+            custom_id = marker_job["custom_id"]
+            run_ref = marker_job["run_ref"]
+            run_id = marker_job["run_id"]
+            ticket = state["tickets"][key]
             ticket["state"] = "running"
             ticket["reason"] = ""
             ticket["run_ref"] = run_ref
             ticket["attempts"] += 1
             ticket["attempt_token"] = "attempt_" + uuid.uuid4().hex
-            marker_jobs[-1]["attempt_token"] = ticket["attempt_token"]
+            ticket["attempt_capability"] = {
+                "token": "attemptcap_" + uuid.uuid4().hex,
+                "repository": str(cfg["shared_root"]), "sprint": str(args.sprint),
+                "ticket": key, "role": "sprint-worker", "run_id": run_id,
+                "worker": run_ref, "attempt": ticket["attempts"], "issued_at": now(),
+            }
+            marker_job["attempt_token"] = ticket["attempt_token"]
+            marker_job["attempt_capability"] = ticket["attempt_capability"]["token"]
             ticket["history"].append(
                 {"at": now(), "event": "batch-reserved", "batch_id": batch_id, "custom_id": custom_id}
             )
@@ -721,6 +818,80 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     )
 
 
+def reconcile_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    """Settle or release every reservation owned by one durable batch marker."""
+    marker_path = cfg["state_dir"] / f"batch-{args.batch}.state.json"
+    if not marker_path.is_file():
+        raise SprintError(f"batch marker not found: {marker_path}")
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    if marker.get("status") not in {"pending_submission", "pending_upload", "submitted"}:
+        raise SprintError("batch is not awaiting reconciliation")
+    usage_ledger = UsageLedger(cfg["shared_root"])
+    results: dict[str, dict[str, Any]] = {}
+    if args.outcome == "completed":
+        if not args.results:
+            raise SprintError("completed batch reconciliation requires --results")
+        source = json.loads(Path(args.results).read_text(encoding="utf-8"))
+        rows = source.get("jobs") if isinstance(source, dict) else None
+        if not isinstance(rows, list):
+            raise SprintError("batch results require a jobs array")
+        results = {normalize_key(row.get("ticket")): row for row in rows if isinstance(row, dict)}
+        if set(results) != {item["ticket"] for item in marker["jobs"]}:
+            raise SprintError("batch results must cover every reserved ticket exactly once")
+    config = load_yaml(cfg["config"])
+    settlements: dict[str, tuple[dict[str, int], str, str]] = {}
+    if args.outcome == "completed":
+        reservation_events = {
+            str(event.get("reservation_id")): event for event in usage_ledger._events()
+            if event.get("kind") == "reservation"
+        }
+        for item in marker["jobs"]:
+            row = results[item["ticket"]]
+            raw_usage = row.get("usage")
+            if not isinstance(raw_usage, dict):
+                raise SprintError(f"batch result for {item['ticket']} requires usage")
+            normalized = {
+                key: int(raw_usage.get(key, 0))
+                for key in ("input_tokens", "cache_write_tokens", "cache_read_tokens", "output_tokens")
+            }
+            normalized["reasoning_tokens"] = int(raw_usage.get("reasoning_tokens", 0))
+            response_id = str(row.get("response_id") or "")
+            event = reservation_events.get(str(item["reservation_id"]))
+            if sum(normalized.values()) <= 0 or not response_id or not event:
+                raise SprintError(
+                    f"batch result for {item['ticket']} requires an open reservation, response_id, and nonzero usage"
+                )
+            settlements[item["ticket"]] = (normalized, response_id, str(event["model"]))
+    for item in marker["jobs"]:
+        if args.outcome == "failed":
+            usage_ledger.release(item["reservation_id"], item["run_id"], "provider batch failed")
+            continue
+        normalized, response_id, model = settlements[item["ticket"]]
+        usage_ledger.settle(
+            item["reservation_id"], run_id=item["run_id"], ticket=item["ticket"],
+            sprint=str(marker["sprint_id"]), provider=str(marker["provider"]), model=str(model),
+            response_id=response_id, usage=normalized,
+            cost=Pricing.from_config(config, str(model)).actual_cost(normalized), role="sprint-worker",
+        )
+    marker["status"] = "completed" if args.outcome == "completed" else "failed"
+    marker["updated_at"] = now()
+    write_json(marker_path, marker)
+    if args.outcome == "failed":
+        checkpoint = state_path(cfg["state_dir"], str(marker["sprint_id"]))
+        with locked(checkpoint):
+            state = load(checkpoint)
+            for item in marker["jobs"]:
+                ticket = state["tickets"].get(item["ticket"])
+                if ticket and ticket.get("state") == "running" and ticket.get("run_ref") == item["run_ref"]:
+                    ticket.update({
+                        "state": "pending", "reason": "provider batch failed before worker output",
+                        "run_ref": "", "attempt_token": "", "attempt_capability": {},
+                    })
+                    ticket["history"].append({"at": now(), "event": "batch-failed-requeued"})
+            save(checkpoint, state)
+    emit({"batch_id": args.batch, "status": marker["status"]})
+
+
 def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     path = state_path(cfg["state_dir"], str(args.sprint))
     key = normalize_key(args.ticket)
@@ -749,12 +920,26 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["run_ref"] = args.run_ref
         ticket["attempts"] += 1
         ticket["attempt_token"] = "attempt_" + uuid.uuid4().hex
+        capability_run_id = args.run_id or args.run_ref
+        capability = {
+            "token": "attemptcap_" + uuid.uuid4().hex,
+            "repository": str(cfg["shared_root"]),
+            "sprint": str(args.sprint),
+            "ticket": key,
+            "attempt": ticket["attempts"],
+            "role": args.role,
+            "run_id": capability_run_id,
+            "worker": args.worker_ref or args.run_ref,
+            "issued_at": now(),
+        }
+        ticket["attempt_capability"] = capability
         event = {"at": now(), "event": "reserved", "run_ref": args.run_ref}
         ticket["history"].append(event)
         save(path, state)
     emit({
         "ticket": key, "state": "running", "run_ref": args.run_ref,
-        "attempt_token": ticket["attempt_token"], "attempt": ticket["attempts"],
+        "attempt_token": ticket["attempt_token"], "attempt_capability": capability["token"],
+        "attempt": ticket["attempts"],
     })
 
 
@@ -814,8 +999,7 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         if not ticket or ticket["state"] == "completed" or ticket["state"] == "pending":
             current = ticket["state"] if ticket else "missing"
             raise SprintError(f"ticket {key} cannot be requeued from state {current}")
-        if not args.worker_stopped:
-            raise SprintError("requeue requires --worker-stopped after verifying the prior worker is gone")
+        require_worker_stopped(ticket, args.operator_capability, cfg)
         require_attempt(ticket, args.attempt_token)
         ticket["state"] = "pending"
         ticket["reason"] = args.reason.strip()
@@ -823,6 +1007,7 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["branch"] = ""
         ticket["pr"] = ""
         ticket["attempt_token"] = ""
+        ticket["attempt_capability"] = {}
         ticket["history"].append({"at": now(), "event": "requeued", "reason": args.reason.strip()})
         save(path, state)
     emit({"ticket": key, "state": "pending"})
@@ -839,16 +1024,42 @@ def recover_legacy(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket = state["tickets"].get(key)
         if (
             not ticket or ticket.get("state") != "user_action"
-            or not any(item.get("event") == "legacy-running-fenced" for item in ticket.get("history", []))
+            or not ticket.get("legacy_recovery_pending")
         ):
             raise SprintError(f"ticket {key} is not a fenced legacy running lane")
+        require_worker_stopped(ticket, args.operator_capability, cfg)
         ticket["state"] = "pending"
         ticket["reason"] = args.reason.strip()
         ticket["run_ref"] = ""
         ticket["attempt_token"] = ""
+        ticket["attempt_capability"] = {}
+        ticket["legacy_recovery_pending"] = False
         ticket["history"].append({"at": now(), "event": "legacy-recovered", "reason": args.reason.strip()})
         save(path, state)
     emit({"ticket": key, "state": "pending", "recovered": True})
+
+
+def require_worker_stopped(ticket: dict[str, Any], operator_token: str, cfg: dict[str, Any]) -> None:
+    """Use process liveness or consume a separately provisioned operator token."""
+    run_ref = str(ticket.get("run_ref") or "")
+    match = re.fullmatch(r"(?:pid|workspace-lease-pid):(\d+)", run_ref)
+    if match:
+        try:
+            os.kill(int(match.group(1)), 0)
+        except ProcessLookupError:
+            return
+        except PermissionError as exc:
+            raise SprintError("cannot verify prior worker process ownership") from exc
+        raise SprintError(f"prior worker process {match.group(1)} is still alive")
+    capability_path = cfg["shared_root"] / ".orchestration/operator-recovery.cap"
+    if not operator_token or not capability_path.is_file():
+        raise SprintError(
+            "worker liveness is not mechanically verifiable; provide an out-of-band single-use operator capability"
+        )
+    expected = capability_path.read_text(encoding="utf-8").strip()
+    if not expected or operator_token != expected:
+        raise SprintError("operator recovery capability is invalid")
+    capability_path.unlink()
 
 
 def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
@@ -892,10 +1103,7 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
                     else "ready but not launched"
                 )
                 result["user_action"].append(item)
-    result["finished"] = not result["running"] and not any(
-        ticket["state"] == "pending" and not blockers(state, key, cfg)
-        for key, ticket in state["tickets"].items()
-    )
+    result["finished"] = not plan_value(state, cfg)["autonomous_work_remaining"]
     result["spend"] = spend
     return result
 
@@ -924,10 +1132,18 @@ def parser() -> argparse.ArgumentParser:
     batch_parser.add_argument("--sprint", required=True)
     batch_parser.add_argument("--jobs", required=True)
     batch_parser.set_defaults(func=prepare_batch)
+    reconcile_batch_parser = commands.add_parser("reconcile-batch")
+    reconcile_batch_parser.add_argument("--batch", required=True)
+    reconcile_batch_parser.add_argument("--outcome", required=True, choices=("completed", "failed"))
+    reconcile_batch_parser.add_argument("--results")
+    reconcile_batch_parser.set_defaults(func=reconcile_batch)
     reserve_parser = commands.add_parser("reserve")
     reserve_parser.add_argument("--sprint", required=True)
     reserve_parser.add_argument("--ticket", required=True)
     reserve_parser.add_argument("--run-ref", required=True)
+    reserve_parser.add_argument("--run-id")
+    reserve_parser.add_argument("--role", default="sprint-worker", choices=("implementer", "sprint-worker"))
+    reserve_parser.add_argument("--worker-ref", default="")
     reserve_parser.set_defaults(func=reserve)
     attach_parser = commands.add_parser("attach")
     attach_parser.add_argument("--sprint", required=True)
@@ -949,12 +1165,14 @@ def parser() -> argparse.ArgumentParser:
     requeue_parser.add_argument("--ticket", required=True)
     requeue_parser.add_argument("--reason", required=True)
     requeue_parser.add_argument("--attempt-token", required=True)
-    requeue_parser.add_argument("--worker-stopped", action="store_true")
+    requeue_parser.add_argument("--operator-capability", default="")
+    requeue_parser.add_argument("--worker-stopped", action="store_true", help=argparse.SUPPRESS)
     requeue_parser.set_defaults(func=requeue)
     recover_parser = commands.add_parser("recover-legacy")
     recover_parser.add_argument("--sprint", required=True)
     recover_parser.add_argument("--ticket", required=True)
     recover_parser.add_argument("--reason", required=True)
+    recover_parser.add_argument("--operator-capability", default="")
     recover_parser.set_defaults(func=recover_legacy)
     return result
 

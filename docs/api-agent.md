@@ -135,6 +135,12 @@ scripts/review-ledger.py permit-review 123 --ticket PROJ-1 \
 #   --review-authorization <token>
 ```
 
+Implementer and sprint-worker API routes also require `--attempt-capability`
+and `--worker-ref` exactly as returned and bound by `sprint-controller.py
+reserve`. Reviewer output is usable only after the API runner creates a
+digest-bound completion receipt; native reviewers use `review-ledger.py
+complete-review` after writing their structured result.
+
 After every response, actual uncached input, cache writes, cache reads, output,
 and reasoning usage is recorded under `.orchestration/.llm-usage/usage.jsonl`.
 Run `scripts/api_agent.py usage` for totals and open reservations.

@@ -30,7 +30,13 @@ from pathlib import Path
 from typing import Any
 
 import context_pipeline
-from review_permit import ReviewPermitError, consume as consume_review_permit
+from attempt_capability import AttemptCapabilityError, validate as validate_attempt_capability
+from review_permit import (
+    ReviewPermitError,
+    cancel_started as cancel_review_permit,
+    complete as complete_review_permit,
+    consume as consume_review_permit,
+)
 from runtime_state import (
     RuntimeStateError,
     canonical_config_path,
@@ -540,6 +546,20 @@ class UsageLedger:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             events = self._events()
             if ticket:
+                last_pause = max(
+                    (index for index, event in enumerate(events)
+                     if event.get("kind") == "ticket_budget_pause"
+                     and self._matches(event, "ticket", ticket)),
+                    default=-1,
+                )
+                last_reset = max(
+                    (index for index, event in enumerate(events)
+                     if event.get("kind") == "ticket_budget_reset"
+                     and self._matches(event, "ticket", ticket)),
+                    default=-1,
+                )
+                if last_pause > last_reset:
+                    raise BudgetError(f"ticket_budget_pause is active for {ticket}; operator reset required")
                 run_ids = {
                     str(event.get("run_id"))
                     for event in events
@@ -550,6 +570,10 @@ class UsageLedger:
                 is_new_run = run_id not in run_ids
                 max_runs = limits["max_model_runs_per_ticket"]
                 if is_new_run and max_runs and len(run_ids) >= max_runs:
+                    self._append_locked({
+                        "kind": "ticket_budget_pause", "timestamp": utc_now(), "ticket": ticket,
+                        "run_id": run_id, "reason": "max_model_runs_per_ticket",
+                    })
                     raise BudgetError(
                         f"max_model_runs_per_ticket={max_runs} reached for {ticket}; human action required"
                     )
@@ -567,6 +591,10 @@ class UsageLedger:
                     is_new_run and role in reviewer_roles and max_reviewers
                     and len(reviewer_run_ids) >= max_reviewers
                 ):
+                    self._append_locked({
+                        "kind": "ticket_budget_pause", "timestamp": utc_now(), "ticket": ticket,
+                        "run_id": run_id, "reason": "max_reviewer_runs_per_ticket",
+                    })
                     raise BudgetError(
                         f"max_reviewer_runs_per_ticket={max_reviewers} reached for {ticket}; "
                         "human action required"
@@ -598,6 +626,12 @@ class UsageLedger:
                     Decimal("0"),
                 )
                 if used + reserved + projected > limit:
+                    if ticket and field in {"ticket", "sprint"}:
+                        self._append_locked({
+                            "kind": "ticket_budget_pause", "timestamp": utc_now(), "ticket": ticket,
+                            "run_id": run_id, "reason": limit_key,
+                            "projected_total_usd": str(used + reserved + projected),
+                        })
                     raise BudgetError(
                         f"{limit_key} would be exceeded: spent ${used:.6f}, reserved "
                         f"${reserved:.6f}, next request up to ${projected:.6f}, limit ${limit:.6f}"
@@ -1359,6 +1393,8 @@ class ApiAgent:
         transport: HttpTransport | Any,
         review_authorization: str | None = None,
         review_pr: str | None = None,
+        attempt_capability: str | None = None,
+        worker_ref: str | None = None,
     ):
         self.root = root.resolve()
         try:
@@ -1379,6 +1415,8 @@ class ApiAgent:
         self.transport = transport
         self.review_authorization = review_authorization
         self.review_pr = review_pr
+        self.attempt_capability = attempt_capability
+        self.worker_ref = worker_ref or run_id
         self.pricing = Pricing.from_config(self.config, self.model)
         self.budgets = budgets_from_config(self.config)
         # Tool execution stays sandboxed to this worktree; spend accounting and
@@ -1390,6 +1428,23 @@ class ApiAgent:
         except RuntimeStateError as exc:
             raise AgentError(str(exc)) from exc
         self.ledger = UsageLedger(self.shared_root)
+        if self.role in {"implementer", "sprint-worker"}:
+            if not self.ticket or not self.sprint or not self.attempt_capability:
+                raise AgentError(
+                    "orchestration worker requires ticket, sprint, and a controller-issued attempt capability"
+                )
+            try:
+                validate_attempt_capability(
+                    state_dir=runtime_path(
+                        self.shared_root,
+                        str(self.config.get("sprint_checkpoint_dir") or ".orchestration/.sprint-state"),
+                    ),
+                    token=self.attempt_capability, repository=str(self.shared_root),
+                    sprint=self.sprint, ticket=self.ticket, role=self.role,
+                    run_id=self.run_id, worker=self.worker_ref,
+                )
+            except AttemptCapabilityError as exc:
+                raise AgentError(str(exc)) from exc
         state_directory = runtime_path(self.shared_root, ".orchestration/.llm-runs")
         self.state_path = state_directory / f"{run_id}.json"
         if self.state_path.exists():
@@ -1723,6 +1778,7 @@ class ApiAgent:
             request["tool_choice"] = "auto"
             request["parallel_tool_calls"] = False
         reviewer_roles = {"design-reviewer", "code-reviewer", "security-reviewer"}
+        review_head = ""
         if self.role in reviewer_roles:
             if not self.review_authorization or not self.review_pr:
                 raise AgentError("reviewer run requires --review-pr and a ledger-issued --review-authorization")
@@ -1743,6 +1799,7 @@ class ApiAgent:
                 )
             except ReviewPermitError as exc:
                 raise AgentError(str(exc)) from exc
+            review_head = head
         self._save(status="ready", request=request)
         body = request
         transcript: list[dict[str, Any]] = []
@@ -1750,7 +1807,23 @@ class ApiAgent:
             try:
                 response = self._submit(body)
             except BudgetError as exc:
+                if self.role in reviewer_roles:
+                    cancel_review_permit(
+                        shared_root=self.shared_root,
+                        ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
+                        pr=str(self.review_pr), token=str(self.review_authorization),
+                        ticket=str(self.ticket), role=self.role, head=review_head, timestamp=utc_now(),
+                    )
                 self._save(status="budget_blocked", error=str(exc))
+                raise
+            except ProviderHTTPError:
+                if self.role in reviewer_roles and self.state.get("status") == "rejected":
+                    cancel_review_permit(
+                        shared_root=self.shared_root,
+                        ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
+                        pr=str(self.review_pr), token=str(self.review_authorization),
+                        ticket=str(self.ticket), role=self.role, head=review_head, timestamp=utc_now(),
+                    )
                 raise
             calls = tool_calls(self.provider, response)
             text = response_text(self.provider, response)
@@ -1799,6 +1872,28 @@ class ApiAgent:
                     except (json.JSONDecodeError, context_pipeline.ContextError) as exc:
                         self._save(status="invalid_output", output_text=text, error=str(exc))
                         raise AgentError(f"reviewer returned invalid structured output: {exc}") from exc
+                if status == "completed" and self.role in reviewer_roles:
+                    completed_result: Any
+                    try:
+                        completed_result = json.loads(review_text(self.provider, text))
+                    except json.JSONDecodeError as exc:
+                        self._save(status="invalid_output", output_text=text, error=str(exc))
+                        raise AgentError("reviewer completion output must be structured JSON") from exc
+                    try:
+                        complete_review_permit(
+                            shared_root=self.shared_root,
+                            ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
+                            pr=str(self.review_pr), token=str(self.review_authorization),
+                            ticket=str(self.ticket), role=self.role,
+                            head=subprocess.run(
+                                ["git", "rev-parse", "HEAD"], cwd=self.root, check=True,
+                                capture_output=True, text=True,
+                            ).stdout.strip().lower(),
+                            result=completed_result, timestamp=utc_now(),
+                        )
+                    except (ReviewPermitError, OSError, subprocess.CalledProcessError) as exc:
+                        self._save(status="invalid_output", output_text=text, error=str(exc))
+                        raise AgentError(f"could not create review completion receipt: {exc}") from exc
                 self._save(status=status, output_text=text, review=review)
                 result = {
                     "run_id": self.run_id,
@@ -2141,6 +2236,8 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--result")
     run.add_argument("--review-authorization")
     run.add_argument("--review-pr")
+    run.add_argument("--attempt-capability")
+    run.add_argument("--worker-ref")
     usage = commands.add_parser("usage", help="summarize durable API usage and open reservations")
     usage.add_argument("--repo", default=".")
     report = commands.add_parser(
@@ -2259,6 +2356,8 @@ def main() -> int:
                 transport=HttpTransport(),
                 review_authorization=args.review_authorization,
                 review_pr=args.review_pr,
+                attempt_capability=args.attempt_capability,
+                worker_ref=args.worker_ref,
             )
             output = agent.run(read_request(args.request))
         if getattr(args, "result", None):

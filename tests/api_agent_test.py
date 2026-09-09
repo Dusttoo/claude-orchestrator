@@ -157,6 +157,9 @@ self_check:
                 "review_authorization": self.phase_permit(role=role),
                 "review_pr": "1",
             }
+        worker = {}
+        if role in {"implementer", "sprint-worker"}:
+            worker = self.attempt_capability(run_id=run_id, role=role)
         return api_agent.ApiAgent(
             root=self.root,
             config_path=self.config(provider=provider),
@@ -166,7 +169,22 @@ self_check:
             run_id=run_id,
             transport=transport,
             **review,
+            **worker,
         )
+
+    def attempt_capability(self, *, run_id, role="implementer", ticket="PROJ-1", sprint="SPRINT-1", worker_ref=None):
+        token = "attemptcap_" + run_id.replace("-", "_")
+        worker = worker_ref or run_id
+        directory = self.root / ".orchestration/.sprint-state"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"test-{run_id}.json").write_text(json.dumps({
+            "schema_version": 2,
+            "tickets": {ticket: {"state": "running", "attempt_capability": {
+                "token": token, "repository": str(self.root.resolve()), "sprint": sprint,
+                "ticket": ticket, "role": role, "run_id": run_id, "worker": worker, "attempt": 1,
+            }, "attempts": 1}},
+        }), encoding="utf-8")
+        return {"attempt_capability": token, "worker_ref": worker}
 
     def test_repository_env_loads_provider_credentials_without_overriding_container(self):
         config = self.config()
@@ -458,8 +476,8 @@ self_check:
             sprint="SPRINT-1",
             run_id="lane-run",
             transport=self._completed_transport(),
-            review_authorization=self.phase_permit(),
-            review_pr="1",
+            review_authorization=self.phase_permit(pr="2"),
+            review_pr="2",
         )
         lane.run(dict(body))
 
@@ -688,11 +706,12 @@ self_check:
             config_path=config,
             role="implementer",
             ticket="PROJ-2",
-            sprint=None,
+            sprint="SPRINT-1",
             run_id="openai-run",
             transport=transport,
             review_authorization=self.phase_permit(ticket="PROJ-5"),
             review_pr="1",
+            **self.attempt_capability(run_id="openai-run", ticket="PROJ-2"),
         )
         result = agent.run(
             {
@@ -767,9 +786,10 @@ self_check:
             config_path=config,
             role="implementer",
             ticket="PROJ-3",
-            sprint=None,
+            sprint="SPRINT-1",
             run_id="azure-adm-run",
             transport=transport,
+            **self.attempt_capability(run_id="azure-adm-run", ticket="PROJ-3"),
         )
         result = agent.run(
             {
@@ -841,9 +861,10 @@ self_check:
             config_path=config,
             role="implementer",
             ticket="PROJ-4",
-            sprint=None,
+            sprint="SPRINT-1",
             run_id="bedrock-mantle-run",
             transport=transport,
+            **self.attempt_capability(run_id="bedrock-mantle-run", ticket="PROJ-4"),
         )
         result = agent.run(
             {
@@ -956,9 +977,10 @@ self_check:
             config_path=config,
             role="implementer",
             ticket="PROJ-4",
-            sprint=None,
+            sprint="SPRINT-1",
             run_id="bedrock-run",
             transport=transport,
+            **self.attempt_capability(run_id="bedrock-run", ticket="PROJ-4"),
         )
         result = agent.run(
             {
@@ -1076,14 +1098,16 @@ self_check:
                 projected=api_agent.Decimal("0.01"), limits=limits, run_id="review-2",
                 ticket="PROJ-1", sprint="S-1", provider="openai", model="m", role="security-reviewer",
             )
+        worker_limits = dict(limits)
+        worker_limits["max_model_runs_per_ticket"] = 1
         ledger.reserve(
-            projected=api_agent.Decimal("0.01"), limits=limits, run_id="implement-1",
-            ticket="PROJ-1", sprint="S-1", provider="anthropic", model="m", role="implementer",
+            projected=api_agent.Decimal("0.01"), limits=worker_limits, run_id="implement-1",
+            ticket="PROJ-2", sprint="S-1", provider="anthropic", model="m", role="implementer",
         )
         with self.assertRaisesRegex(api_agent.BudgetError, "max_model_runs_per_ticket"):
             ledger.reserve(
-                projected=api_agent.Decimal("0.01"), limits=limits, run_id="implement-2",
-                ticket="PROJ-1", sprint="S-1", provider="anthropic", model="m", role="implementer",
+                projected=api_agent.Decimal("0.01"), limits=worker_limits, run_id="implement-2",
+                ticket="PROJ-2", sprint="S-1", provider="anthropic", model="m", role="implementer",
             )
 
     def test_ticket_pause_is_durable_and_has_no_self_approval_bypass(self):
@@ -1133,6 +1157,22 @@ self_check:
                 transport=FakeTransport([]),
             )
 
+    def test_implementer_requires_exact_controller_attempt_capability(self):
+        config = self.config(extra="    implementer:\n      allowed_tools: [read_file]")
+        with self.assertRaisesRegex(api_agent.AgentError, "controller-issued attempt capability"):
+            api_agent.ApiAgent(
+                root=self.root, config_path=config, role="implementer",
+                ticket="PROJ-1", sprint="SPRINT-1", run_id="uncap",
+                transport=FakeTransport([]),
+            )
+        binding = self.attempt_capability(run_id="bound", ticket="PROJ-1")
+        with self.assertRaisesRegex(api_agent.AgentError, "does not match"):
+            api_agent.ApiAgent(
+                root=self.root, config_path=config, role="implementer",
+                ticket="PROJ-1", sprint="SPRINT-1", run_id="different",
+                transport=FakeTransport([]), **binding,
+            )
+
     def test_review_phase_permit_is_single_use_and_bound_to_head(self):
         token = self.phase_permit()
         head = subprocess.run(
@@ -1148,7 +1188,7 @@ self_check:
             shared_root=self.root, ledger_dir=".orchestration/.review-ledger", pr="1",
             token=token, ticket="PROJ-1", role="code-reviewer", head=head, timestamp="now",
         )
-        with self.assertRaisesRegex(api_agent.ReviewPermitError, "already consumed"):
+        with self.assertRaisesRegex(api_agent.ReviewPermitError, "already started"):
             api_agent.consume_review_permit(
                 shared_root=self.root, ledger_dir=".orchestration/.review-ledger", pr="1",
                 token=token, ticket="PROJ-1", role="code-reviewer", head=head, timestamp="later",

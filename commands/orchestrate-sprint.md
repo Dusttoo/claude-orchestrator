@@ -73,7 +73,10 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    the prior agent no longer exists. Never duplicate an uncertain run.
    A resolved blocked or user-action ticket may also be explicitly requeued with
    the evidence in `--reason`; completed tickets cannot be requeued.
-   Requeue requires its current `--attempt-token` and `--worker-stopped`.
+   Seal the sanitized fetch and pagination metadata with
+   `jira_inventory_receipt.py` before sync. Requeue requires its current
+   `--attempt-token` and mechanical process/workspace-lease liveness proof, or
+   a separately provisioned single-use operator capability.
 
 5. For each key in `plan.launch` — already ordered by `(priority, key)`, so
    launch in that order and never reprioritize locally — first create a unique

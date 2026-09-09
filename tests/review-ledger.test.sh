@@ -19,6 +19,26 @@ mkdir -p "$TMP/.orchestration"
 
 led() { (cd "$TMP" && python3 "$LEDGER" "$@"); }
 field() { python3 -c "import json,sys; v=json.load(sys.stdin)['$1']; print(','.join(v) if isinstance(v,list) else v)"; }
+review_record() {
+  local pr="$1" gate="$2" file="$3" ticket="${4:-PROJ-$1}" role
+  role="${gate}-reviewer"
+  local head permit
+  head="$(git -C "$TMP" rev-parse HEAD)"
+  permit="$(led permit-review "$pr" --ticket "$ticket" --role "$role" --head "$head" | field review_phase_permit)" || return
+  led complete-review "$pr" --ticket "$ticket" --role "$role" --phase-permit "$permit" --result "$file" >/dev/null || return
+  led record "$pr" --gate "$gate-review" --result "$file" --head "$head" --phase-permit "$permit"
+}
+record_pass() {
+  local pr="$1" gate="$2" advisory="${3:-}" file
+  file="$TMP/pass-$pr-$gate.json"
+  python3 - "$file" "$gate" "$advisory" <<'PY'
+import json,sys
+findings=[]
+if sys.argv[3]: findings=[{"component":sys.argv[3],"disposition":"advisory","severity":"low","title":"follow-up","explanation":"non-blocking follow-up","regression":False}]
+json.dump({"schema_version":1,"gate":sys.argv[2]+"-review","verdict":"PASS","checks":[{"name":"review","status":"pass"}],"findings":findings},open(sys.argv[1],"w"))
+PY
+  review_record "$pr" "$gate" "$file"
+}
 
 git -C "$TMP" worktree add -qb review-ledger-lane "$LANE"
 (cd "$LANE" && python3 "$LEDGER" open shared-pr >/dev/null)
@@ -34,6 +54,9 @@ eq "the [component: ...] wrapper and casing normalize to the same key" \
   "$(led record 1 --gate code-review --verdict FAIL --blocking '[component: SRC/auth/Session.ts:RefreshToken]' | field open_blocking)"
 eq "the same defect named twice accumulates a second strike" \
   "2" "$(led status 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["components"]["src/auth/session.ts:refreshtoken"]["strikes"])')"
+led open cap-test --max-rounds 1 >/dev/null
+led open cap-test --max-rounds 99 >/dev/null
+eq "worker CLI cannot raise a durable repair cap" "1" "$(led status cap-test | field max_rounds)"
 
 # --- round 1 has full blocking authority --------------------------------------
 led open 2 >/dev/null
@@ -93,16 +116,17 @@ led handoff 5 2>/dev/null | grep -q "Still blocking" && ok "handoff renders the 
 # --- the cap counts explicit repairs, not review passes ------------------------
 led open 9 --max-rounds 2 >/dev/null
 led record 9 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/null
-led record 9 --gate security-review --verdict PASS >/dev/null
-led record 9 --gate code-review --verdict PASS >/dev/null
+record_pass 9 security >/dev/null
+record_pass 9 code >/dev/null
 eq "review passes do not spend a repair cycle" "0" "$(led status 9 | field fix_cycles)"
 eq "three passes without a repair can still clear" "gates-clear" "$(led status 9 | field next_action)"
 
 # --- the clean path -----------------------------------------------------------
 led open 6 >/dev/null
-eq "a clean gate clears the loop" "gates-clear" "$(led record 6 --gate code-review --verdict PASS | field next_action)"
+eq "a clean gate clears the loop" "gates-clear" "$(record_pass 6 code | field next_action)"
+led open 11 >/dev/null
 eq "advisory-only findings do not fail a gate" \
-  "PASS" "$(led record 6 --gate code-review --verdict PASS --advisory 'src/x.ts:nit' | field effective_verdict)"
+  "PASS" "$(record_pass 11 code 'src/x.ts:nit' | field effective_verdict)"
 
 # --- structured reviewer results ---------------------------------------------
 led open 10 >/dev/null
@@ -110,7 +134,7 @@ cat > "$TMP/review.json" <<'JSON'
 {"schema_version":1,"gate":"code-review","verdict":"FAIL","checks":[{"name":"tests","status":"fail"}],"findings":[{"component":"src/a.ts:parse","disposition":"blocking","severity":"high","title":"Missing rejection","explanation":"Invalid input reaches parse and is accepted; reject it and add the regression assertion.","regression":true}]}
 JSON
 eq "structured results populate the durable ledger" \
-  "src/a.ts:parse" "$(led record 10 --gate code-review --result "$TMP/review.json" | field accepted_blocking)"
+  "src/a.ts:parse" "$(review_record 10 code "$TMP/review.json" | field accepted_blocking)"
 led handoff 10 | grep -q "Invalid input reaches parse" && ok "finding-only explanation survives handoff" || bad "finding-only explanation survives handoff"
 if led record 10 --gate code-review --result "$TMP/review.json" --verdict FAIL >/dev/null 2>&1; then
   bad "structured and manual review inputs must not be mixed"
@@ -148,17 +172,10 @@ HEAD_SHA="$(git -C "$TMP" rev-parse HEAD)"
 printf 'reviewed boundary\n' > "$TMP/design-BL-2.md"
 ARTIFACT_SHA="$(shasum -a 256 "$TMP/design-BL-2.md" | awk '{print $1}')"
 PERMIT="$(led permit-review BL-2 --ticket BL-2 --role design-reviewer --head "$HEAD_SHA" | python3 -c 'import json,sys; print(json.load(sys.stdin)["review_phase_permit"])')"
-python3 - "$ROOT/scripts" "$TMP" "$PERMIT" "$HEAD_SHA" <<'PY'
-import sys
-sys.path.insert(0, sys.argv[1])
-from pathlib import Path
-from review_permit import consume
-consume(shared_root=Path(sys.argv[2]), ledger_dir='.orchestration/.review-ledger', pr='BL-2',
-        token=sys.argv[3], ticket='BL-2', role='design-reviewer', head=sys.argv[4], timestamp='now')
-PY
 cat > "$TMP/design-pass.json" <<JSON
 {"schema_version":1,"gate":"design-review","verdict":"PASS","source_sha":"$HEAD_SHA","artifact":"design-BL-2.md","artifact_sha256":"$ARTIFACT_SHA","phase_permit":"$PERMIT","checks":[{"name":"trust-boundary","status":"pass"}]}
 JSON
+led complete-review BL-2 --ticket BL-2 --role design-reviewer --phase-permit "$PERMIT" --result "$TMP/design-pass.json" >/dev/null
 python3 - "$TMP/design-pass.json" "$TMP/design-short.json" <<'PY'
 import json, sys
 value=json.load(open(sys.argv[1])); value['source_sha']=value['source_sha'][:12]

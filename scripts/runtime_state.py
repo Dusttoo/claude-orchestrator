@@ -80,28 +80,60 @@ def migrate_legacy_runtime_dir(start: Path, relative: str | Path) -> Path:
     requested = Path(relative)
     if requested.is_absolute():
         raise RuntimeStateError("runtime state path must be repository-relative")
-    legacy = (working / requested).resolve()
     target = shared_runtime_path(working, requested)
-    if legacy == target or not legacy.exists():
-        return target
     with _migration_lock(shared):
-        if legacy.is_file():
-            if target.exists() and not filecmp.cmp(legacy, target, shallow=False):
-                raise RuntimeStateError(f"conflicting legacy runtime state: {legacy} and {target}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.exists():
-                shutil.copy2(legacy, target)
-            return target
-        for source in sorted(path for path in legacy.rglob("*") if path.is_file()):
-            destination = target / source.relative_to(legacy)
-            if destination.exists():
-                if not filecmp.cmp(source, destination, shallow=False):
-                    raise RuntimeStateError(
-                        f"conflicting legacy runtime state: {source} and {destination}"
-                    )
+        roots = [working]
+        try:
+            output = subprocess.run(
+                ["git", "-C", str(working), "worktree", "list", "--porcelain"],
+                check=True, capture_output=True, text=True,
+            ).stdout
+            roots = [
+                Path(line[9:]).resolve() for line in output.splitlines()
+                if line.startswith("worktree ")
+            ] or roots
+        except (OSError, subprocess.CalledProcessError):
+            pass
+        sources: list[tuple[Path, Path]] = []
+        for checkout in roots:
+            legacy = (checkout / requested).resolve()
+            if legacy == target or not legacy.exists():
                 continue
+            if legacy.is_file():
+                sources.append((legacy, target))
+            else:
+                sources.extend(
+                    (source, target / source.relative_to(legacy))
+                    for source in sorted(path for path in legacy.rglob("*") if path.is_file())
+                )
+        # Validate the entire migration before changing anything. This makes a
+        # dormant worktree conflict a fail-closed preflight condition.
+        pending: dict[Path, Path] = {}
+        for source, destination in sources:
+            prior = pending.get(destination)
+            if destination.exists() and not filecmp.cmp(source, destination, shallow=False):
+                raise RuntimeStateError(f"conflicting legacy runtime state: {source} and {destination}")
+            if prior and not filecmp.cmp(source, prior, shallow=False):
+                raise RuntimeStateError(f"conflicting legacy runtime state: {source} and {prior}")
+            pending[destination] = source
+        for destination, source in pending.items():
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
+            if not destination.exists():
+                shutil.copy2(source, destination)
+        # Identical legacy copies have been reconciled into the canonical
+        # domain. Remove only those exact files so they cannot diverge later.
+        for source, _ in sources:
+            source.unlink(missing_ok=True)
+        for checkout in roots:
+            legacy = (checkout / requested).resolve()
+            if legacy != target and legacy.is_dir():
+                for directory in sorted(
+                    (path for path in legacy.rglob("*") if path.is_dir()), reverse=True
+                ):
+                    with contextlib.suppress(OSError):
+                        directory.rmdir()
+                with contextlib.suppress(OSError):
+                    legacy.rmdir()
     return target
 
 

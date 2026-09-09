@@ -95,7 +95,9 @@ Steps:
      `review-ledger.py brief <pr>` into every reviewer brief, save the JSON under
      `.orchestration/.review-results/`, and record every completed gate with
      `review-ledger.py record <pr> --gate <gate> --result
-     .orchestration/.review-results/<gate>.json`. It normalizes each finding's
+     .orchestration/.review-results/<gate>.json --head <exact-sha>
+     --phase-permit <token>`. Native reviewers first atomically complete that
+     permit with `review-ledger.py complete-review`. It normalizes each finding's
      bare `<path>:<symbol>` component key, counts strikes across all gates and
      rounds, freezes blocking scope after round 1, and returns `next_action`.
    - `review` first generates one `repair-brief` after all gates record. Give its

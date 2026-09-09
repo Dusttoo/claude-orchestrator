@@ -70,8 +70,12 @@ must be reconciled and never duplicated.
    and advisory findings alike:
 
    ```bash
-   ${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py record <pr> --gate code-review \
+   ${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py complete-review <pr> --ticket <ticket> \
+     --role code-reviewer --phase-permit <token> \
      --result .orchestration/.review-results/code-review.json
+   ${CLAUDE_PLUGIN_ROOT}/scripts/review-ledger.py record <pr> --gate code-review \
+     --result .orchestration/.review-results/code-review.json --head <exact-sha> \
+     --phase-permit <token>
    ```
 
    The validated result carries blocking, advisory, severity, regression, and
