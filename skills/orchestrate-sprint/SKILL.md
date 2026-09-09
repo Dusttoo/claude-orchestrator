@@ -50,6 +50,12 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    `active`), and `concurrency_max >= 1`. If Jira access is unavailable, stop
    before launches and report the missing connection as user action.
 
+   Resolve `worker_trust_profile` once and keep it fixed for the sprint. It
+   governs only worker-versus-host guarantees; it never narrows application or
+   tenant security. A `cooperative-worker` sprint must not later be blocked on a
+   hypothetical malicious same-UID worker, while `isolated-worker` requires its
+   independently owned host boundary before any lane launches.
+
    Before each lane launch, resolve `sprint-worker` with
    `scripts/context_pipeline.py route --config .orchestration/config.yaml --role
    sprint-worker`. Desktop routes keep the native/CLI path. API routes use the

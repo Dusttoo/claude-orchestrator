@@ -14,7 +14,7 @@ Do not cut a branch on a ticket that is not Ready. Scope it, or push it back.
 
 ## Fill every section
 
-Work the ticket into these five sections. If you cannot fill one, that gap is
+Work the ticket into these six sections. If you cannot fill one, that gap is
 the thing to resolve before implementing.
 
 1. **Behavior.** What the system should do, in the user's terms, not the
@@ -38,6 +38,13 @@ the thing to resolve before implementing.
 
 5. **Out of Scope.** What this ticket explicitly does NOT do. This is what keeps
    the implementation from sprawling and what protects the next ticket's turf.
+
+6. **Implementation Boundary.** Name the repository/runtime boundary that can
+   enforce the requested behavior. Record any required root-owned installation,
+   distinct UID, daemon, container, cloud resource, migration, or operational
+   rollout. If one is required but not authorized in this ticket, split or defer
+   it; a repository-local approximation does not make the ticket Ready. For
+   orchestration host controls, record the configured `worker_trust_profile`.
 
 ## Required adversarial test matrix
 
@@ -65,7 +72,7 @@ After filling the sections, ask the one question that decides it:
 
 ## Output
 
-Produce the ticket rewritten into the five sections and the adversarial test
+Produce the ticket rewritten into the six sections and the adversarial test
 matrix, then state the verdict
 (Ready / Not Ready) and, if Not Ready, the exact gap that blocks it. If the
 repo's `rules_docs` define a ticket template or extra required fields (a

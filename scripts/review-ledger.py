@@ -482,7 +482,7 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
         "fix_cycles": fix_cycles,
         "fix_cycles_remaining": max(0, max_rounds - fix_cycles),
         "next_scope_mode": FULL if next_round == 1 else FROZEN,
-        "uncertainty_rule": "block-on-doubt"
+        "uncertainty_rule": "investigate-on-doubt"
         if fix_cycles == 0
         else "advisory-on-doubt",
         "open_blocking": blocking,
@@ -1210,8 +1210,11 @@ def cmd_brief(args: argparse.Namespace) -> None:
             "report it for the PR body, but it does not FAIL this gate.",
         ]
     doubt = (
-        "When unsure whether something is a real defect, treat it as BLOCKING."
-        if plan["uncertainty_rule"] == "block-on-doubt"
+        "Investigate uncertainty before the verdict. Block only with a concrete "
+        "failing input or precondition, production path, wrong outcome and impact, "
+        "plus a reproduction or exact falsifying assertion. If that evidence "
+        "remains incomplete, file it as ADVISORY and name what would settle it."
+        if plan["uncertainty_rule"] == "investigate-on-doubt"
         else (
             f"This is fix cycle {plan['fix_cycles'] + 1}. A false FAIL no longer costs one loop -- it costs\n"
             "the next one too. When unsure whether something is a real defect, file it as\n"

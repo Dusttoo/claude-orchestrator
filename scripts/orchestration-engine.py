@@ -369,6 +369,13 @@ def validate_config(cfg: dict[str, Any]) -> None:
     version = schema_version(cfg)
     if version not in SUPPORTED_SCHEMA_VERSIONS:
         raise EngineError(f"unsupported configuration schema_version '{version}'")
+    worker_trust_profile = str(
+        cfg.get("worker_trust_profile", "cooperative-worker")
+    )
+    if worker_trust_profile not in {"cooperative-worker", "isolated-worker"}:
+        raise EngineError(
+            "worker_trust_profile must be cooperative-worker or isolated-worker"
+        )
     if version == "1":
         if not cfg.get("integration_branch"):
             raise EngineError("legacy config requires integration_branch")

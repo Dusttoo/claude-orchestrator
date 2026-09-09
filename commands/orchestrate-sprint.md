@@ -23,6 +23,12 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    `$ARGUMENTS` when supplied), and `concurrency_max >= 1`. Missing Jira access is
    a user action and no worker may launch.
 
+   Resolve `worker_trust_profile` once for the sprint. It applies only to the
+   orchestration worker-versus-host boundary and never weakens application or
+   tenant security. `isolated-worker` requires its independently owned host
+   boundary before launch; do not silently impose that boundary on a
+   `cooperative-worker` repository.
+
    Before each lane launch, resolve `sprint-worker` with
    `${CLAUDE_PLUGIN_ROOT}/scripts/context_pipeline.py route --config
    .orchestration/config.yaml --role sprint-worker`. Desktop routes keep the

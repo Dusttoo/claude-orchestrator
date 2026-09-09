@@ -57,6 +57,9 @@ completion receipt after successful provider output.
    configured gate or merge transition; branch roles, evidence, approvals, CI
    categories, and adapters come from that plan. For legacy configs, continue
    with the existing review gates below.
+   Keep the configured `worker_trust_profile` fixed for every reviewer. It
+   governs only worker-versus-host assumptions and never relaxes application,
+   tenant, client, ticket-input, or provider security.
 2. Open the durable review ledger and build this round's brief:
    `review-ledger.py open <pr>` then `review-ledger.py brief <pr>`. The
    failure ledger lives on disk, not in this conversation -- it survives
@@ -79,6 +82,10 @@ completion receipt after successful provider output.
    The reviewer must finish the full checklist, diff, and adversarial matrix even
    after finding a blocker, then return only concise structured review JSON.
    Explanations belong only to findings; each finding has a stable component key.
+   A blocker must name a concrete failing input/precondition, production path,
+   wrong outcome/impact, and reproduction or exact falsifying assertion under
+   the selected profile. Do not let a reviewer expand the PR into new host
+   infrastructure based only on a stronger, unconfigured threat model.
 4. Inspect the PR diff against `security_required_when` before launching the
    pair. If any trigger matches, run a fresh security-review pass using
    `orchestration-security-reviewer.md`

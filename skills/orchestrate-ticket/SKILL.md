@@ -1,6 +1,6 @@
 ---
 name: orchestrate-ticket
-description: Drive one ticket or change end-to-end through the full multi-agent orchestration pipeline (implement in an isolated worktree -> independent code review -> security review when warranted -> optional verification -> merge on green). Use when the user asks in natural language to "orchestrate" a ticket, "run it through the pipeline", "take it end to end", or otherwise wants the gated implement-review-merge flow rather than a plain one-off edit. This is the natural-language entry to the same flow as the Claude /orchestrate command and Codex orchestration skill. Do NOT trigger for an ordinary implementation request ("just fix this", "make this change") where the user did not ask for the full gated pipeline.
+description: Drive one ticket or change end-to-end through the full multi-agent orchestration pipeline (isolated implementation, independent code review, security review when warranted, optional verification, and merge on green). Use when the user asks in natural language to "orchestrate" a ticket, "run it through the pipeline", "take it end to end", or otherwise wants the gated implement-review-merge flow rather than a plain one-off edit. This is the natural-language entry to the same flow as the Claude /orchestrate command and Codex orchestration skill. Do NOT trigger for an ordinary implementation request ("just fix this", "make this change") where the user did not ask for the full gated pipeline.
 ---
 
 # Orchestrate a ticket end to end
@@ -99,6 +99,10 @@ working directory.
    scope it (see the `scope-ticket` skill) or push back BEFORE cutting a branch.
    With no tracker, treat the request as the spec.
 
+   Resolve `worker_trust_profile` now. It applies only to orchestration workers
+   versus the host; it never narrows the application threat model. Do not let a
+   later reviewer silently substitute a stronger profile.
+
 2. **Pre-implementation gates.** Before cutting a branch or editing production
    code, build an adversarial test matrix from the acceptance criteria and the
    existing system. Each row names the attack/failure mode, setup/input, expected
@@ -107,7 +111,13 @@ working directory.
    redirections and pipelines), ignored/untracked files, failed Git or other
    inspection commands, partial execution, cleanup/recovery, permissions,
    concurrency, retries, and hostile inputs; mark a category N/A only with a
-   reason. If the planned change touches security-sensitive infrastructure, run
+   reason. Perform an architecture-feasibility check before implementation:
+   name which repository or operating boundary can enforce every promised
+   invariant. If success requires a root-owned installation, distinct UID,
+   daemon, container, cloud resource, or rollout outside the authorized scope,
+   split or defer that work instead of approving an in-repository approximation.
+   If the planned change touches security-sensitive infrastructure or crosses
+   one of those external boundaries, run
    a fresh pre-code design review with `orchestration-design-reviewer.md`. Open
    its durable counter with `review-ledger.py design-open <ticket-or-change>` and
    record FAIL with `design-record --verdict FAIL --evidence <artifact>`. A PASS
@@ -139,6 +149,10 @@ working directory.
    regression check. On any structured FAIL result, require the reviewer to finish its
    full checklist and
    adversarial sweep and return all findings together.
+   A blocking finding must identify a concrete failing input/precondition,
+   production path, wrong outcome/impact, and reproduction or exact falsifying
+   assertion under the configured threat profile. Hypothetical stronger-profile
+   concerns are advisory and must not expand the ticket into infrastructure.
 
    The durable failure ledger owns this loop; do not track it in your own
    context, which compacts. Open it once (`review-ledger.py open <pr>`), paste
