@@ -1,9 +1,16 @@
 import hashlib
+import http.server
 import importlib.util
 import json
+import os
 from pathlib import Path
+import ssl
+import subprocess
 import tempfile
+import threading
 import unittest
+from unittest import mock
+from urllib.request import HTTPSHandler
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -118,14 +125,331 @@ class ProviderBatchAdapterTests(unittest.TestCase):
                 adapter.verify_request(marker)
 
     def test_cross_origin_redirect_is_rejected_without_second_request(self):
-        request = adapter.authenticated_request(
-            "anthropic", "https://api.anthropic.com/v1", "messages/batches", "secret"
-        )
-        handler = adapter.NoCredentialRedirect("https://api.anthropic.com")
-        with self.assertRaisesRegex(ValueError, "redirect"):
-            handler.redirect_request(
-                request, None, 302, "Found", {}, "https://evil.example/steal"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cert = root / "cert.pem"
+            key = root / "key.pem"
+            subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-keyout",
+                    str(key),
+                    "-out",
+                    str(cert),
+                    "-days",
+                    "1",
+                    "-subj",
+                    "/CN=localhost",
+                ],
+                check=True,
+                capture_output=True,
             )
+            stolen = []
+            source_seen = []
+
+            class Sink(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    stolen.append(self.headers.get("Authorization"))
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+
+                def log_message(self, *args):
+                    pass
+
+            sink = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Sink)
+            server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_context.load_cert_chain(str(cert), str(key))
+            sink.socket = server_context.wrap_socket(sink.socket, server_side=True)
+
+            class Redirect(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    source_seen.append(self.headers.get("Authorization"))
+                    self.send_response(302)
+                    self.send_header(
+                        "Location", f"https://127.0.0.1:{sink.server_port}/steal"
+                    )
+                    self.end_headers()
+
+                def log_message(self, *args):
+                    pass
+
+            source = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+            source.socket = server_context.wrap_socket(source.socket, server_side=True)
+            threads = [
+                threading.Thread(target=x.serve_forever, daemon=True)
+                for x in (sink, source)
+            ]
+            for thread in threads:
+                thread.start()
+            context = ssl._create_unverified_context()
+            opener = adapter.build_opener(
+                adapter.NoCredentialRedirect(f"https://127.0.0.1:{source.server_port}"),
+                HTTPSHandler(context=context),
+            )
+            transport = adapter.NetworkTransport(
+                "openai",
+                base=f"https://127.0.0.1:{source.server_port}/v1",
+                key="secret",
+                opener=opener,
+            )
+            try:
+                with self.assertRaisesRegex(ValueError, "redirect"):
+                    transport.request("batches/test")
+                self.assertEqual(source_seen, ["Bearer secret"])
+                self.assertEqual(stolen, [])
+            finally:
+                source.shutdown()
+                sink.shutdown()
+                source.server_close()
+                sink.server_close()
+
+    def test_caller_base_url_is_ignored_without_operator_policy(self):
+        with mock.patch.dict(
+            os.environ,
+            {"OPENAI_API_KEY": "secret", "OPENAI_BASE_URL": "https://evil.example/v1"},
+            clear=False,
+        ):
+            transport = adapter.NetworkTransport("openai")
+        self.assertEqual(transport.base, "https://api.openai.com/v1")
+
+    def test_operator_policy_maps_credential_name_to_gateway(self):
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            mock.patch.dict(os.environ, {"OPENAI_API_KEY": "secret"}, clear=False),
+        ):
+            policy = Path(temp) / "provider-origins.json"
+            policy.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "credentials": {"OPENAI_API_KEY": "https://gateway.example/v1"},
+                    }
+                )
+            )
+            transport = adapter.NetworkTransport("openai", policy_path=policy)
+        self.assertEqual(transport.base, "https://gateway.example/v1")
+        self.assertNotIn("secret", json.dumps(transport.policy_receipt))
+
+    def test_strict_provider_envelopes_bind_openai_batch(self):
+        rows = self.fixture("openai-batch-output.json")
+        for mutation, pattern in (
+            (lambda row: row.update(id="wrong"), "object"),
+            (lambda row: row.update(error={"code": "also_error"}), "exclusive"),
+            (
+                lambda row: row["response"]["body"].update(object="chat.completion"),
+                "response object",
+            ),
+            (
+                lambda row: row["response"]["body"]["usage"].update(input_tokens="13"),
+                "invalid input_tokens",
+            ),
+        ):
+            changed = json.loads(json.dumps(rows))
+            mutation(changed[0])
+            with (
+                self.subTest(pattern=pattern),
+                self.assertRaisesRegex(ValueError, pattern),
+            ):
+                adapter.normalize_results(
+                    "openai", changed, {"job-a"}, require_complete=True
+                )
+
+    def test_terminal_partial_rows_preserve_missing_as_ambiguous(self):
+        rows = adapter.normalize_results(
+            "openai",
+            self.fixture("openai-batch-output.json"),
+            {"job-a", "job-b"},
+            require_complete=False,
+        )
+        self.assertEqual([row["custom_id"] for row in rows], ["job-a"])
+
+    def test_cancelled_bundle_keeps_successes_and_marks_only_missing_ambiguous(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = root / "request.json"
+            request.write_text('{"requests":[]}\n')
+            acceptance = {"id": "msgbatch_01", "type": "message_batch"}
+            digest = adapter.canonical_sha256(acceptance)
+            raw = root / f"sha256-{digest}.json"
+            raw.write_text(json.dumps(acceptance))
+            receipt = {
+                "provider": "anthropic",
+                "provider_batch_id": "msgbatch_01",
+                "request_sha256": hashlib.sha256(request.read_bytes()).hexdigest(),
+                "raw": {"path": str(raw), "sha256": digest},
+            }
+            receipt["sha256"] = adapter.canonical_sha256(receipt)
+            marker = {
+                "schema_version": 2,
+                "batch_id": "local",
+                "provider": "anthropic",
+                "request_file": str(request),
+                "request_sha256": receipt["request_sha256"],
+                "provider_batch_id": "msgbatch_01",
+                "acceptance_receipt": receipt,
+                "jobs": [{"custom_id": "job-a"}, {"custom_id": "job-b"}],
+            }
+            status = self.fixture("anthropic-batch-ended.json")
+            bundle = adapter.acquire_terminal_bundle(
+                marker,
+                {
+                    "status": status,
+                    "result_pages": [[self.fixture("anthropic-batch-results.json")[0]]],
+                },
+                root,
+            )
+            self.assertEqual(bundle["status"], "ended")
+            self.assertEqual([x["custom_id"] for x in bundle["results"]], ["job-a"])
+            self.assertEqual(bundle["unresolved_job_ids"], ["job-b"])
+
+    def test_openai_cancelled_batch_acquires_all_available_terminal_rows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = root / "request.jsonl"
+            request.write_text("{}\n")
+            acceptance = {
+                "id": "batch_01",
+                "object": "batch",
+                "input_file_id": "file_in",
+                "endpoint": "/v1/responses",
+            }
+            digest = adapter.canonical_sha256(acceptance)
+            raw = root / f"sha256-{digest}.json"
+            raw.write_text(json.dumps(acceptance))
+            receipt = {
+                "provider": "openai",
+                "provider_batch_id": "batch_01",
+                "request_sha256": hashlib.sha256(request.read_bytes()).hexdigest(),
+                "raw": {"path": str(raw), "sha256": digest},
+            }
+            receipt["sha256"] = adapter.canonical_sha256(receipt)
+            marker = {
+                "schema_version": 2,
+                "batch_id": "local",
+                "provider": "openai",
+                "request_file": str(request),
+                "request_sha256": receipt["request_sha256"],
+                "input_file_id": "file_in",
+                "provider_batch_id": "batch_01",
+                "acceptance_receipt": receipt,
+                "jobs": [
+                    {"custom_id": "job-a"},
+                    {"custom_id": "job-b"},
+                    {"custom_id": "job-c"},
+                ],
+            }
+            status = {
+                **acceptance,
+                "status": "cancelled",
+                "output_file_id": "file_out",
+                "error_file_id": "file_error",
+            }
+            bundle = adapter.acquire_terminal_bundle(
+                marker,
+                {
+                    "status": status,
+                    "result_pages": [
+                        self.fixture("openai-batch-output.json"),
+                        self.fixture("openai-batch-errors.json"),
+                    ],
+                },
+                root,
+            )
+            self.assertEqual(
+                [row["custom_id"] for row in bundle["results"]], ["job-a", "job-b"]
+            )
+            self.assertEqual(bundle["unresolved_job_ids"], ["job-c"])
+
+    def test_openai_network_submission_carries_stable_idempotency_key(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        class Opener:
+            request = None
+
+            def open(self, request, timeout):
+                self.request = request
+                return Response()
+
+        opener = Opener()
+        transport = adapter.NetworkTransport(
+            "openai", base="https://api.openai.com/v1", key="secret", opener=opener
+        )
+        transport.request(
+            "batches", payload={}, method="POST", idempotency_key="batch-create-digest"
+        )
+        self.assertEqual(
+            opener.request.get_header("Idempotency-key"), "batch-create-digest"
+        )
+
+    def test_submission_lock_prevents_duplicate_provider_creation(self):
+        class CountingTransport(dict):
+            def __init__(self):
+                super().__init__(
+                    submit={
+                        "id": "msgbatch_01",
+                        "type": "message_batch",
+                        "processing_status": "in_progress",
+                    }
+                )
+                self.reads = 0
+
+            def __contains__(self, key):
+                if key == "submit":
+                    self.reads += 1
+                return super().__contains__(key)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = root / "request.json"
+            request.write_text('{"requests":[]}\n')
+            marker_path = root / "marker.json"
+            marker_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "batch_id": "local",
+                        "provider": "anthropic",
+                        "status": "pending_submission",
+                        "request_file": str(request),
+                        "request_sha256": hashlib.sha256(
+                            request.read_bytes()
+                        ).hexdigest(),
+                        "provider_batch_id": "",
+                        "jobs": [],
+                    }
+                )
+            )
+            transport = CountingTransport()
+            receipts = []
+            threads = [
+                threading.Thread(
+                    target=lambda: receipts.append(
+                        adapter.submit(marker_path, transport)
+                    )
+                )
+                for _ in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(len(receipts), 2)
+            self.assertEqual(receipts[0], receipts[1])
+            self.assertEqual(transport.reads, 1)
 
     def test_ambiguous_submission_is_fenced_and_not_retried(self):
         marker = {"status": "submitting", "provider_batch_id": ""}

@@ -209,8 +209,10 @@ Before launching, resolve the executable because non-interactive SSH shells may 
    creates the provider batch without exposing credentials or accepting a
    caller-supplied provider id. Reconcile only through `sprint-controller.py
    reconcile-batch --batch <local-id> --outcome completed|failed`. The adapter
-   downloads the complete terminal result/error set, freezes its digest, and
-   journals each `custom_id` application.
+   downloads every available terminal result/error file, freezes its digest,
+   and journals each `custom_id` application. It settles successful rows,
+   releases only provider-proven nonexecuted rows, and leaves missing or
+   ambiguous rows reserved for operator reconciliation.
    Caller-authored terminal JSON is never authoritative.
 
 6. **Checkpoint every outcome.** As workers finish, immediately call:

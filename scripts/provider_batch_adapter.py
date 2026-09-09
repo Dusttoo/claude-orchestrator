@@ -4,19 +4,26 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import socket
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.error import URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 TERMINAL = {"ended", "completed", "failed", "cancelled", "expired"}
+DEFAULT_BASES = {
+    "anthropic": "https://api.anthropic.com/v1",
+    "openai": "https://api.openai.com/v1",
+}
+KEY_NAMES = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -48,6 +55,19 @@ def write_json(path: Path, value: Any) -> None:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+@contextlib.contextmanager
+def marker_lock(marker_path: Path) -> Iterator[None]:
+    """Serialize provider submission through durable receipt persistence."""
+    lock_path = marker_path.with_suffix(marker_path.suffix + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def origin(url: str) -> str:
@@ -107,21 +127,69 @@ def authenticated_request(
     return Request(url, data=data, headers=headers, method=method)
 
 
+def provider_policy(
+    provider: str, policy_path: Path | None
+) -> tuple[str, dict[str, str]]:
+    if provider not in DEFAULT_BASES:
+        raise ValueError(f"unsupported batch provider: {provider}")
+    key_name = KEY_NAMES[provider]
+    base = DEFAULT_BASES[provider]
+    receipt = {"credential": key_name, "origin": origin(base), "source": "built-in"}
+    if policy_path is None or not policy_path.is_file():
+        return base, receipt
+    try:
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("provider origin policy is unreadable") from exc
+    credentials = policy.get("credentials") if isinstance(policy, dict) else None
+    if (
+        not isinstance(policy, dict)
+        or policy.get("schema_version") != 1
+        or not isinstance(credentials, dict)
+    ):
+        raise ValueError("provider origin policy has an unsupported schema")
+    if set(credentials) - set(KEY_NAMES.values()):
+        raise ValueError("provider origin policy names an unsupported credential")
+    configured = credentials.get(key_name)
+    if configured is not None:
+        if not isinstance(configured, str):
+            raise ValueError("provider origin policy value must be an HTTPS URL")
+        base = configured.rstrip("/")
+    return base, {
+        "credential": key_name,
+        "origin": origin(base),
+        "source": "operator-policy",
+        "policy_sha256": file_sha256(policy_path),
+    }
+
+
+def canonical_policy_path(path: Path) -> Path | None:
+    for parent in path.resolve().parents:
+        if parent.name == ".orchestration":
+            return parent / "provider-origins.json"
+    return None
+
+
 class NetworkTransport:
-    def __init__(self, provider: str):
+    def __init__(
+        self,
+        provider: str,
+        *,
+        policy_path: Path | None = None,
+        base: str | None = None,
+        key: str | None = None,
+        opener: Any | None = None,
+    ):
         self.provider = provider
-        env_prefix = provider.upper()
-        self.base = os.environ.get(
-            f"{env_prefix}_BASE_URL",
-            "https://api.anthropic.com/v1"
-            if provider == "anthropic"
-            else "https://api.openai.com/v1",
-        )
+        policy_base, self.policy_receipt = provider_policy(provider, policy_path)
+        # base/key/opener are an import-only test construction seam. The CLI has
+        # no corresponding arguments and always uses canonical policy.
+        self.base = base or policy_base
         self.approved_origin = origin(self.base)
-        self.key = os.environ.get(f"{env_prefix}_API_KEY", "")
+        self.key = key if key is not None else os.environ.get(KEY_NAMES[provider], "")
         if not self.key:
             raise ValueError(f"{provider} API key is required")
-        self.opener = build_opener(NoCredentialRedirect(self.approved_origin))
+        self.opener = opener or build_opener(NoCredentialRedirect(self.approved_origin))
 
     def request(
         self,
@@ -131,6 +199,7 @@ class NetworkTransport:
         raw: bytes | None = None,
         content_type: str | None = None,
         method: str | None = None,
+        idempotency_key: str | None = None,
     ) -> Any:
         data = raw
         if payload is not None:
@@ -145,6 +214,8 @@ class NetworkTransport:
             content_type=content_type,
             method=method or ("POST" if data is not None else "GET"),
         )
+        if idempotency_key:
+            request.add_header("Idempotency-Key", idempotency_key)
         with self.opener.open(request, timeout=30) as response:
             body = response.read()
         try:
@@ -204,9 +275,18 @@ def _test_response(transport: dict[str, Any], name: str) -> Any:
 
 
 def submit(
+    marker_path: Path, transport_override: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    with marker_lock(marker_path):
+        return _submit_locked(marker_path, transport_override)
+
+
+def _submit_locked(
     marker_path: Path, test_transport: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    if marker.get("schema_version") != 2:
+        raise ValueError("legacy batch marker requires controller inspection")
     request_path = verify_request(marker)
     if marker.get("provider_batch_id"):
         if marker.get("status") != "submitted":
@@ -214,7 +294,11 @@ def submit(
         return marker["acceptance_receipt"]
     assert_submission_retry_safe(marker)
     provider = str(marker["provider"])
-    transport = None if test_transport is not None else NetworkTransport(provider)
+    transport = (
+        None
+        if test_transport is not None
+        else NetworkTransport(provider, policy_path=canonical_policy_path(marker_path))
+    )
     raw_dir = marker_path.parent / "batch-raw"
     try:
         if provider == "openai" and not marker.get("input_file_id"):
@@ -225,13 +309,21 @@ def submit(
                 _test_response(test_transport, "upload")
                 if test_transport is not None
                 else transport.request(
-                    "files", raw=body, content_type=content_type, method="POST"
+                    "files",
+                    raw=body,
+                    content_type=content_type,
+                    method="POST",
+                    idempotency_key=f"batch-upload-{marker['request_sha256']}",
                 )
             )
             input_file_id = (
                 str(uploaded.get("id") or "") if isinstance(uploaded, dict) else ""
             )
-            if not input_file_id:
+            if (
+                not input_file_id
+                or uploaded.get("object") != "file"
+                or uploaded.get("purpose") != "batch"
+            ):
                 raise ValueError("OpenAI upload response has no file id")
             upload_ref = store_raw(raw_dir, uploaded)
             marker.update(
@@ -263,7 +355,12 @@ def submit(
             response = (
                 _test_response(test_transport, "submit")
                 if test_transport is not None
-                else transport.request("batches", payload=payload, method="POST")
+                else transport.request(
+                    "batches",
+                    payload=payload,
+                    method="POST",
+                    idempotency_key=f"batch-create-{marker['request_sha256']}",
+                )
             )
     except (TimeoutError, socket.timeout, URLError) as exc:
         marker["status"] = "submission_uncertain"
@@ -278,12 +375,31 @@ def submit(
         raise ValueError(
             "provider submission returned no batch id; reservations remain fenced"
         )
+    if provider == "anthropic" and response.get("type") != "message_batch":
+        marker["status"] = "submission_uncertain"
+        write_json(marker_path, marker)
+        raise ValueError("Anthropic submission returned the wrong object type")
+    if provider == "openai" and (
+        response.get("object") != "batch"
+        or response.get("input_file_id") != marker.get("input_file_id")
+        or response.get("endpoint") != "/v1/responses"
+    ):
+        marker["status"] = "submission_uncertain"
+        write_json(marker_path, marker)
+        raise ValueError(
+            "OpenAI submission did not bind object, endpoint, and input file"
+        )
     raw_ref = store_raw(raw_dir, response)
     receipt = {
         "provider": provider,
         "provider_batch_id": provider_id,
         "request_sha256": marker["request_sha256"],
         "raw": raw_ref,
+        "origin_policy": (
+            {"source": "in-process-test"}
+            if test_transport is not None
+            else transport.policy_receipt
+        ),
     }
     receipt["sha256"] = canonical_sha256(receipt)
     marker.update(
@@ -310,8 +426,19 @@ def _rows(page: Any) -> list[dict[str, Any]]:
     return rows
 
 
+def usage_int(usage: dict[str, Any], field: str, custom_id: str) -> int:
+    value = usage.get(field, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"usage for {custom_id} has invalid {field}")
+    return value
+
+
 def normalize_results(
-    provider: str, rows: list[dict[str, Any]], expected: set[str]
+    provider: str,
+    rows: list[dict[str, Any]],
+    expected: set[str],
+    *,
+    require_complete: bool = True,
 ) -> list[dict[str, Any]]:
     seen: set[str] = set()
     normalized = []
@@ -323,6 +450,10 @@ def normalize_results(
             raise ValueError(f"unknown provider result custom_id: {custom_id}")
         seen.add(custom_id)
         if provider == "anthropic":
+            if set(row) != {"custom_id", "result"}:
+                raise ValueError(
+                    f"result for {custom_id} has an invalid Anthropic object"
+                )
             result = row.get("result")
             if not isinstance(result, dict):
                 raise ValueError(f"result for {custom_id} has no terminal envelope")
@@ -337,13 +468,19 @@ def normalize_results(
                     raise ValueError(
                         f"successful result for {custom_id} lacks response id or usage"
                     )
+                if message.get("type") != "message":
+                    raise ValueError(
+                        f"successful result for {custom_id} has wrong message type"
+                    )
                 normalized_usage = {
-                    "input_tokens": int(usage.get("input_tokens", 0)),
-                    "cache_write_tokens": int(
-                        usage.get("cache_creation_input_tokens", 0)
+                    "input_tokens": usage_int(usage, "input_tokens", custom_id),
+                    "cache_write_tokens": usage_int(
+                        usage, "cache_creation_input_tokens", custom_id
                     ),
-                    "cache_read_tokens": int(usage.get("cache_read_input_tokens", 0)),
-                    "output_tokens": int(usage.get("output_tokens", 0)),
+                    "cache_read_tokens": usage_int(
+                        usage, "cache_read_input_tokens", custom_id
+                    ),
+                    "output_tokens": usage_int(usage, "output_tokens", custom_id),
                     "reasoning_tokens": 0,
                 }
                 item = {
@@ -357,12 +494,21 @@ def normalize_results(
                     "custom_id": custom_id,
                     "outcome": "failed",
                     "error": result.get("error") or {"type": result_type},
+                    "provider_proven_nonexecuted": True,
                 }
             else:
                 raise ValueError(f"result for {custom_id} is not terminal")
         elif provider == "openai":
+            if not str(row.get("id") or "").startswith("batch_req_"):
+                raise ValueError(
+                    f"result for {custom_id} has an invalid request object id"
+                )
             response = row.get("response")
             error = row.get("error")
+            if (response is None) == (error is None):
+                raise ValueError(
+                    f"result for {custom_id} must have mutually exclusive response/error"
+                )
             if isinstance(response, dict) and response.get("status_code") == 200:
                 body = response.get("body")
                 usage = body.get("usage") if isinstance(body, dict) else None
@@ -373,35 +519,66 @@ def normalize_results(
                     raise ValueError(
                         f"successful result for {custom_id} lacks nested response id or usage"
                     )
+                if body.get("object") != "response":
+                    raise ValueError(
+                        f"successful result for {custom_id} has wrong response object"
+                    )
+                if not str(response.get("request_id") or ""):
+                    raise ValueError(
+                        f"successful result for {custom_id} has no request id"
+                    )
                 input_details = usage.get("input_tokens_details") or {}
                 output_details = usage.get("output_tokens_details") or {}
+                if not isinstance(input_details, dict) or not isinstance(
+                    output_details, dict
+                ):
+                    raise ValueError(
+                        f"successful result for {custom_id} has invalid usage details"
+                    )
                 item = {
                     "custom_id": custom_id,
                     "outcome": "completed",
                     "response_id": response_id,
                     "usage": {
-                        "input_tokens": int(usage.get("input_tokens", 0)),
+                        "input_tokens": usage_int(usage, "input_tokens", custom_id),
                         "cache_write_tokens": 0,
-                        "cache_read_tokens": int(input_details.get("cached_tokens", 0)),
-                        "output_tokens": int(usage.get("output_tokens", 0)),
-                        "reasoning_tokens": int(
-                            output_details.get("reasoning_tokens", 0)
+                        "cache_read_tokens": usage_int(
+                            input_details, "cached_tokens", custom_id
+                        ),
+                        "output_tokens": usage_int(usage, "output_tokens", custom_id),
+                        "reasoning_tokens": usage_int(
+                            output_details, "reasoning_tokens", custom_id
                         ),
                     },
                 }
-            elif error is not None or isinstance(response, dict):
+            elif isinstance(error, dict) and str(error.get("code") or ""):
                 item = {
                     "custom_id": custom_id,
                     "outcome": "failed",
-                    "error": error or response,
+                    "error": error,
+                    "provider_proven_nonexecuted": True,
+                }
+            elif (
+                isinstance(response, dict)
+                and isinstance(response.get("status_code"), int)
+                and response.get("status_code") != 200
+                and str(response.get("request_id") or "")
+                and isinstance(response.get("body"), dict)
+            ):
+                item = {
+                    "custom_id": custom_id,
+                    "outcome": "ambiguous",
+                    "error": response,
                 }
             else:
-                raise ValueError(f"result for {custom_id} is not terminal")
+                raise ValueError(
+                    f"result for {custom_id} is not a valid terminal envelope"
+                )
         else:
             raise ValueError(f"unsupported batch provider: {provider}")
         normalized.append(item)
     missing = expected - seen
-    if missing:
+    if missing and require_complete:
         raise ValueError(
             "missing provider results for custom_ids: " + ", ".join(sorted(missing))
         )
@@ -442,7 +619,28 @@ def acquire_terminal_bundle(
         or str(acceptance_value.get("id") or "") != provider_id
     ):
         raise ValueError("acceptance receipt raw response is not content-addressed")
-    transport = None if test_transport is not None else NetworkTransport(provider)
+    if provider == "anthropic":
+        if acceptance_value.get("type") != "message_batch":
+            raise ValueError("Anthropic acceptance has wrong object type")
+    elif provider == "openai":
+        if (
+            acceptance_value.get("object") != "batch"
+            or acceptance_value.get("input_file_id") != marker.get("input_file_id")
+            or acceptance_value.get("endpoint") != "/v1/responses"
+        ):
+            raise ValueError(
+                "OpenAI acceptance does not bind object, endpoint, and input file"
+            )
+    else:
+        raise ValueError(f"unsupported batch provider: {provider}")
+    transport = (
+        None
+        if test_transport is not None
+        else NetworkTransport(
+            provider,
+            policy_path=canonical_policy_path(Path(str(marker["request_file"]))),
+        )
+    )
     if test_transport is not None:
         status_response = _test_response(test_transport, "status")
         result_pages = test_transport.get("result_pages", [])
@@ -458,12 +656,25 @@ def acquire_terminal_bundle(
         or str(status_response.get("id") or "") != provider_id
     ):
         raise ValueError("provider status does not match accepted batch id")
-    status = str(
-        status_response.get("processing_status") or status_response.get("status") or ""
-    )
-    if status not in TERMINAL:
+    if provider == "anthropic":
+        status = str(status_response.get("processing_status") or "")
+        if status_response.get("type") != "message_batch":
+            raise ValueError("Anthropic status has wrong object type")
+        terminal_statuses = {"ended"}
+    else:
+        status = str(status_response.get("status") or "")
+        if (
+            status_response.get("object") != "batch"
+            or status_response.get("input_file_id") != marker.get("input_file_id")
+            or status_response.get("endpoint") != "/v1/responses"
+        ):
+            raise ValueError(
+                "OpenAI status does not bind object, endpoint, and input file"
+            )
+        terminal_statuses = {"completed", "failed", "cancelled", "expired"}
+    if status not in terminal_statuses:
         raise ValueError("provider batch is not terminal; uncertainty remains reserved")
-    if test_transport is None and status in {"ended", "completed"}:
+    if test_transport is None:
         if provider == "anthropic":
             result_pages = [
                 transport.request(f"messages/batches/{provider_id}/results")
@@ -479,11 +690,8 @@ def acquire_terminal_bundle(
     ]
     expected = {str(item["custom_id"]) for item in marker.get("jobs", [])}
     rows = [row for page in result_pages for row in _rows(page)]
-    results = (
-        normalize_results(provider, rows, expected)
-        if status in {"ended", "completed"}
-        else []
-    )
+    results = normalize_results(provider, rows, expected, require_complete=False)
+    resolved = {str(item["custom_id"]) for item in results}
     usage = {
         key: sum(int(item.get("usage", {}).get(key, 0)) for item in results)
         for key in (
@@ -510,6 +718,7 @@ def acquire_terminal_bundle(
         "job_ids": sorted(expected),
         "raw_pages": raw_pages,
         "results": results,
+        "unresolved_job_ids": sorted(expected - resolved),
         "results_sha256": canonical_sha256(results),
         "usage": usage,
     }
@@ -531,23 +740,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("submit", "fetch"))
     parser.add_argument("--marker", required=True)
-    parser.add_argument("--test-transport", help=argparse.SUPPRESS)
     parser.add_argument("--output-dir")
     args = parser.parse_args()
     marker_path = Path(args.marker).resolve()
-    test_transport = (
-        json.loads(Path(args.test_transport).read_text())
-        if args.test_transport
-        else None
-    )
     if args.action == "submit":
-        print(json.dumps(submit(marker_path, test_transport), sort_keys=True))
+        print(json.dumps(submit(marker_path), sort_keys=True))
         return 0
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     output_dir = (
         Path(args.output_dir).resolve() if args.output_dir else marker_path.parent
     )
-    bundle = acquire_terminal_bundle(marker, test_transport, output_dir)
+    bundle = acquire_terminal_bundle(marker, None, output_dir)
     print(json.dumps(persist_bundle(bundle, output_dir), sort_keys=True))
     return 0
 
