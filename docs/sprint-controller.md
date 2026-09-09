@@ -16,7 +16,12 @@ same checkpoint. The host must pass arguments without shell interpolation.
 
 Plugin adapters own completeness at external boundaries. The Jira adapter
 performs authenticated requests restricted to its configured HTTPS origin,
-exhausts pagination, and stores content-addressed raw responses. Provider batch
+rejects cross-origin redirects before credentials can follow, exhausts parent,
+child, and external-dependency pagination, and stores only sanitized,
+content-addressed responses. Inventory templates carry query policy only; all
+scheduler metadata, including sprint identity and dependencies, is derived from
+those authenticated responses. `jira_sprint_field` names the REST field that
+contains the provider's sprint id/name (often a Jira Cloud custom field). Provider batch
 adapters perform authenticated terminal lookup and complete result download.
 The controller rejects caller-authored receipts, unknown dependencies, and
 duplicate keys rather than inventing those facts.

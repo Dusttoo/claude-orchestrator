@@ -58,53 +58,29 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    reuse the provisional reservation only when
    no provider/run id was created; uncertain API work remains reserved.
 
-2. **Query the complete sprint.** Resolve `ticket.jira_fields` with
+2. **Define the complete sprint queries.** Resolve `ticket.jira_fields` with
    `scripts/context_pipeline.py jira-fields`; when absent it defaults to
    `key,summary,description,status,priority,components,subtasks,issuelinks`.
-   Pass its `fields` value explicitly on every Jira issue/search request and run
-   responses through `context_pipeline.py sanitize-jira` before model injection,
-   dropping rendered fields, edit-meta, changelogs, render schemas, and avatar
-   links. Use the connected Jira capability or the
-   repository's configured ticket adapter. Query the configured project and
-   sprint, paginate until every issue is fetched, and retrieve the configured
-   dependency link types. A link is a dependency only when the current ticket
-   occupies its configured `blocked_side`; the issue on the opposite side is the
-   prerequisite. Fetch each ticket's priority when the project ranks its work.
-   Resolve `active` to one exact Jira sprint id. Fetch the current status of
-   every dependency outside the sprint. Do not infer a missing page, link
-   direction, or dependency status.
-   Independently query every issue whose parent is in the fetched sprint set.
-   Expand those results into inventory tickets and preserve the exact child
-   query and returned keys. This independent query is mandatory even when it
-   returns zero children; a parent's empty `subtasks` field is not proof of
-   completeness.
+   Supply one JQL query for the configured project/sprint and one independent
+   child query. The controller-owned adapter passes the compact fields plus
+   scheduler-required relation and configured `jira_sprint_field` fields, runs
+   `context_pipeline.py sanitize-jira`, exhausts pagination, derives exact
+   sprint identity, priority, and links, and fetches external dependency status.
+   Do not query or normalize Jira in the captain.
 
-3. **Create an inventory.** Write a temporary JSON file inside the configured
-   checkpoint directory with this exact shape:
+3. **Create a query template.** Write a temporary JSON file inside the configured
+   checkpoint directory with only this policy shape:
 
    ```json
    {
-     "project": "PROJ",
-     "sprint": {"id": "123", "name": "Sprint 12"},
      "source_query": "the exact Jira query used",
-     "subtask_source_query": "the exact independent parent/child query used",
-     "subtask_keys": ["PROJ-3"],
-     "tickets": [
-       {
-         "key": "PROJ-2",
-         "summary": "Ticket summary",
-         "status": "Ready",
-         "priority": 2,
-         "url": "https://jira.example/browse/PROJ-2",
-         "dependencies": ["PROJ-1"],
-         "subtasks": ["PROJ-3"]
-       }
-     ],
-     "dependency_status": {"OTHER-9": "Done"}
+     "subtask_source_query": "the exact independent parent/child query used"
    }
    ```
 
-   `dependencies` means prerequisites of that ticket, never tickets it blocks.
+   Caller-authored project, sprint, ticket, status, priority, relation, and
+   dependency values have no authority. Derived `dependencies` means
+   prerequisites of that ticket, never tickets it blocks.
    `priority` is optional per ticket: map the Jira priority to an integer where
    lower is more urgent (Jira's own ranking already does this, Highest = 1).
    The controller fills lanes in `(priority, key)` order, so ties break on key

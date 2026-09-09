@@ -36,9 +36,24 @@ import json,sys
 value=json.load(open(sys.argv[1])); parents=sorted(x["key"].upper() for x in value["tickets"])
 children=sorted(x.upper() for x in value["subtask_keys"])
 by_key={x["key"].upper():x for x in value["tickets"]}
-parent_issues=[{"key":key,"fields":{"subtasks":[{"key":x} for x in by_key[key].get("subtasks",[])]}} for key in parents]
-child_issues=[{"key":key,"fields":{"parent":{"key":by_key.get(key,{}).get("parent","")}}} for key in children]
-json.dump({"parents":[{"startAt":0,"total":len(parents),"isLast":True,"issues":parent_issues}],"children":[{"startAt":0,"total":len(children),"isLast":True,"issues":child_issues}]},open(sys.argv[2],"w"))
+sprint=value["sprint"]
+def fields(item):
+  links=[{"type":{"name":"Blocks"},"outwardIssue":{"key":dep}} for dep in item.get("dependencies",[])]
+  priority=item.get("priority")
+  return {"summary":item.get("summary",""),"status":{"name":item.get("status","")},
+    "priority":({"id":str(priority)} if priority is not None else None),"sprint":sprint,
+    "subtasks":[{"key":x} for x in item.get("subtasks",[])],"issuelinks":links,
+    **({"parent":{"key":item["parent"]}} if item.get("parent") else {})}
+parent_issues=[{"key":key,"fields":fields(by_key[key])} for key in parents]
+child_issues=[{"key":key,"fields":fields(by_key[key])} for key in children]
+external=sorted({dep for item in value["tickets"] for dep in item.get("dependencies",[]) if dep not in by_key})
+transport={"parents":[{"startAt":0,"total":len(parents),"isLast":True,"issues":parent_issues}],
+  "children":[{"startAt":0,"total":len(children),"isLast":True,"issues":child_issues}]}
+if external:
+  statuses=value.get("dependency_status",{})
+  transport["external"]=[{"startAt":0,"total":len(external),"isLast":True,
+    "issues":[{"key":key,"fields":{"status":{"name":statuses.get(key,"")}}} for key in external]}]
+json.dump(transport,open(sys.argv[2],"w"))
 PY
   python3 "$ROOT/scripts/jira_inventory_fetch.py" --inventory-template "$inventory" \
     --test-transport "$transport" --artifact "$artifact" --output "$inventory"
@@ -73,6 +88,16 @@ jira_receipt "$TMP/repo/inventory.json"
 
 cd "$TMP/repo" || exit 1
 run_ok "sync creates normalized durable checkpoint" "$CONTROLLER" sync --inventory inventory.json
+CHECKPOINT="$(find "$TMP/repo/.orchestration/.sprint-state" -name '42-*.json' -print -quit)"
+BEFORE_FAILED_FETCH="$(shasum -a 256 "$CHECKPOINT" | awk '{print $1}')"
+run_fail "production sync fails closed without Jira credentials" env -u JIRA_API_TOKEN -u JIRA_BASE_URL \
+  "$CONTROLLER" sync --inventory-template inventory.json
+AFTER_FAILED_FETCH="$(shasum -a 256 "$CHECKPOINT" | awk '{print $1}')"
+if [ "$BEFORE_FAILED_FETCH" = "$AFTER_FAILED_FETCH" ]; then
+  ok "failed provider inspection preserves the prior checkpoint"
+else
+  fail_case "failed provider inspection preserves the prior checkpoint"
+fi
 if env -u ORCHESTRATION_TEST_MODE "$CONTROLLER" sync --inventory inventory.json >/dev/null 2>&1; then
   fail_case "test transport cannot authorize production Jira sync"
 else

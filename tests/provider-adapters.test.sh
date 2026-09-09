@@ -11,7 +11,7 @@ cat > "$TMP/inventory.json" <<'JSON'
 {"project":"PROJ","sprint":{"id":"1","name":"one"},"source_query":"parents","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-1","status":"Ready","subtasks":[]},{"key":"PROJ-2","status":"Ready","subtasks":[]}]}
 JSON
 cat > "$TMP/jira-transport.json" <<'JSON'
-{"parents":[{"isLast":false,"nextPageToken":"page-2","issues":[{"key":"PROJ-1","fields":{"subtasks":[]}}]},{"isLast":true,"issues":[{"key":"PROJ-2","fields":{"subtasks":[]}}]}],"children":[{"isLast":true,"issues":[]}]}
+{"parents":[{"isLast":false,"nextPageToken":"page-2","issues":[{"key":"PROJ-1","fields":{"summary":"one","status":{"name":"Ready"},"priority":null,"sprint":{"id":"1","name":"one"},"subtasks":[],"issuelinks":[]}}]},{"isLast":true,"issues":[{"key":"PROJ-2","fields":{"summary":"two","status":{"name":"Ready"},"priority":null,"sprint":{"id":"1","name":"one"},"subtasks":[],"issuelinks":[]}}]}],"children":[{"isLast":true,"issues":[]}]}
 JSON
 if python3 "$ROOT/scripts/jira_inventory_fetch.py" --inventory-template "$TMP/inventory.json" --test-transport "$TMP/jira-transport.json" --artifact "$TMP/jira.json" --output "$TMP/output.json" \
   && python3 - "$TMP/jira.json" <<'PY'

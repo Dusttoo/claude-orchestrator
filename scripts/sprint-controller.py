@@ -406,7 +406,7 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
         raise SprintError(f"cannot read Jira fetch artifact: {exc}") from exc
     if (
         not isinstance(artifact, dict)
-        or artifact.get("schema_version") != 2
+        or artifact.get("schema_version") != 3
         or artifact.get("adapter") != "jira-rest-v3"
     ):
         raise SprintError("Jira fetch artifact identity is invalid")
@@ -432,17 +432,21 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
         if not re.fullmatch(r"https://[A-Za-z0-9.-]+(?::[0-9]+)?", approved):
             raise SprintError("Jira evidence has no approved HTTPS provider origin")
     queries = artifact.get("queries")
-    if not isinstance(queries, list) or len(queries) != 2:
+    if not isinstance(queries, list) or len(queries) not in {2, 3}:
         raise SprintError(
             "Jira fetch artifact requires parent and child query evidence"
         )
     by_kind = {item.get("kind"): item for item in queries if isinstance(item, dict)}
-    if set(by_kind) != {"parents", "children"}:
+    if not {"parents", "children"}.issubset(by_kind) or not set(by_kind).issubset(
+        {"parents", "children", "external"}
+    ):
         raise SprintError("Jira fetch artifact query kinds are invalid")
 
     def proven_keys(query: dict[str, Any], expected_jql: str) -> list[str]:
         if (
             query.get("jql") != expected_jql
+            or not isinstance(query.get("fields"), list)
+            or not query["fields"]
             or not isinstance(query.get("pages"), list)
             or not query["pages"]
         ):
@@ -506,6 +510,8 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
                 raise SprintError(
                     f"cannot read Jira raw response evidence: {exc}"
                 ) from exc
+            if not isinstance(raw_response, dict):
+                raise SprintError("Jira raw response evidence must be an object")
             raw_digest = hashlib.sha256(
                 json.dumps(raw_response, sort_keys=True, separators=(",", ":")).encode(
                     "utf-8"
@@ -516,6 +522,21 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
                 or raw_path.name != f"sha256-{raw_digest}.json"
             ):
                 raise SprintError("Jira raw response is not content-addressed")
+            allowed_top_level = {
+                "startAt",
+                "total",
+                "isLast",
+                "nextPageToken",
+                "issues",
+            }
+            if not set(raw_response).issubset(allowed_top_level) or any(
+                not set((issue.get("fields") or {})).issubset(set(query["fields"]))
+                for issue in raw_response.get("issues", [])
+                if isinstance(issue, dict)
+            ):
+                raise SprintError(
+                    "Jira raw evidence exceeds the explicitly requested field surface"
+                )
             if (
                 raw_response.get("startAt") != page["start_at"]
                 and "startAt" in raw_response
@@ -523,7 +544,10 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
                 str(raw_response.get("nextPageToken") or "") != page["cursor_out"]
                 or page["cursor_in"] != cursor
                 or raw_response.get("total") != page["total"]
-                or bool(raw_response.get("isLast", False)) != page["terminal"]
+                or (
+                    "isLast" in raw_response
+                    and bool(raw_response.get("isLast")) != page["terminal"]
+                )
                 or len(raw_response.get("issues", [])) != page["count"]
                 or [
                     str(item.get("key", "")).upper()
@@ -679,6 +703,45 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
         raise SprintError("inventory.dependency_status must be an object when present")
     for key, status in raw_external.items():
         external[normalize_key(key)] = str(status).strip()
+    expected_external = sorted(
+        {
+            dependency
+            for ticket in tickets.values()
+            for dependency in ticket["dependencies"]
+            if dependency not in tickets
+        }
+    )
+    external_query = by_kind.get("external")
+    if expected_external:
+        expected_jql = "key in (" + ",".join(expected_external) + ")"
+        if (
+            external_query is None
+            or proven_keys(external_query, expected_jql) != expected_external
+        ):
+            raise SprintError(
+                "Jira external dependency query does not bind every dependency"
+            )
+        proven_status: dict[str, str] = {}
+        for page in external_query["pages"]:
+            response = json.loads(
+                Path(str(page["raw_path"])).read_text(encoding="utf-8")
+            )
+            for issue in response.get("issues", []):
+                status_value = (issue.get("fields") or {}).get("status")
+                status = (
+                    status_value.get("name")
+                    if isinstance(status_value, dict)
+                    else status_value
+                )
+                proven_status[normalize_key(issue.get("key"))] = str(
+                    status or ""
+                ).strip()
+        if proven_status != external:
+            raise SprintError(
+                "Jira external dependency statuses disagree with provider evidence"
+            )
+    elif external_query is not None or external:
+        raise SprintError("Jira external dependency evidence is unexpected")
     return {
         "schema_version": SCHEMA_VERSION,
         "project": project,
@@ -871,6 +934,8 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                     str(artifact_path),
                     "--output",
                     str(inventory_path),
+                    "--config",
+                    str(cfg["config"]),
                 ],
                 cwd=cfg["shared_root"],
                 check=True,
