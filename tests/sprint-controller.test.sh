@@ -266,6 +266,8 @@ import json, sys
 from pathlib import Path
 for path in Path(sys.argv[1]).glob("*.json"):
     state = json.loads(path.read_text())
+    if not isinstance(state.get("tickets"), dict):
+        continue
     for ticket in state["tickets"].values():
         ticket.pop("priority", None)
     path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
