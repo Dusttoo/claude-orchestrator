@@ -11,14 +11,19 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import fcntl
 import hashlib
 import json
 import os
 import re
+import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +50,10 @@ DEFAULT_READY = ["ready", "to do", "open", "selected for development"]
 
 class SprintError(RuntimeError):
     pass
+
+
+class ProcessAbsent(SprintError):
+    """The OS conclusively reported that a process no longer exists."""
 
 
 def now() -> str:
@@ -307,6 +316,7 @@ def load(path: Path) -> dict[str, Any]:
         )
         ticket.setdefault("attach_capability", "")
         ticket.setdefault("attached_at", "")
+        ticket.setdefault("launch_evidence", {})
     return value
 
 
@@ -334,6 +344,18 @@ def write_json(path: Path, value: Any) -> None:
     finally:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
+
+
+def read_json(path: Path, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ProcessAbsent(f"{label} does not exist") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SprintError(f"cannot read {label}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise SprintError(f"{label} must contain a JSON object")
+    return value
 
 
 def write_jsonl(path: Path, values: list[dict[str, Any]]) -> None:
@@ -637,6 +659,7 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             "worker_identity": "",
             "attach_capability": "",
             "attached_at": "",
+            "launch_evidence": {},
             "history": [],
         }
     missing_subtasks = sorted(
@@ -980,6 +1003,7 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                         "worker_identity",
                         "attach_capability",
                         "attached_at",
+                        "launch_evidence",
                     ):
                         if field in previous:
                             fresh[field] = previous[field]
@@ -1225,8 +1249,13 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             )
         request = {"requests": requests}
         endpoint = "/v1/messages/batches" if provider == "anthropic" else "/v1/batches"
+        if provider == "anthropic":
+            write_json(request_path, request)
+        else:
+            write_jsonl(request_path, requests)
+        request_sha256 = hashlib.sha256(request_path.read_bytes()).hexdigest()
         marker = {
-            "schema_version": 1,
+            "schema_version": 2,
             "batch_id": batch_id,
             "sprint_id": state["sprint"]["id"],
             "provider": provider,
@@ -1235,15 +1264,12 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             else "pending_upload",
             "endpoint": endpoint,
             "request_file": str(request_path),
+            "request_sha256": request_sha256,
             "provider_batch_id": "",
             "jobs": marker_jobs,
             "created_at": now(),
             "updated_at": now(),
         }
-        if provider == "anthropic":
-            write_json(request_path, request)
-        else:
-            write_jsonl(request_path, requests)
         state.setdefault("batches", {})[batch_id] = marker
         save(path, state)
         write_json(marker_path, marker)
@@ -1259,67 +1285,226 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     )
 
 
-def reconcile_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
-    """Settle or release every reservation owned by one durable batch marker."""
-    marker_path = cfg["state_dir"] / f"batch-{args.batch}.state.json"
-    if not marker_path.is_file():
-        raise SprintError(f"batch marker not found: {marker_path}")
-    marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    if args.provider_evidence:
-        raise SprintError("caller-authored provider evidence is never authoritative")
-    if not marker.get("provider_batch_id"):
-        if not args.provider_batch_id:
-            raise SprintError(
-                "provider batch id is required before terminal reconciliation"
-            )
-        marker["provider_batch_id"] = args.provider_batch_id
-        marker["status"] = "submitted"
-        write_json(marker_path, marker)
-    elif (
-        args.provider_batch_id and args.provider_batch_id != marker["provider_batch_id"]
-    ):
-        raise SprintError("provider batch identity is immutable")
-    bundle_path = cfg["state_dir"] / f"batch-{args.batch}.terminal.json"
-    adapter = Path(__file__).with_name("provider_batch_fetch.py")
+def run_batch_adapter(
+    action: str,
+    marker_path: Path,
+    cfg: dict[str, Any],
+    *,
+    in_process_runner: Any | None = None,
+) -> dict[str, Any]:
+    if in_process_runner is not None:
+        value = in_process_runner(action, marker_path, cfg)
+        if not isinstance(value, dict):
+            raise SprintError("provider batch adapter returned an invalid receipt")
+        return value
+    adapter = Path(__file__).with_name("provider_batch_adapter.py")
     command = [
         sys.executable,
         str(adapter),
+        action,
         "--marker",
         str(marker_path),
-        "--bundle",
-        str(bundle_path),
     ]
-    if args.test_transport:
-        if not cfg["allow_test_evidence"]:
-            raise SprintError(
-                "test transport cannot authorize production reconciliation"
-            )
-        command.extend(["--test-transport", args.test_transport])
+    if action == "fetch":
+        command.extend(["--output-dir", str(cfg["state_dir"])])
     try:
-        subprocess.run(
+        result = subprocess.run(
             command, cwd=cfg["shared_root"], check=True, capture_output=True, text=True
         )
-        evidence = json.loads(bundle_path.read_text(encoding="utf-8"))
+        value = json.loads(result.stdout)
     except (OSError, json.JSONDecodeError, subprocess.CalledProcessError) as exc:
         raise SprintError(
-            "provider batch lookup did not produce authoritative terminal evidence; uncertainty remains reserved"
+            f"provider batch {action} did not produce authoritative adapter evidence; uncertainty remains reserved"
+        ) from exc
+    if not isinstance(value, dict):
+        raise SprintError("provider batch adapter returned an invalid receipt")
+    return value
+
+
+def load_batch_marker(marker_path: Path, *, migrate: bool = True) -> dict[str, Any]:
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SprintError("batch marker is unreadable") from exc
+    if marker.get("schema_version") == 1:
+        if not migrate:
+            return marker
+        legacy_digest = hashlib.sha256(
+            json.dumps(marker, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        marker.update(
+            {
+                "schema_version": 2,
+                "status": "legacy_uncertain",
+                "legacy_marker_sha256": legacy_digest,
+                "legacy_status": str(marker.get("status") or "unknown"),
+                "operator_recovery_required": True,
+                "updated_at": now(),
+            }
+        )
+        write_json(marker_path, marker)
+    if marker.get("schema_version") != 2:
+        raise SprintError("unsupported batch marker schema")
+    return marker
+
+
+def inspect_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    marker_path = cfg["state_dir"] / f"batch-{args.batch}.state.json"
+    if not marker_path.is_file():
+        raise SprintError(f"batch marker not found: {marker_path}")
+    with locked(marker_path):
+        marker = load_batch_marker(marker_path)
+        emit(
+            {
+                "batch_id": args.batch,
+                "status": marker.get("status"),
+                "provider_batch_id": marker.get("provider_batch_id") or "",
+                "reservations_fenced": marker.get("status")
+                in {"legacy_uncertain", "legacy_operator_action"},
+                "operator_recovery_required": bool(
+                    marker.get("operator_recovery_required")
+                ),
+            }
+        )
+
+
+def recover_legacy_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    marker_path = cfg["state_dir"] / f"batch-{args.batch}.state.json"
+    if not args.reason.strip():
+        raise SprintError("legacy batch recovery requires an operator reason")
+    with locked(marker_path):
+        marker = load_batch_marker(marker_path)
+        if marker.get("status") != "legacy_uncertain":
+            raise SprintError("batch is not awaiting legacy operator recovery")
+        marker.update(
+            {
+                "status": "legacy_operator_action",
+                "operator_recovery_required": False,
+                "operator_reason": args.reason.strip(),
+                "reservations_released": False,
+                "updated_at": now(),
+            }
+        )
+        write_json(marker_path, marker)
+    emit(
+        {
+            "batch_id": args.batch,
+            "status": "legacy_operator_action",
+            "reservations_fenced": True,
+        }
+    )
+
+
+def submit_batch(
+    args: argparse.Namespace, cfg: dict[str, Any], in_process_runner: Any | None = None
+) -> None:
+    """Submit a prepared request through the credential-owning provider adapter."""
+    marker_path = cfg["state_dir"] / f"batch-{args.batch}.state.json"
+    if not marker_path.is_file():
+        raise SprintError(f"batch marker not found: {marker_path}")
+    marker = load_batch_marker(marker_path)
+    if marker.get("status") in {"legacy_uncertain", "legacy_operator_action"}:
+        raise SprintError(
+            "legacy batch is fenced; run inspect-batch for operator recovery"
+        )
+    receipt = run_batch_adapter(
+        "submit", marker_path, cfg, in_process_runner=in_process_runner
+    )
+    marker = load_batch_marker(marker_path)
+    if (
+        marker.get("status") != "submitted"
+        or receipt.get("provider_batch_id") != marker.get("provider_batch_id")
+        or receipt.get("request_sha256") != marker.get("request_sha256")
+        or receipt.get("sha256")
+        != hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in receipt.items() if key != "sha256"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    ):
+        raise SprintError("provider adapter acceptance receipt is invalid")
+    emit(
+        {
+            "batch_id": args.batch,
+            "provider_batch_id": marker["provider_batch_id"],
+            "status": "submitted",
+        }
+    )
+
+
+def reconcile_batch(
+    args: argparse.Namespace, cfg: dict[str, Any], in_process_runner: Any | None = None
+) -> None:
+    marker_path = cfg["state_dir"] / f"batch-{args.batch}.state.json"
+    with locked(marker_path):
+        _reconcile_batch_locked(args, cfg, in_process_runner)
+
+
+def _reconcile_batch_locked(
+    args: argparse.Namespace, cfg: dict[str, Any], in_process_runner: Any | None = None
+) -> None:
+    """Apply one immutable adapter-owned terminal bundle exactly once per job."""
+    marker_path = cfg["state_dir"] / f"batch-{args.batch}.state.json"
+    if not marker_path.is_file():
+        raise SprintError(f"batch marker not found: {marker_path}")
+    marker = load_batch_marker(marker_path)
+    if args.provider_evidence or args.results or args.provider_batch_id:
+        raise SprintError(
+            "caller-authored provider identity, evidence, and results are never authoritative"
+        )
+    if marker.get("status") not in {
+        "submitted",
+        "reconciling",
+        "completed",
+        "failed",
+        "completed_with_failures",
+        "completed_with_uncertainty",
+    }:
+        raise SprintError("batch has no certain adapter-owned provider submission")
+    bundle_ref = marker.get("terminal_bundle")
+    if bundle_ref:
+        bundle_path = Path(str(bundle_ref.get("path") or "")).resolve()
+    else:
+        bundle_ref = run_batch_adapter(
+            "fetch", marker_path, cfg, in_process_runner=in_process_runner
+        )
+        bundle_path = Path(str(bundle_ref.get("path") or "")).resolve()
+    if (
+        bundle_path != cfg["shared_root"]
+        and cfg["shared_root"] not in bundle_path.parents
+    ):
+        raise SprintError("provider terminal bundle escapes the shared repository")
+    try:
+        evidence = json.loads(bundle_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SprintError(
+            "provider terminal bundle is unreadable; reservations remain fenced"
         ) from exc
     evidence_digest = hashlib.sha256(
-        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+    if (
+        bundle_ref.get("sha256") != evidence_digest
+        or bundle_path.name
+        != f"batch-{args.batch}.terminal.sha256-{evidence_digest}.json"
+    ):
+        raise SprintError(
+            "provider terminal bundle is not immutable and content-addressed"
+        )
     expected_jobs = sorted(str(item["custom_id"]) for item in marker.get("jobs", []))
     if (
         not isinstance(evidence, dict)
-        or evidence.get("schema_version") != 1
+        or evidence.get("schema_version") != 2
         or evidence.get("adapter") != f"{marker.get('provider')}-batch"
-        or evidence.get("authority")
-        not in (
-            {"provider-network", "test-only"}
-            if cfg["allow_test_evidence"]
-            else {"provider-network"}
-        )
+        or evidence.get("authority") != "provider-network"
         or evidence.get("batch_id") != marker.get("batch_id")
-        or not str(evidence.get("provider_batch_id") or "").strip()
+        or evidence.get("provider_batch_id") != marker.get("provider_batch_id")
+        or evidence.get("request_sha256") != marker.get("request_sha256")
+        or evidence.get("acceptance_receipt_sha256")
+        != marker.get("acceptance_receipt", {}).get("sha256")
+        or evidence.get("acceptance_receipt") != marker.get("acceptance_receipt")
         or sorted(evidence.get("job_ids") or []) != expected_jobs
     ):
         raise SprintError(
@@ -1330,7 +1515,12 @@ def reconcile_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         str(evidence.get("approved_origin") or ""),
     ):
         raise SprintError("provider batch evidence has no approved HTTPS origin")
-    for raw_ref in evidence.get("raw", []):
+    raw_refs = [evidence.get("acceptance_receipt", {}).get("raw")] + list(
+        evidence.get("raw_pages", [])
+    )
+    for raw_ref in raw_refs:
+        if not isinstance(raw_ref, dict):
+            raise SprintError("provider evidence has an invalid raw page reference")
         raw_path = Path(str(raw_ref.get("path") or "")).resolve()
         if (
             raw_path != cfg["shared_root"]
@@ -1346,123 +1536,126 @@ def reconcile_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             or raw_path.name != f"sha256-{raw_digest}.json"
         ):
             raise SprintError("provider raw evidence is not content-addressed")
-    terminal = {
-        "completed": {"completed", "ended"},
-        "failed": {"failed", "cancelled", "expired"},
-    }[args.outcome]
-    if evidence.get("status") not in terminal:
-        raise SprintError(
-            f"provider status {evidence.get('status')!r} is not terminal for {args.outcome}"
-        )
-    final_status = "completed" if args.outcome == "completed" else "failed"
-    if marker.get("status") == final_status:
-        if marker.get("provider_evidence_sha256") != evidence_digest:
-            raise SprintError("completed batch reconciliation evidence is immutable")
-        emit({"batch_id": args.batch, "status": final_status})
-        return
-    if marker.get("status") not in {
-        "pending_submission",
-        "pending_upload",
-        "submitted",
-        "reconciling_completed",
-        "reconciling_failed",
+    if evidence.get("status") not in {
+        "completed",
+        "ended",
+        "failed",
+        "cancelled",
+        "expired",
     }:
-        raise SprintError("batch is not awaiting reconciliation")
-    expected_reconciling = f"reconciling_{args.outcome}"
+        raise SprintError("provider status is not terminal")
+    if marker.get("status") in {
+        "completed",
+        "failed",
+        "completed_with_failures",
+        "completed_with_uncertainty",
+    }:
+        if marker.get("terminal_bundle", {}).get("sha256") != evidence_digest:
+            raise SprintError("completed batch reconciliation evidence is immutable")
+        emit({"batch_id": args.batch, "status": marker["status"]})
+        return
+    usage_ledger = UsageLedger(cfg["shared_root"])
+    rows = evidence.get("results")
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise SprintError("batch results require a normalized jobs array")
+    results_by_custom = {str(row.get("custom_id")): row for row in rows}
+    unresolved = set(evidence.get("unresolved_job_ids") or [])
     if (
-        str(marker.get("status")).startswith("reconciling_")
-        and marker.get("status") != expected_reconciling
+        len(results_by_custom) != len(rows)
+        or set(results_by_custom) & unresolved
+        or set(results_by_custom) | unresolved != set(expected_jobs)
     ):
-        raise SprintError("batch is already reconciling a different terminal outcome")
-    if marker.get("provider_evidence_sha256") not in {None, "", evidence_digest}:
-        raise SprintError("batch terminal evidence changed during reconciliation")
+        raise SprintError(
+            "batch results and unresolved jobs must partition reservations"
+        )
+    if (
+        evidence.get("results_sha256")
+        != hashlib.sha256(
+            json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    ):
+        raise SprintError("normalized provider results digest is invalid")
+    config = load_yaml(cfg["config"])
+    reservation_events = {
+        str(event.get("reservation_id")): event
+        for event in usage_ledger._events()
+        if event.get("kind") == "reservation"
+    }
+    journal = marker.setdefault("application_journal", {})
+    # Freeze the accepted bundle, normalized results, and every per-job intent
+    # before the first ledger settlement or requeue can occur.
     marker.update(
         {
-            "status": expected_reconciling,
-            "provider_batch_id": evidence["provider_batch_id"],
+            "status": "reconciling",
+            "terminal_bundle": bundle_ref,
             "provider_terminal_status": evidence["status"],
-            "provider_evidence_sha256": evidence_digest,
+            "results_sha256": evidence.get("results_sha256"),
             "updated_at": now(),
         }
     )
-    write_json(marker_path, marker)
-    usage_ledger = UsageLedger(cfg["shared_root"])
-    results: dict[str, dict[str, Any]] = {}
-    if args.outcome == "completed":
-        rows = evidence.get("results")
-        if not isinstance(rows, list):
-            raise SprintError("batch results require a jobs array")
-        by_custom = {item["custom_id"]: item["ticket"] for item in marker["jobs"]}
-        results = {
-            by_custom[str(row.get("custom_id"))]: row
-            for row in rows
-            if isinstance(row, dict) and str(row.get("custom_id")) in by_custom
-        }
-        if set(results) != {item["ticket"] for item in marker["jobs"]}:
-            raise SprintError(
-                "batch results must cover every reserved ticket exactly once"
-            )
-    config = load_yaml(cfg["config"])
-    settlements: dict[str, tuple[dict[str, int], str, str]] = {}
-    if args.outcome == "completed":
-        reservation_events = {
-            str(event.get("reservation_id")): event
-            for event in usage_ledger._events()
-            if event.get("kind") == "reservation"
-        }
-        for item in marker["jobs"]:
-            row = results[item["ticket"]]
-            raw_usage = row.get("usage")
-            if not isinstance(raw_usage, dict):
-                raise SprintError(f"batch result for {item['ticket']} requires usage")
-            normalized = {
-                key: int(raw_usage.get(key, 0))
-                for key in (
-                    "input_tokens",
-                    "cache_write_tokens",
-                    "cache_read_tokens",
-                    "output_tokens",
-                )
-            }
-            normalized["reasoning_tokens"] = int(raw_usage.get("reasoning_tokens", 0))
-            response_id = str(row.get("response_id") or "")
-            event = reservation_events.get(str(item["reservation_id"]))
-            if sum(normalized.values()) <= 0 or not response_id or not event:
-                raise SprintError(
-                    f"batch result for {item['ticket']} requires an open reservation, response_id, and nonzero usage"
-                )
-            settlements[item["ticket"]] = (normalized, response_id, str(event["model"]))
-    journal = marker.setdefault("application_journal", {})
     for item in marker["jobs"]:
-        if journal.get(item["custom_id"]) == args.outcome:
-            continue
-        if args.outcome == "failed":
+        row = results_by_custom.get(item["custom_id"], {})
+        job_outcome = str(row.get("outcome") or "ambiguous")
+        result_digest = hashlib.sha256(
+            json.dumps(row, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        prior = journal.get(item["custom_id"])
+        intent = {
+            "outcome": job_outcome,
+            "result_sha256": result_digest,
+            "ledger_applied": job_outcome == "ambiguous",
+            "state_applied": job_outcome in {"completed", "ambiguous"},
+        }
+        if prior and (
+            prior.get("outcome") != job_outcome
+            or prior.get("result_sha256") != result_digest
+        ):
+            raise SprintError("frozen per-job reconciliation intent changed")
+        journal.setdefault(item["custom_id"], intent)
+    write_json(marker_path, marker)
+    for item in marker["jobs"]:
+        entry = journal[item["custom_id"]]
+        row = results_by_custom.get(item["custom_id"], {})
+        if not entry["ledger_applied"] and entry["outcome"] == "failed":
+            if row.get("provider_proven_nonexecuted") is not True:
+                raise SprintError("failed provider row is not proven nonexecuted")
             usage_ledger.release(
                 item["reservation_id"], item["run_id"], "provider batch failed"
             )
-            journal[item["custom_id"]] = args.outcome
+            entry["ledger_applied"] = True
             write_json(marker_path, marker)
-            continue
-        normalized, response_id, model = settlements[item["ticket"]]
-        usage_ledger.settle(
-            item["reservation_id"],
-            run_id=item["run_id"],
-            ticket=item["ticket"],
-            sprint=str(marker["sprint_id"]),
-            provider=str(marker["provider"]),
-            model=str(model),
-            response_id=response_id,
-            usage=normalized,
-            cost=Pricing.from_config(config, str(model)).actual_cost(normalized),
-            role="sprint-worker",
-        )
-        journal[item["custom_id"]] = args.outcome
-        write_json(marker_path, marker)
-    if args.outcome == "failed":
-        checkpoint = state_path(cfg["state_dir"], str(marker["sprint_id"]))
-        with locked(checkpoint):
-            state = load(checkpoint)
-            for item in marker["jobs"]:
+        elif not entry["ledger_applied"]:
+            usage = row.get("usage")
+            response_id = str(row.get("response_id") or "")
+            event = reservation_events.get(str(item["reservation_id"]))
+            if (
+                not isinstance(usage, dict)
+                or sum(int(x) for x in usage.values()) <= 0
+                or not response_id
+                or not event
+            ):
+                raise SprintError(
+                    f"batch result for {item['ticket']} requires reservation, response id, and usage"
+                )
+            model = str(event["model"])
+            usage_ledger.settle(
+                item["reservation_id"],
+                run_id=item["run_id"],
+                ticket=item["ticket"],
+                sprint=str(marker["sprint_id"]),
+                provider=str(marker["provider"]),
+                model=model,
+                response_id=response_id,
+                usage=usage,
+                cost=Pricing.from_config(config, model).actual_cost(usage),
+                role="sprint-worker",
+            )
+            entry["ledger_applied"] = True
+            write_json(marker_path, marker)
+        if not entry["state_applied"]:
+            checkpoint = state_path(cfg["state_dir"], str(marker["sprint_id"]))
+            with locked(checkpoint):
+                state = load(checkpoint)
                 ticket = state["tickets"].get(item["ticket"])
                 if (
                     ticket
@@ -1481,8 +1674,19 @@ def reconcile_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                     ticket["history"].append(
                         {"at": now(), "event": "batch-failed-requeued"}
                     )
-            save(checkpoint, state)
-    marker["status"] = final_status
+                save(checkpoint, state)
+            entry["state_applied"] = True
+            write_json(marker_path, marker)
+    outcomes = {entry["outcome"] for entry in journal.values()}
+    marker["status"] = (
+        "completed_with_uncertainty"
+        if "ambiguous" in outcomes
+        else "failed"
+        if outcomes == {"failed"}
+        else "completed"
+        if outcomes == {"completed"}
+        else "completed_with_failures"
+    )
     marker["updated_at"] = now()
     write_json(marker_path, marker)
     emit({"batch_id": args.batch, "status": marker["status"]})
@@ -1541,6 +1745,7 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["worker_identity"] = ""
         ticket["attach_capability"] = "attachcap_" + uuid.uuid4().hex
         ticket["attached_at"] = ""
+        ticket["launch_evidence"] = {}
         event = {"at": now(), "event": "reserved", "run_ref": args.run_ref}
         ticket["history"].append(event)
         save(path, state)
@@ -1565,11 +1770,190 @@ def require_attempt(ticket: dict[str, Any], supplied: str) -> None:
         )
 
 
-def attach(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+def _repository_path(root: Path, raw: str, *, label: str) -> Path:
+    path = Path(raw)
+    resolved = (path if path.is_absolute() else root / path).resolve()
+    try:
+        resolved.relative_to(root.resolve())
+    except ValueError as exc:
+        raise SprintError(f"{label} must stay inside the shared repository") from exc
+    return resolved
+
+
+def linux_systemd_scope_available() -> bool:
+    if (
+        not sys.platform.startswith("linux")
+        or not Path("/sys/fs/cgroup/cgroup.controllers").is_file()
+    ):
+        return False
+    if not shutil.which("systemd-run") or not shutil.which("systemctl"):
+        return False
+    if os.environ.get("ORCHESTRATION_TEST_MODE") == "1":
+        return False
+    try:
+        check = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return check.returncode == 0
+
+
+def wait_for_runtime_record(
+    path: Path, process: subprocess.Popen[Any], label: str
+) -> dict[str, Any]:
+    deadline = time.monotonic() + 10
+    last: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        if path.is_file():
+            last = read_json(path, label=label)
+            if label == "supervisor readiness" or last.get("phase") in {
+                "launched",
+                "terminal",
+            }:
+                return last
+        if process.poll() is not None:
+            break
+        time.sleep(0.02)
+    detail = f" (exit {process.returncode})" if process.poll() is not None else ""
+    raise SprintError(f"controller timed out waiting for {label}{detail}")
+
+
+def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
+    """Internal shim: establish identity before spawn and retain a tombstone."""
+    command = list(args.command)
+    if command and command[0] == "--":
+        command.pop(0)
+    if not command:
+        raise SprintError("supervisor requires a worker command")
+    ready_path, ack_path = Path(args.ready), Path(args.ack)
+    tombstone_path, output_path = Path(args.tombstone), Path(args.output)
+    identity = process_identity(str(os.getpid()))
+    identity["invocation_id"] = args.invocation_id
+    write_json(ready_path, {"phase": "ready", "identity": identity})
+    deadline = time.monotonic() + 30
+    while not ack_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if not ack_path.exists():
+        terminal = {
+            "invocation_id": args.invocation_id,
+            "phase": "terminal",
+            "spawned": False,
+        }
+        write_json(tombstone_path, terminal)
+        write_json(ready_path, {**terminal, "identity": identity})
+        return
+    input_handle: Any = subprocess.DEVNULL
+    child: subprocess.Popen[Any] | None = None
+
+    def forward(signum: int, _frame: Any) -> None:
+        if child is not None and child.poll() is None:
+            child.send_signal(signum)
+
+    signal.signal(signal.SIGTERM, forward)
+    signal.signal(signal.SIGINT, forward)
+    try:
+        if args.stdin_file:
+            input_handle = Path(args.stdin_file).open("rb")
+        with output_path.open("ab") as output_handle:
+            child = subprocess.Popen(
+                command,
+                stdin=input_handle,
+                stdout=output_handle,
+                stderr=subprocess.STDOUT,
+            )
+            write_json(
+                ready_path,
+                {"phase": "launched", "identity": identity, "worker_pid": child.pid},
+            )
+            returncode = child.wait()
+    except (OSError, subprocess.SubprocessError) as exc:
+        terminal = {
+            "invocation_id": args.invocation_id,
+            "phase": "terminal",
+            "spawned": child is not None,
+            "error": str(exc),
+        }
+        write_json(tombstone_path, terminal)
+        write_json(
+            ready_path,
+            {**terminal, "identity": identity, "worker_pid": child.pid if child else 0},
+        )
+        return
+    finally:
+        if args.stdin_file and input_handle is not subprocess.DEVNULL:
+            input_handle.close()
+    terminal = {
+        "invocation_id": args.invocation_id,
+        "phase": "terminal",
+        "spawned": True,
+        "returncode": returncode,
+        "finished_at": now(),
+    }
+    write_json(tombstone_path, terminal)
+    write_json(
+        ready_path,
+        {**terminal, "identity": identity, "worker_pid": child.pid if child else 0},
+    )
+
+
+def execution_unit_status(identity: dict[str, Any]) -> str:
+    """Return live, absent, or unknown without collapsing inspection failure."""
+    tombstone_path = Path(str(identity.get("tombstone_path") or ""))
+    tombstone = None
+    if tombstone_path.is_file():
+        tombstone = read_json(tombstone_path, label="execution tombstone")
+        if tombstone.get("invocation_id") != identity.get("invocation_id"):
+            return "unknown"
+    containment = identity.get("containment")
+    if containment == "cgroup-v2-systemd-scope":
+        raw_cgroup = str(identity.get("cgroup") or "")
+        if not raw_cgroup.startswith("/") or ".." in Path(raw_cgroup).parts:
+            return "unknown"
+        cgroup = Path("/sys/fs/cgroup") / raw_cgroup.lstrip("/")
+        try:
+            if not cgroup.exists():
+                return "absent" if tombstone else "unknown"
+            populated = (cgroup / "cgroup.events").read_text(encoding="utf-8")
+        except (OSError, PermissionError):
+            return "unknown"
+        if re.search(r"^populated\s+1$", populated, re.MULTILINE):
+            return "live"
+        return "absent" if tombstone else "unknown"
+    try:
+        current = process_identity(str(identity.get("pid")))
+    except ProcessAbsent:
+        return "absent" if tombstone else "unknown"
+    except SprintError:
+        return "unknown"
+    if current.get("start_identity") != identity.get("start_identity"):
+        return "absent" if tombstone else "unknown"
+    return "live"
+
+
+def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    """Launch through a controller-owned execution unit and durable tombstone."""
     path = state_path(cfg["state_dir"], str(args.sprint))
     key = normalize_key(args.ticket)
-    if not args.run_ref.strip():
-        raise SprintError("run reference must not be empty")
+    command = list(args.command)
+    if command and command[0] == "--":
+        command.pop(0)
+    if not command:
+        raise SprintError("launch-local requires an executable and arguments after --")
+    output_path = _repository_path(
+        cfg["shared_root"], args.output, label="worker output"
+    )
+    input_path = (
+        _repository_path(cfg["shared_root"], args.stdin_file, label="worker input")
+        if args.stdin_file
+        else None
+    )
+    if input_path is not None and not input_path.is_file():
+        raise SprintError("worker input must be an existing repository file")
     with locked(path):
         state = load(path)
         ticket = state["tickets"].get(key)
@@ -1580,19 +1964,185 @@ def attach(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             not expected
             or args.attach_capability != expected
             or ticket.get("attached_at")
+            or ticket.get("launch_evidence")
         ):
             raise SprintError(
-                "attach capability is missing, stale, or already consumed"
+                "attach capability is missing, stale, or already used for a launch"
             )
-        ticket["run_ref"] = args.run_ref
-        ticket["worker_identity"] = args.run_ref
-        ticket["attached_at"] = now()
-        ticket["attach_capability"] = ""
+        invocation_id = uuid.uuid4().hex
+        runtime_prefix = cfg["state_dir"] / f"execution-{invocation_id}"
+        ready_path = runtime_prefix.with_suffix(".ready.json")
+        ack_path = runtime_prefix.with_suffix(".ack")
+        tombstone_path = runtime_prefix.with_suffix(".terminal.json")
+        evidence = {
+            "token": "launch_" + uuid.uuid4().hex,
+            "status": "launching",
+            "repository": str(cfg["shared_root"]),
+            "sprint": str(args.sprint),
+            "ticket": key,
+            "attempt": ticket["attempts"],
+            "attempt_token": ticket["attempt_token"],
+            "invocation_id": invocation_id,
+            "ready_path": str(ready_path),
+            "ack_path": str(ack_path),
+            "tombstone_path": str(tombstone_path),
+            "created_at": now(),
+        }
+        # Persist the launch intent first. A controller crash can then fence the
+        # lane for reconciliation instead of allowing a duplicate launch.
+        ticket["launch_evidence"] = evidence
+        save(path, state)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        supervisor = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "supervise-local",
+            "--invocation-id",
+            invocation_id,
+            "--ready",
+            str(ready_path),
+            "--ack",
+            str(ack_path),
+            "--tombstone",
+            str(tombstone_path),
+            "--output",
+            str(output_path),
+        ]
+        if input_path is not None:
+            supervisor.extend(["--stdin-file", str(input_path)])
+        supervisor.extend(["--", *command])
+        containment = "cooperative-session"
+        unit_name = ""
+        launch_command = supervisor
+        if linux_systemd_scope_available():
+            unit_name = f"orchestration-{invocation_id}.scope"
+            containment = "cgroup-v2-systemd-scope"
+            launch_command = [
+                "systemd-run",
+                "--user",
+                "--scope",
+                "--quiet",
+                f"--unit={unit_name}",
+                *supervisor,
+            ]
+        elif os.environ.get("ORCHESTRATION_TEST_MODE") == "1":
+            containment = "test-supervisor"
+        evidence["containment"] = containment
+        evidence["unit_name"] = unit_name
+        ticket["launch_evidence"] = evidence
+        save(path, state)
+        try:
+            worker = subprocess.Popen(
+                launch_command,
+                cwd=cfg["shared_root"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            evidence.update({"status": "launch-failed", "error": str(exc)})
+            ticket["launch_evidence"] = evidence
+            save(path, state)
+            raise SprintError(
+                f"controller could not launch local worker: {exc}"
+            ) from exc
+        ready = wait_for_runtime_record(ready_path, worker, "supervisor readiness")
+        identity = ready.get("identity")
+        if not isinstance(identity, dict):
+            worker.terminate()
+            raise SprintError("controller supervisor omitted its execution identity")
+        identity.update(
+            {
+                "kind": "execution_unit",
+                "invocation_id": invocation_id,
+                "containment": containment,
+                "unit_name": unit_name,
+                "tombstone_path": str(tombstone_path),
+            }
+        )
+        if containment == "cgroup-v2-systemd-scope" and unit_name not in str(
+            identity.get("cgroup") or ""
+        ):
+            worker.terminate()
+            raise SprintError("systemd launch did not enter its assigned cgroup scope")
+        evidence.update({"status": "launched", "identity": identity})
+        ticket["launch_evidence"] = evidence
         ticket["history"].append(
-            {"at": now(), "event": "attached", "run_ref": args.run_ref}
+            {"at": now(), "event": "worker-launched", "worker_identity": identity}
         )
         save(path, state)
-    emit({"ticket": key, "state": "running", "run_ref": args.run_ref})
+        ack_path.touch(exist_ok=False)
+        launched = wait_for_runtime_record(ready_path, worker, "worker launch")
+        worker_pid = launched.get("worker_pid") or identity["pid"]
+    emit(
+        {
+            "ticket": key,
+            "state": "running",
+            "launch_evidence": evidence["token"],
+            "worker_pid": worker_pid,
+            "run_ref": ticket["run_ref"],
+        }
+    )
+
+
+def attach(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    path = state_path(cfg["state_dir"], str(args.sprint))
+    key = normalize_key(args.ticket)
+    with locked(path):
+        state = load(path)
+        ticket = state["tickets"].get(key)
+        if not ticket or ticket["state"] != "running":
+            raise SprintError(f"ticket {key} is not running")
+        evidence = ticket.get("launch_evidence") or {}
+        expected = {
+            "repository": str(cfg["shared_root"]),
+            "sprint": str(args.sprint),
+            "ticket": key,
+            "attempt": ticket["attempts"],
+            "attempt_token": ticket["attempt_token"],
+        }
+        if (
+            not evidence
+            or args.launch_evidence != evidence.get("token")
+            or evidence.get("status") not in {"launching", "launched"}
+            or any(evidence.get(name) != value for name, value in expected.items())
+            or ticket.get("attached_at")
+        ):
+            raise SprintError(
+                "controller launch evidence is missing, stale, or belongs to another attempt"
+            )
+        identity = evidence.get("identity")
+        if not isinstance(identity, dict) and evidence.get("ready_path"):
+            ready = read_json(
+                Path(str(evidence["ready_path"])), label="supervisor readiness"
+            )
+            identity = ready.get("identity")
+        if not isinstance(identity, dict):
+            raise SprintError(
+                "controller launch evidence has no execution-unit identity"
+            )
+        identity.update(
+            {
+                "kind": "execution_unit",
+                "invocation_id": evidence.get("invocation_id", ""),
+                "containment": evidence.get("containment", "cooperative-session"),
+                "unit_name": evidence.get("unit_name", ""),
+                "tombstone_path": evidence.get("tombstone_path", ""),
+            }
+        )
+        unit_status = execution_unit_status(identity)
+        if unit_status == "unknown":
+            raise SprintError("controller cannot verify the launched execution unit")
+        ticket["worker_identity"] = identity
+        ticket["attached_at"] = now()
+        ticket["attach_capability"] = ""
+        ticket["launch_evidence"] = {}
+        ticket["history"].append(
+            {"at": now(), "event": "attached", "worker_identity": identity}
+        )
+        save(path, state)
+    emit({"ticket": key, "state": "running", "worker_identity": identity})
 
 
 def finish(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
@@ -1642,6 +2192,7 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["worker_identity"] = ""
         ticket["attach_capability"] = ""
         ticket["attached_at"] = ""
+        ticket["launch_evidence"] = {}
         ticket["history"].append(
             {"at": now(), "event": "requeued", "reason": args.reason.strip()}
         )
@@ -1681,25 +2232,184 @@ def recover_legacy(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
 def require_worker_stopped(
     ticket: dict[str, Any], operator_token: str, cfg: dict[str, Any]
 ) -> None:
-    """Use process liveness or consume a separately provisioned operator token."""
-    run_ref = str(ticket.get("worker_identity") or "")
-    match = re.fullmatch(r"(?:pid|workspace-lease-pid):(\d+)", run_ref)
-    if match:
-        try:
-            os.kill(int(match.group(1)), 0)
-        except ProcessLookupError:
+    """Prove the complete execution unit absent or use external authority."""
+    identity = ticket.get("worker_identity")
+    if isinstance(identity, dict) and identity.get("kind") == "execution_unit":
+        status = execution_unit_status(identity)
+        if status == "absent" and identity.get("containment") in {
+            "cgroup-v2-systemd-scope",
+            "test-supervisor",
+        }:
             return
-        except PermissionError:
-            pass
-    capability_path = cfg["shared_root"] / ".orchestration/operator-recovery.cap"
-    if not operator_token or not capability_path.is_file():
+    # Old process identities and cooperative sessions cannot prove that a
+    # descendant did not escape. They therefore require the host authority.
+    if not consume_operator_recovery(operator_token, ticket, cfg):
         raise SprintError(
-            "worker liveness is not mechanically verifiable; provide an out-of-band single-use operator capability"
+            "worker-unit absence is not mechanically verifiable; external operator recovery authority is unavailable or denied"
         )
-    expected = capability_path.read_text(encoding="utf-8").strip()
-    if not expected or operator_token != expected:
-        raise SprintError("operator recovery capability is invalid")
-    capability_path.unlink()
+
+
+def consume_operator_recovery(
+    operator_token: str, ticket: dict[str, Any], cfg: dict[str, Any]
+) -> bool:
+    """Ask a separately owned host helper to atomically consume a capability."""
+    if not operator_token:
+        return False
+    helper = Path("/usr/local/libexec/orchestration-recovery-authority")
+    if os.environ.get("ORCHESTRATION_TEST_MODE") == "1" and os.environ.get(
+        "ORCHESTRATION_TEST_RECOVERY_HELPER"
+    ):
+        helper = Path(os.environ["ORCHESTRATION_TEST_RECOVERY_HELPER"])
+    try:
+        st = helper.stat()
+    except OSError:
+        return False
+    if os.environ.get("ORCHESTRATION_TEST_MODE") != "1":
+        if (
+            st.st_uid == os.geteuid()
+            or st.st_mode & 0o022
+            or not st.st_mode & stat.S_ISUID
+            or not helper.is_file()
+        ):
+            return False
+    scope = json.dumps(
+        {
+            "repository": str(cfg["shared_root"]),
+            "ticket": ticket.get("key", ""),
+            "attempt": ticket.get("attempts", 0),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    try:
+        result = subprocess.run(
+            [str(helper), "consume", "--scope", scope],
+            input=operator_token + "\n",
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def process_identity(raw_pid: str) -> dict[str, Any]:
+    """Read a stable kernel process-start identity, distinguishing unknown from gone."""
+    try:
+        pid = int(str(raw_pid))
+    except ValueError as exc:
+        raise SprintError("worker PID must be a positive integer") from exc
+    if pid < 1:
+        raise SprintError("worker PID must be a positive integer")
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError as exc:
+        raise ProcessAbsent(f"worker PID {pid} does not exist") from exc
+    except PermissionError as exc:
+        raise SprintError(
+            f"permission denied while inspecting worker PID {pid}"
+        ) from exc
+    except OSError as exc:
+        raise SprintError(f"cannot inspect worker PID {pid}: {exc}") from exc
+
+    if sys.platform.startswith("linux"):
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            tail = raw[raw.rindex(")") + 2 :].split()
+            started = tail[19]
+        except FileNotFoundError as exc:
+            raise ProcessAbsent(f"worker PID {pid} exited during inspection") from exc
+        except (PermissionError, OSError, ValueError, IndexError) as exc:
+            raise SprintError(
+                f"cannot verify Linux start identity for PID {pid}"
+            ) from exc
+        try:
+            boot_id = (
+                Path("/proc/sys/kernel/random/boot_id")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+        except (PermissionError, OSError) as exc:
+            raise SprintError("cannot verify the Linux boot identity") from exc
+        try:
+            cgroup_lines = (
+                Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8").splitlines()
+            )
+            cgroup = next(
+                line.split(":", 2)[2] for line in cgroup_lines if line.startswith("0::")
+            )
+        except (OSError, StopIteration, IndexError) as exc:
+            raise SprintError(
+                f"cannot verify Linux cgroup identity for PID {pid}"
+            ) from exc
+        marker = f"linux:{boot_id}:{started}"
+    elif sys.platform == "darwin":
+
+        class ProcBsdInfo(ctypes.Structure):
+            _fields_ = [
+                ("flags", ctypes.c_uint32),
+                ("status", ctypes.c_uint32),
+                ("xstatus", ctypes.c_uint32),
+                ("pid", ctypes.c_uint32),
+                ("ppid", ctypes.c_uint32),
+                ("uid", ctypes.c_uint32),
+                ("gid", ctypes.c_uint32),
+                ("ruid", ctypes.c_uint32),
+                ("rgid", ctypes.c_uint32),
+                ("svuid", ctypes.c_uint32),
+                ("svgid", ctypes.c_uint32),
+                ("rfu_1", ctypes.c_uint32),
+                ("comm", ctypes.c_char * 16),
+                ("name", ctypes.c_char * 32),
+                ("nfiles", ctypes.c_uint32),
+                ("pgid", ctypes.c_uint32),
+                ("pjobc", ctypes.c_uint32),
+                ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32),
+                ("nice", ctypes.c_int32),
+                ("start_tvsec", ctypes.c_uint64),
+                ("start_tvusec", ctypes.c_uint64),
+            ]
+
+        info = ProcBsdInfo()
+        try:
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            size = libproc.proc_pidinfo(
+                pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)
+            )
+        except (OSError, AttributeError) as exc:
+            raise SprintError(
+                f"cannot inspect macOS worker PID {pid} with proc_pidinfo"
+            ) from exc
+        if size != ctypes.sizeof(info) or info.pid != pid or not info.start_tvsec:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError as exc:
+                raise ProcessAbsent(
+                    f"worker PID {pid} exited during inspection"
+                ) from exc
+            except (PermissionError, OSError) as exc:
+                raise SprintError(f"cannot verify macOS worker PID {pid}") from exc
+            raise SprintError(
+                f"proc_pidinfo did not return an exact birth identity for live PID {pid}"
+            )
+        marker = f"darwin:{info.start_tvsec}:{info.start_tvusec}"
+        cgroup = ""
+    else:
+        raise SprintError(
+            f"process start identity is unsupported on platform {sys.platform}"
+        )
+    fingerprint = hashlib.sha256(f"{pid}:{marker}".encode("utf-8")).hexdigest()
+    return {
+        "kind": "process",
+        "pid": pid,
+        "start_fingerprint": fingerprint,
+        "start_identity": marker,
+        "boot_id": boot_id if sys.platform.startswith("linux") else "",
+        "cgroup": cgroup,
+    }
 
 
 def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
@@ -1783,6 +2493,16 @@ def parser() -> argparse.ArgumentParser:
     batch_parser.add_argument("--sprint", required=True)
     batch_parser.add_argument("--jobs", required=True)
     batch_parser.set_defaults(func=prepare_batch)
+    submit_batch_parser = commands.add_parser("submit-batch")
+    submit_batch_parser.add_argument("--batch", required=True)
+    submit_batch_parser.set_defaults(func=submit_batch)
+    inspect_batch_parser = commands.add_parser("inspect-batch")
+    inspect_batch_parser.add_argument("--batch", required=True)
+    inspect_batch_parser.set_defaults(func=inspect_batch)
+    recover_batch_parser = commands.add_parser("recover-legacy-batch")
+    recover_batch_parser.add_argument("--batch", required=True)
+    recover_batch_parser.add_argument("--reason", required=True)
+    recover_batch_parser.set_defaults(func=recover_legacy_batch)
     reconcile_batch_parser = commands.add_parser("reconcile-batch")
     reconcile_batch_parser.add_argument("--batch", required=True)
     reconcile_batch_parser.add_argument(
@@ -1791,7 +2511,6 @@ def parser() -> argparse.ArgumentParser:
     reconcile_batch_parser.add_argument("--results")
     reconcile_batch_parser.add_argument("--provider-evidence")
     reconcile_batch_parser.add_argument("--provider-batch-id")
-    reconcile_batch_parser.add_argument("--test-transport", help=argparse.SUPPRESS)
     reconcile_batch_parser.set_defaults(func=reconcile_batch)
     reserve_parser = commands.add_parser("reserve")
     reserve_parser.add_argument("--sprint", required=True)
@@ -1806,9 +2525,25 @@ def parser() -> argparse.ArgumentParser:
     attach_parser = commands.add_parser("attach")
     attach_parser.add_argument("--sprint", required=True)
     attach_parser.add_argument("--ticket", required=True)
-    attach_parser.add_argument("--run-ref", required=True)
-    attach_parser.add_argument("--attach-capability", required=True)
+    attach_parser.add_argument("--launch-evidence", required=True)
     attach_parser.set_defaults(func=attach)
+    launch_parser = commands.add_parser("launch-local")
+    launch_parser.add_argument("--sprint", required=True)
+    launch_parser.add_argument("--ticket", required=True)
+    launch_parser.add_argument("--attach-capability", required=True)
+    launch_parser.add_argument("--output", required=True)
+    launch_parser.add_argument("--stdin-file")
+    launch_parser.add_argument("command", nargs=argparse.REMAINDER)
+    launch_parser.set_defaults(func=launch_local)
+    supervisor_parser = commands.add_parser("supervise-local", help=argparse.SUPPRESS)
+    supervisor_parser.add_argument("--invocation-id", required=True)
+    supervisor_parser.add_argument("--ready", required=True)
+    supervisor_parser.add_argument("--ack", required=True)
+    supervisor_parser.add_argument("--tombstone", required=True)
+    supervisor_parser.add_argument("--output", required=True)
+    supervisor_parser.add_argument("--stdin-file")
+    supervisor_parser.add_argument("command", nargs=argparse.REMAINDER)
+    supervisor_parser.set_defaults(func=supervise_local)
     finish_parser = commands.add_parser("finish")
     finish_parser.add_argument("--sprint", required=True)
     finish_parser.add_argument("--ticket", required=True)

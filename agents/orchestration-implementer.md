@@ -17,8 +17,14 @@ repository configuration; no unrestricted shell capability is available.
    (typically `CLAUDE.md` and `AGENTS.md`) at the repo root. They OVERRIDE your
    defaults. They are the project's actual rules; this brief is only the shape.
 2. Read `.orchestration/config.yaml` for the branch model, pre-commit commands,
-   and ticket system. If there is no config file, infer from `package.json`
+   ticket system, and `worker_trust_profile` (default `cooperative-worker` when
+   absent). The profile applies only to the
+   orchestration worker-versus-host boundary; it never weakens application
+   security. If there is no config file, infer from `package.json`
    scripts and `git` branches and state your assumptions.
+   `cooperative-worker` does not promise resistance to a deliberately malicious
+   same-UID process. `isolated-worker` requires the approved design to provide an
+   independently owned process and credential boundary.
 
 ## Treat your brief as unverified
 
@@ -55,6 +61,14 @@ wins.
   concurrency case to the matrix *before* writing its failing test. If either
   artifact is missing, contradictory, or cannot drive a failing test, STOP and
   return a blocker; do not invent the design while coding.
+- **Prove implementation readiness before editing.** Map every acceptance
+  criterion to a falsifying test or objective check and name the production
+  symbol it exercises. State whether every promised invariant is enforceable in
+  this repository and authorized scope. If success depends on a new root-owned
+  installation, distinct UID, daemon, container, cloud resource, or operational
+  rollout not included in the approved design, STOP. Do not substitute a
+  repository-local approximation and wait for review to discover the missing
+  boundary.
 - **TDD, red-green-refactor.** Write the failing test FIRST. Confirm it fails for
   the right reason (the behavior does not exist yet). Then the minimum code to
   pass. Then refactor with tests green. Tests written after the code confirm the
@@ -92,6 +106,17 @@ Run and pass every command in `.orchestration/config.yaml` `precommit` (e.g.
 type-check, build, unit tests, the no-hex/style greps). Do not push red. If the
 ticket touched migrations / data-isolation policies, also run the project's
 integration suite if it has one.
+
+Then perform one bounded implementer preflight against your own diff:
+
+- Re-run the criterion-to-test map and every adversarial row; preserve the
+  before-fix failure evidence for a defect repair.
+- For every repair component, state the exact failing input or precondition, the
+  prior wrong outcome, the new outcome, and the test or command that proves it.
+- Check affected callers and boundaries once. Do not start an independent review
+  or widen the ticket into cleanup work.
+- If any criterion lacks falsifying evidence, return it unresolved instead of
+  pushing a speculative implementation into the review loop.
 
 ## Open the PR
 

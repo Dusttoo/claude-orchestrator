@@ -51,6 +51,12 @@ repository config. Caller environment and CLI values cannot replace that policy.
    `active`), a canonical `jira_base_url`, and `concurrency_max >= 1`. If Jira access is unavailable, stop
    before launches and report the missing connection as user action.
 
+   Resolve `worker_trust_profile` once and keep it fixed for the sprint. It
+   governs only worker-versus-host guarantees; it never narrows application or
+   tenant security. A `cooperative-worker` sprint must not later be blocked on a
+   hypothetical malicious same-UID worker, while `isolated-worker` requires its
+   independently owned host boundary before any lane launches.
+
    Before each lane launch, resolve `sprint-worker` with
    `scripts/context_pipeline.py route --config .orchestration/config.yaml --role
    sprint-worker`. Desktop routes keep the native/CLI path. API routes use the
@@ -114,9 +120,11 @@ repository config. Caller environment and CLI values cannot replace that policy.
    If a previously blocked or user-action ticket becomes safe to retry, requeue
    it explicitly with the evidence in `--reason`; completed tickets cannot be
    requeued. A running ticket additionally requires proof that no worker remains.
-   Requeue requires its current `--attempt-token` plus mechanically dead
-   `pid:`/`workspace-lease-pid:` identity, or a separately provisioned
-   single-use operator recovery capability. After
+   Requeue requires its current `--attempt-token` plus a mechanically empty
+   controller-owned execution unit, or a separately provisioned single-use
+   operator recovery capability consumed by the distinct host authority. A
+   repository file, home-directory secret, or same-UID helper is never recovery
+   authority. After
    `max_lane_relaunches`, stop for operator policy action; there is no same-user
    approval flag.
 
@@ -133,34 +141,54 @@ repository config. Caller environment and CLI values cannot replace that policy.
 
    Preserve the `attempt_token` returned by reserve. It fences worker completion
    and requeue from every earlier or replacement attempt. The controller also
-   owns the separate one-use `attach_capability`; API workers receive the
+   owns the separate one-use local-launch `attach_capability`; API workers receive the
    returned `attempt_capability` and its exact immutable worker reference.
 
    Then launch a fresh isolated worker for that one ticket. Instruct it to use
    `$orchestrate-ticket`, pass the freshly fetched Jira body and acceptance
    criteria with provenance `from Jira, verified in this sprint query`, and
    require its final report to include outcome, summary, PR, branch, and any
-   user action. After launch, replace the provisional reference:
+   user action. For a local process, the controller must perform the launch and
+   return evidence bound to this exact attempt:
 
    ```text
-   sprint-controller.py attach --sprint <id> --ticket <key> --run-ref <actual-task-or-agent-ref> --attach-capability <attach_capability>
+   sprint-controller.py launch-local --sprint <id> --ticket <key> \
+     --attach-capability <attach_capability> --output <repository-output> \
+     [--stdin-file <repository-input>] -- <worker-command>
+   sprint-controller.py attach --sprint <id> --ticket <key> --launch-evidence <launch_evidence>
    ```
 
+   Attach accepts only controller-owned evidence for the exact repository,
+   sprint, ticket, and attempt. It never accepts a caller PID. The evidence
+   binds the boot, controller invocation, exact process birth, and execution-unit
+   identity. Linux uses a cgroup-v2 systemd scope when available and checks all
+   descendants. macOS uses exact `proc_pidinfo` birth data and a controller
+   supervisor/session, explicitly as cooperative containment; possible escape,
+   unsupported containment, and unknown inspection require external operator
+   recovery. Fast exits retain a terminal tombstone that attach can consume.
+   `run_ref` is display metadata only.
+   When a native task has no verified adapter, keep the reservation and require
+   explicit operator recovery.
+
    **Codex host launch contract.** A reservation is not a worker launch. First
-   use the native multi-agent worker tool when it is available and record its
-   actual task/agent reference. On SSH or `codex exec` hosts where that tool is
-   unavailable, launch one detached worker process per reservation with the
-   host's Codex binary, for example:
+   use the native multi-agent worker tool only when its verified adapter can
+   return controller-owned launch evidence. On SSH or `codex exec` hosts, use
+   `launch-local` to start one detached worker process per reservation with the
+   host's Codex binary.
 
    ```text
-   <codex-bin> exec --ephemeral --json --sandbox danger-full-access      --model <configured-model> --cd <repository>      "Use the orchestrate-ticket skill for <ticket>; report outcome, PR,
-      branch, and user action." > <checkpoint-dir>/<run-ref>.jsonl 2>&1 < /dev/null &
+   sprint-controller.py launch-local --sprint <id> --ticket <key> \
+     --attach-capability <attach_capability> --output <checkpoint-dir>/<run-ref>.jsonl \
+     --stdin-file <checkpoint-dir>/<run-ref>.prompt \
+     -- <codex-bin> exec --ephemeral --json --sandbox danger-full-access \
+     --model <configured-model> --cd <repository> -
    ```
 
    Pass the ticket body through a temporary file or stdin; never interpolate
-Before launching, resolve the executable because non-interactive SSH shells may not load the npm-global PATH: `CODEX_BIN="$(command -v codex || printf '%s' /home/orchestrator/.npm-global/bin/codex)"`; verify it is executable. Use this exact background form: ("$CODEX_BIN" exec --ephemeral --json --sandbox danger-full-access --cd <repository> <prompt> > <output> 2>&1 < /dev/null) & pid=$!; echo $pid. Do not call disown and do not place pid=$! inside the subshell.
-   Jira text into a shell command. Use the detached process id plus output path
-   as the actual run reference, monitor it to terminal outcome, and call
+Before launching, resolve the executable because non-interactive SSH shells may not load the npm-global PATH: `CODEX_BIN="$(command -v codex || printf '%s' /home/orchestrator/.npm-global/bin/codex)"`; verify it is executable. Pass that executable and arguments to `launch-local`; do not background it independently or supply a PID to `attach`.
+   Jira text into a shell command. Keep the detached worker's PID in the
+   controller-owned evidence and keep `run_ref` as display metadata; monitor the
+   worker to terminal outcome and call
    `finish` immediately. Do not mark a reserved ticket blocked merely because
    native subagents are unavailable when this CLI fallback can run. If neither
    native workers nor a Codex executable is available, stop with a clear
@@ -180,10 +208,15 @@ Before launching, resolve the executable because non-interactive SSH shells may 
    of launching interactive workers. The controller rejects interactive jobs,
    atomically reserves the lanes, and writes a provider-native request and
    marker under `.orchestration/.sprint-state/`.
-   Submit Anthropic JSON to `POST /v1/messages/batches`; upload OpenAI JSONL and
-   create `POST /v1/batches`. Reconcile only through `sprint-controller.py reconcile-batch --batch <local-id> --provider-batch-id <provider-id> --outcome completed|failed`.
-   The controller invokes the authenticated provider adapter, downloads the
-   complete terminal result set, and journals each `custom_id` application.
+   Submit only through `sprint-controller.py submit-batch --batch <local-id>`;
+   its authenticated adapter posts Anthropic JSON or uploads OpenAI JSONL and
+   creates the provider batch without exposing credentials or accepting a
+   caller-supplied provider id. Reconcile only through `sprint-controller.py
+   reconcile-batch --batch <local-id> --outcome completed|failed`. The adapter
+   downloads every available terminal result/error file, freezes its digest,
+   and journals each `custom_id` application. It settles successful rows,
+   releases only provider-proven nonexecuted rows, and leaves missing or
+   ambiguous rows reserved for operator reconciliation.
    Caller-authored terminal JSON is never authoritative.
 
 6. **Checkpoint every outcome.** As workers finish, immediately call:

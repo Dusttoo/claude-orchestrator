@@ -6,7 +6,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/.."
 CONTROLLER="$ROOT/tests/sprint_controller_test_driver.py"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+WORKER_PIDS=""
+trap 'for pid in $WORKER_PIDS; do kill "$pid" 2>/dev/null || true; done; rm -rf "$TMP"' EXIT
 
 fails=0
 ok() { printf 'ok   %s\n' "$1"; }
@@ -67,6 +68,18 @@ PY
 }
 
 mkdir -p "$TMP/repo/.git" "$TMP/repo/.orchestration"
+cat > "$TMP/operator-recovery-helper" <<'SH'
+#!/usr/bin/env bash
+set -eu
+[ "$1" = consume ] && [ "$2" = --scope ] && [ -n "$3" ]
+IFS= read -r token
+cap="${ORCHESTRATION_TEST_RECOVERY_CAP:?}"
+[ -f "$cap" ] && [ "$(cat "$cap")" = "$token" ]
+rm "$cap"
+SH
+chmod +x "$TMP/operator-recovery-helper"
+export ORCHESTRATION_TEST_RECOVERY_HELPER="$TMP/operator-recovery-helper"
+export ORCHESTRATION_TEST_RECOVERY_CAP="$TMP/operator-recovery.cap"
 cp "$ROOT/templates/config.yaml" "$TMP/repo/.orchestration/config.yaml"
 sed -i.bak 's/^concurrency_max:.*/concurrency_max: 2/' "$TMP/repo/.orchestration/config.yaml"
 rm "$TMP/repo/.orchestration/config.yaml.bak"
@@ -156,8 +169,14 @@ TOKEN1="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attem
 ATTACH1="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attach_capability"])' "$TMP/reserve1.json")"
 TOKEN3="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_token"])' "$TMP/reserve3.json")"
 run_fail "third reservation is rejected at concurrency_max" "$CONTROLLER" reserve --sprint 42 --ticket PROJ-2 --run-ref should-fail
-run_fail "stale worker cannot attach without its controller capability" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --run-ref stale --attach-capability attach_stale
-run_ok "actual worker reference attaches after launch" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --run-ref pid:999999 --attach-capability "$ATTACH1"
+run_fail "caller-supplied live PID cannot be attached" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --worker-pid "$$" --attach-capability "$ATTACH1"
+run_fail "stale capability cannot create controller launch evidence" "$CONTROLLER" launch-local --sprint 42 --ticket PROJ-1 --attach-capability attach_stale --output .orchestration/worker1.log -- /bin/sh -c 'sleep 30'
+"$CONTROLLER" launch-local --sprint 42 --ticket PROJ-1 --attach-capability "$ATTACH1" --output .orchestration/worker1.log -- /bin/sh -c 'sleep 30' > "$TMP/launch1.json"
+LAUNCH1="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["launch_evidence"])' "$TMP/launch1.json")"
+PID1="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["worker_pid"])' "$TMP/launch1.json")"
+WORKER_PIDS="$WORKER_PIDS $PID1"
+run_ok "attach consumes controller-owned launch evidence" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --launch-evidence "$LAUNCH1"
+run_fail "controller launch evidence is one-use" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --launch-evidence "$LAUNCH1"
 
 "$CONTROLLER" plan --sprint 42 > "$TMP/restart.json"
 json_check "restart exposes running work for reconciliation" "$TMP/restart.json" 'data["needs_reconcile"] == ["PROJ-1", "PROJ-3"] and data["launch"] == []'
@@ -176,12 +195,59 @@ run_ok "running ticket survives inventory resync" "$CONTROLLER" sync --inventory
 "$CONTROLLER" plan --sprint 42 > "$TMP/resync.json"
 json_check "resync does not duplicate a running workflow" "$TMP/resync.json" 'data["needs_reconcile"] == ["PROJ-2"] and "PROJ-2" not in data["launch"]'
 run_fail "requeue without stopped-worker proof fails closed" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason missing-proof --attempt-token "$TOKEN2"
-run_fail "worker attempt token cannot rewrite death evidence" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --run-ref pid:999999 --attach-capability "$TOKEN2"
-run_ok "controller attach capability establishes actual worker identity once" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --run-ref "pid:$$" --attach-capability "$ATTACH2"
-run_fail "controller attach capability is one-use" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --run-ref second-display --attach-capability "$ATTACH2"
+run_fail "worker attempt token cannot create launch evidence" "$CONTROLLER" launch-local --sprint 42 --ticket PROJ-2 --attach-capability "$TOKEN2" --output .orchestration/worker2.log -- /bin/sh -c 'sleep 30'
+"$CONTROLLER" launch-local --sprint 42 --ticket PROJ-2 --attach-capability "$ATTACH2" --output .orchestration/worker2.log -- /bin/sh -c 'sleep 30' > "$TMP/launch2.json"
+LAUNCH2="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["launch_evidence"])' "$TMP/launch2.json")"
+PID2="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["worker_pid"])' "$TMP/launch2.json")"
+WORKER_PIDS="$WORKER_PIDS $PID2"
+run_fail "launch evidence is bound to its exact ticket and attempt" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --launch-evidence "$LAUNCH2"
+run_ok "controller attach capability establishes launched worker identity" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --launch-evidence "$LAUNCH2"
 run_fail "live attached worker blocks requeue despite dead provisional identity" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker no longer exists' --attempt-token "$TOKEN2"
-printf 'recover-once' > .orchestration/operator-recovery.cap
-run_ok "operator can requeue a live mechanically bound worker" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'operator stopped worker' --attempt-token "$TOKEN2" --operator-capability recover-once
+kill "$PID2" 2>/dev/null || true
+wait "$PID2" 2>/dev/null || true
+run_ok "confirmed process absence permits automatic requeue" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker exited' --attempt-token "$TOKEN2"
+python3 - "$CONTROLLER" "$TMP/repo" <<'PY' && ok "unknown unit inspection, descendant liveness, and identity reuse fail closed" || fail_case "unknown unit inspection, descendant liveness, and identity reuse fail closed"
+import importlib.util,sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).parent))
+spec=importlib.util.spec_from_file_location("sprint_controller", sys.argv[1])
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+cfg={"shared_root": Path(sys.argv[2])}
+ticket={"worker_identity":{"kind":"execution_unit","pid":123,"containment":"cgroup-v2-systemd-scope"}}
+for status in ("unknown", "live"):
+    module.execution_unit_status=lambda _identity, status=status: status
+    try: module.require_worker_stopped(ticket, "", cfg)
+    except module.SprintError: pass
+    else: raise AssertionError(f"{status} execution unit was treated as absent")
+module.execution_unit_status=lambda _identity: "absent"
+module.require_worker_stopped(ticket, "", cfg)
+ticket["worker_identity"]["containment"]="cooperative-session"
+try: module.require_worker_stopped(ticket, "", cfg)
+except module.SprintError: pass
+else: raise AssertionError("cooperative containment claimed mechanical absence")
+ticket["worker_identity"]={"kind":"process","pid":123,"start_fingerprint":"legacy"}
+try: module.require_worker_stopped(ticket, "", cfg)
+except module.SprintError: pass
+else: raise AssertionError("legacy leader-PID identity was treated as descendant proof")
+PY
+python3 - "$CONTROLLER" <<'PY' && ok "macOS process identity uses exact proc_pidinfo birth time" || fail_case "macOS process identity uses exact proc_pidinfo birth time"
+import importlib.util,sys
+from unittest import mock
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).parent))
+spec=importlib.util.spec_from_file_location("sprint_controller_darwin", sys.argv[1])
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+class Lib:
+    def __init__(self,usec): self.usec=usec
+    def proc_pidinfo(self,pid,flavor,arg,ptr,size):
+        ptr._obj.pid=pid; ptr._obj.start_tvsec=100; ptr._obj.start_tvusec=self.usec
+        return size
+with mock.patch.object(module.sys,"platform","darwin"), mock.patch.object(module.os,"kill"):
+    with mock.patch.object(module.ctypes,"CDLL",return_value=Lib(1)): first=module.process_identity("123")
+    with mock.patch.object(module.ctypes,"CDLL",return_value=Lib(2)): second=module.process_identity("123")
+assert first["start_identity"] == "darwin:100:1"
+assert first["start_fingerprint"] != second["start_fingerprint"]
+PY
 run_ok "pending attempt history survives Jira resync" "$CONTROLLER" sync --inventory inventory.json
 "$CONTROLLER" reserve --sprint 42 --ticket PROJ-2 --run-ref codex-task-two > "$TMP/reserve2b.json" && ok "requeued ticket can reserve again" || bad "requeued ticket can reserve again"
 json_check "relaunch accounting survives pending sync" "$TMP/reserve2b.json" 'data["attempt"] == 2'
@@ -235,6 +301,8 @@ import json, sys
 from pathlib import Path
 for path in Path(sys.argv[1]).glob("*.json"):
     state = json.loads(path.read_text())
+    if not isinstance(state.get("tickets"), dict):
+        continue
     for ticket in state["tickets"].values():
         ticket.pop("priority", None)
     path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
@@ -292,10 +360,26 @@ path.write_text(json.dumps(state) + '\n')
 PY
 "$CONTROLLER" summary --sprint 47 > "$TMP/legacy-summary.json"
 json_check "schema-v1 running lanes fence to explicit recovery" "$TMP/legacy-summary.json" 'data["user_action"][0]["key"] == "PROJ-60" and "legacy running lane" in data["user_action"][0]["reason"]'
-run_ok "fenced legacy lane has an explicit recovery path" "$CONTROLLER" recover-legacy --sprint 47 --ticket PROJ-60 --reason 'operator verified old worker stopped'
+printf 'recover-legacy-once' > "$ORCHESTRATION_TEST_RECOVERY_CAP"
+run_ok "fenced legacy lane has an explicit recovery path" "$CONTROLLER" recover-legacy --sprint 47 --ticket PROJ-60 --reason 'operator verified old worker stopped' --operator-capability recover-legacy-once
 "$CONTROLLER" plan --sprint 47 > "$TMP/legacy-plan.json"
 json_check "recovered legacy lane becomes launchable without duplication" "$TMP/legacy-plan.json" 'data["launch"] == ["PROJ-60"]'
 run_fail "legacy recovery capability is one-shot" "$CONTROLLER" recover-legacy --sprint 47 --ticket PROJ-60 --reason replay
+
+cat > "$TMP/repo/fast-exit.json" <<'JSON'
+{"project":"PROJ","sprint":{"id":"49","name":"fast exit"},"source_query":"q","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-90","status":"Ready","dependencies":[],"subtasks":[]}]}
+JSON
+jira_receipt "$TMP/repo/fast-exit.json"
+run_ok "fast-exit inventory syncs" "$CONTROLLER" sync --inventory fast-exit.json
+printf 'prompt-from-stdin\n' > "$TMP/repo/.orchestration/fast.prompt"
+"$CONTROLLER" reserve --sprint 49 --ticket PROJ-90 --run-ref fast > "$TMP/fast-reserve.json"
+FAST_TOKEN="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_token"])' "$TMP/fast-reserve.json")"
+FAST_ATTACH="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attach_capability"])' "$TMP/fast-reserve.json")"
+"$CONTROLLER" launch-local --sprint 49 --ticket PROJ-90 --attach-capability "$FAST_ATTACH" --output .orchestration/fast.log --stdin-file .orchestration/fast.prompt -- /bin/sh -c 'IFS= read -r prompt; printf "%s\n" "$prompt"' > "$TMP/fast-launch.json"
+FAST_EVIDENCE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["launch_evidence"])' "$TMP/fast-launch.json")"
+if [ "$(cat "$TMP/repo/.orchestration/fast.log")" = prompt-from-stdin ]; then ok "launch-local sends prompt file contents to worker stdin"; else fail_case "launch-local sends prompt file contents to worker stdin"; fi
+run_ok "fast worker terminal tombstone remains attachable" "$CONTROLLER" attach --sprint 49 --ticket PROJ-90 --launch-evidence "$FAST_EVIDENCE"
+run_ok "fast worker tombstone permits confirmed recovery" "$CONTROLLER" requeue --sprint 49 --ticket PROJ-90 --reason 'fast worker exited' --attempt-token "$FAST_TOKEN"
 
 cat > "$TMP/repo/limit-inventory.json" <<'JSON'
 {"project":"PROJ","sprint":{"id":"48","name":"run limit"},"source_query":"q","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-70","status":"Ready","dependencies":[],"subtasks":[]},{"key":"PROJ-71","status":"Ready","dependencies":[],"subtasks":[]}]}
@@ -347,18 +431,9 @@ cat > "$TMP/batch-terminal.json" <<JSON
 JSON
 run_fail "hand-authored terminal JSON cannot transition an uncertain batch" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --provider-evidence "$TMP/batch-terminal.json"
 cat > "$TMP/batch-transport.json" <<'JSON'
-{"status":{"id":"msgbatch_test","processing_status":"cancelled"},"result_pages":[]}
+{"submit":{"id":"msgbatch_test","type":"message_batch","processing_status":"in_progress"},"status":{"id":"msgbatch_test","processing_status":"cancelled"},"result_pages":[]}
 JSON
-run_ok "adapter-owned terminal lookup releases reservations" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --provider-batch-id msgbatch_test --test-transport "$TMP/batch-transport.json"
-run_ok "terminal batch reconciliation is idempotent" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --test-transport "$TMP/batch-transport.json"
-python3 - "$TMP/batch-result.json" <<'PY'
-import json,sys
-result=json.load(open(sys.argv[1])); marker=json.load(open(result["marker"])); marker["status"]="reconciling_failed"
-json.dump(marker,open(result["marker"],"w"),indent=2)
-PY
-run_ok "crash-partial batch reconciliation resumes idempotently" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --test-transport "$TMP/batch-transport.json"
-"$CONTROLLER" plan --sprint 45 > "$TMP/batch-retry-plan.json"
-json_check "failed batch lanes return to bounded scheduling" "$TMP/batch-retry-plan.json" 'data["launch"] == ["PROJ-40", "PROJ-41"]'
+run_fail "production CLI has no synthetic batch transport authority" "$CONTROLLER" submit-batch --batch "$BATCH_ID" --test-transport "$TMP/batch-transport.json"
 
 cat > "$TMP/repo/interactive-job.json" <<'JSON'
 {"jobs":[{"ticket":"PROJ-40","background":true,"interactive":true,"params":{"model":"claude-sonnet-5","max_tokens":10,"messages":[{"role":"user","content":"x"}]}}]}
@@ -385,6 +460,8 @@ assert line["method"] == "POST" and line["url"] == "/v1/responses"
 assert marker["endpoint"] == "/v1/batches" and marker["provider"] == "openai"
 PY
 if [ "$?" -eq 0 ]; then ok "OpenAI background lanes serialize to Batch JSONL"; else fail_case "OpenAI background lanes serialize to Batch JSONL"; fi
+OPENAI_BATCH_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["batch_id"])' "$TMP/openai-batch-result.json")"
+run_fail "OpenAI production CLI also rejects synthetic transport" "$CONTROLLER" submit-batch --batch "$OPENAI_BATCH_ID" --test-transport "$TMP/openai-nonterminal.json"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi
