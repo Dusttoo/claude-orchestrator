@@ -138,8 +138,8 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    If a previously blocked or user-action ticket becomes safe to retry, requeue
    it explicitly with the evidence in `--reason`; completed tickets cannot be
    requeued. A running ticket additionally requires proof that no worker remains.
-   Requeue requires its current `--attempt-token` plus mechanically dead
-   `pid:`/`workspace-lease-pid:` identity, or a separately provisioned
+   Requeue requires its current `--attempt-token` plus a mechanically dead
+   PID-and-process-start identity, or a separately provisioned
    single-use operator recovery capability. After
    `max_lane_relaunches`, stop for operator policy action; there is no same-user
    approval flag.
@@ -167,8 +167,13 @@ The host reads `ticket.kind`, `ticket.project`, `sprint_id`, and
    user action. After launch, replace the provisional reference:
 
    ```text
-   sprint-controller.py attach --sprint <id> --ticket <key> --run-ref <actual-task-or-agent-ref> --attach-capability <attach_capability>
+   sprint-controller.py attach --sprint <id> --ticket <key> --worker-pid <actual-worker-pid> --attach-capability <attach_capability>
    ```
+
+   Attach accepts only a live process that the controller can verify and binds
+   its immutable PID/start fingerprint. Never substitute a native task label or
+   arbitrary run reference. When a native task has no supported process adapter,
+   keep the reservation and require explicit operator recovery.
 
    **Codex host launch contract.** A reservation is not a worker launch. First
    use the native multi-agent worker tool when it is available and record its

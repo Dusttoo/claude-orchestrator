@@ -1504,8 +1504,7 @@ def require_attempt(ticket: dict[str, Any], supplied: str) -> None:
 def attach(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     path = state_path(cfg["state_dir"], str(args.sprint))
     key = normalize_key(args.ticket)
-    if not args.run_ref.strip():
-        raise SprintError("run reference must not be empty")
+    identity = process_identity(args.worker_pid)
     with locked(path):
         state = load(path)
         ticket = state["tickets"].get(key)
@@ -1520,15 +1519,14 @@ def attach(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             raise SprintError(
                 "attach capability is missing, stale, or already consumed"
             )
-        ticket["run_ref"] = args.run_ref
-        ticket["worker_identity"] = args.run_ref
+        ticket["worker_identity"] = identity
         ticket["attached_at"] = now()
         ticket["attach_capability"] = ""
         ticket["history"].append(
-            {"at": now(), "event": "attached", "run_ref": args.run_ref}
+            {"at": now(), "event": "attached", "worker_identity": identity}
         )
         save(path, state)
-    emit({"ticket": key, "state": "running", "run_ref": args.run_ref})
+    emit({"ticket": key, "state": "running", "worker_identity": identity})
 
 
 def finish(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
@@ -1618,15 +1616,14 @@ def require_worker_stopped(
     ticket: dict[str, Any], operator_token: str, cfg: dict[str, Any]
 ) -> None:
     """Use process liveness or consume a separately provisioned operator token."""
-    run_ref = str(ticket.get("worker_identity") or "")
-    match = re.fullmatch(r"(?:pid|workspace-lease-pid):(\d+)", run_ref)
-    if match:
+    identity = ticket.get("worker_identity")
+    if isinstance(identity, dict) and identity.get("kind") == "process":
         try:
-            os.kill(int(match.group(1)), 0)
-        except ProcessLookupError:
+            current = process_identity(str(identity.get("pid")))
+        except SprintError:
             return
-        except PermissionError:
-            pass
+        if current.get("start_fingerprint") != identity.get("start_fingerprint"):
+            return
     capability_path = cfg["shared_root"] / ".orchestration/operator-recovery.cap"
     if not operator_token or not capability_path.is_file():
         raise SprintError(
@@ -1636,6 +1633,30 @@ def require_worker_stopped(
     if not expected or operator_token != expected:
         raise SprintError("operator recovery capability is invalid")
     capability_path.unlink()
+
+
+def process_identity(raw_pid: str) -> dict[str, Any]:
+    """Bind a live PID to its OS-reported start time so PID reuse is harmless."""
+    try:
+        pid = int(str(raw_pid))
+    except ValueError as exc:
+        raise SprintError("worker PID must be a positive integer") from exc
+    if pid < 1:
+        raise SprintError("worker PID must be a positive integer")
+    try:
+        os.kill(pid, 0)
+        started = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (ProcessLookupError, PermissionError, OSError, subprocess.CalledProcessError) as exc:
+        raise SprintError(f"worker PID {pid} is not a verifiable live process") from exc
+    if not started:
+        raise SprintError(f"worker PID {pid} has no verifiable start time")
+    fingerprint = hashlib.sha256(f"{pid}:{started}".encode("utf-8")).hexdigest()
+    return {"kind": "process", "pid": pid, "start_fingerprint": fingerprint}
 
 
 def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
@@ -1745,7 +1766,7 @@ def parser() -> argparse.ArgumentParser:
     attach_parser = commands.add_parser("attach")
     attach_parser.add_argument("--sprint", required=True)
     attach_parser.add_argument("--ticket", required=True)
-    attach_parser.add_argument("--run-ref", required=True)
+    attach_parser.add_argument("--worker-pid", required=True)
     attach_parser.add_argument("--attach-capability", required=True)
     attach_parser.set_defaults(func=attach)
     finish_parser = commands.add_parser("finish")

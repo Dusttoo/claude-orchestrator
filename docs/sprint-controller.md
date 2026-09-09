@@ -31,11 +31,13 @@ locks coordinate cooperating processes; they are not an authorization boundary.
 GitHub branch protection and the plugin's merge guard remain the enforcement
 boundary for merges.
 
-Crash recovery cannot safely decide whether an already-launched worker still
-exists. Therefore every launch is reserved first, and restart plans surface all
-running reservations as `needs_reconcile`. The host must inspect external state;
-it may requeue only after proving the old worker is gone. This deliberately
-prefers a paused lane over duplicate ticket execution.
+Every launch is reserved first, and restart plans surface all running
+reservations as `needs_reconcile`. Local-process attach validates the live PID
+and stores a fingerprint of its OS-reported start time, so PID reuse cannot make
+a replacement process authoritative. Requeue consults only that immutable
+identity. Native task labels and provisional run references are never liveness
+evidence; tasks without a supported process adapter require explicit operator
+recovery. This deliberately prefers a paused lane over duplicate execution.
 
 ## Context and provider efficiency
 

@@ -76,7 +76,7 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    Run `sprint-controller.py sync --inventory-template <template>` so the
    controller-owned adapter performs authenticated approved-origin requests,
    exhaustive pagination, and content-addressed evidence itself. Requeue requires its current
-   `--attempt-token` and mechanical process/workspace-lease liveness proof, or
+   `--attempt-token` and the controller-bound PID/start fingerprint, or
    a separately provisioned single-use operator capability.
 
 5. For each key in `plan.launch` — already ordered by `(priority, key)`, so
@@ -92,10 +92,16 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    and record its PID plus output file as the actual run reference. Pass ticket
    text through stdin or a temporary file; never interpolate Jira text into a
    shell command. A reservation is not a launch: verify a real worker process or
-   task reference before calling `attach`. Do not mark a ticket blocked merely
+   process identity before calling `attach`; native task references with no
+   supported process adapter remain reserved for operator recovery. Do not mark a ticket blocked merely
    because native subagents are unavailable when the Codex CLI fallback can run.
    If neither launch mechanism exists, record `user_action` and preserve the
-   reservation for reconciliation. After a real launch, run `attach --sprint <id> --ticket <key> --run-ref <actual-agent-ref> --attach-capability <attach_capability>`.
+   reservation for reconciliation. After a real local process launch, run
+   `attach --sprint <id> --ticket <key> --worker-pid <actual-worker-pid> --attach-capability <attach_capability>`.
+   The controller records the verified PID plus its process-start fingerprint.
+   A native task reference is display metadata, not liveness evidence; if no
+   supported adapter exposes its process identity, leave it reserved for
+   explicit operator recovery.
 
    For a lane explicitly marked `background: true` and `interactive: false`, do
    not start an interactive worker. Use the resolved API route and assemble each

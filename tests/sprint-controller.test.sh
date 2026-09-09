@@ -121,8 +121,9 @@ TOKEN1="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attem
 ATTACH1="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attach_capability"])' "$TMP/reserve1.json")"
 TOKEN3="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attempt_token"])' "$TMP/reserve3.json")"
 run_fail "third reservation is rejected at concurrency_max" "$CONTROLLER" reserve --sprint 42 --ticket PROJ-2 --run-ref should-fail
-run_fail "stale worker cannot attach without its controller capability" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --run-ref stale --attach-capability attach_stale
-run_ok "actual worker reference attaches after launch" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --run-ref pid:999999 --attach-capability "$ATTACH1"
+run_fail "stale worker cannot attach without its controller capability" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --worker-pid "$$" --attach-capability attach_stale
+run_fail "attach rejects a nonexistent native process" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --worker-pid 999999 --attach-capability "$ATTACH1"
+run_ok "actual worker process attaches after launch" "$CONTROLLER" attach --sprint 42 --ticket PROJ-1 --worker-pid "$$" --attach-capability "$ATTACH1"
 
 "$CONTROLLER" plan --sprint 42 > "$TMP/restart.json"
 json_check "restart exposes running work for reconciliation" "$TMP/restart.json" 'data["needs_reconcile"] == ["PROJ-1", "PROJ-3"] and data["launch"] == []'
@@ -141,9 +142,9 @@ run_ok "running ticket survives inventory resync" "$CONTROLLER" sync --inventory
 "$CONTROLLER" plan --sprint 42 > "$TMP/resync.json"
 json_check "resync does not duplicate a running workflow" "$TMP/resync.json" 'data["needs_reconcile"] == ["PROJ-2"] and "PROJ-2" not in data["launch"]'
 run_fail "requeue without stopped-worker proof fails closed" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason missing-proof --attempt-token "$TOKEN2"
-run_fail "worker attempt token cannot rewrite death evidence" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --run-ref pid:999999 --attach-capability "$TOKEN2"
-run_ok "controller attach capability establishes actual worker identity once" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --run-ref "pid:$$" --attach-capability "$ATTACH2"
-run_fail "controller attach capability is one-use" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --run-ref second-display --attach-capability "$ATTACH2"
+run_fail "worker attempt token cannot rewrite death evidence" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --worker-pid "$$" --attach-capability "$TOKEN2"
+run_ok "controller attach capability establishes actual worker identity once" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --worker-pid "$$" --attach-capability "$ATTACH2"
+run_fail "controller attach capability is one-use" "$CONTROLLER" attach --sprint 42 --ticket PROJ-2 --worker-pid "$$" --attach-capability "$ATTACH2"
 run_fail "live attached worker blocks requeue despite dead provisional identity" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'worker no longer exists' --attempt-token "$TOKEN2"
 printf 'recover-once' > .orchestration/operator-recovery.cap
 run_ok "operator can requeue a live mechanically bound worker" "$CONTROLLER" requeue --sprint 42 --ticket PROJ-2 --reason 'operator stopped worker' --attempt-token "$TOKEN2" --operator-capability recover-once
@@ -257,7 +258,8 @@ path.write_text(json.dumps(state) + '\n')
 PY
 "$CONTROLLER" summary --sprint 47 > "$TMP/legacy-summary.json"
 json_check "schema-v1 running lanes fence to explicit recovery" "$TMP/legacy-summary.json" 'data["user_action"][0]["key"] == "PROJ-60" and "legacy running lane" in data["user_action"][0]["reason"]'
-run_ok "fenced legacy lane has an explicit recovery path" "$CONTROLLER" recover-legacy --sprint 47 --ticket PROJ-60 --reason 'operator verified old worker stopped'
+printf 'recover-legacy-once' > .orchestration/operator-recovery.cap
+run_ok "fenced legacy lane has an explicit recovery path" "$CONTROLLER" recover-legacy --sprint 47 --ticket PROJ-60 --reason 'operator verified old worker stopped' --operator-capability recover-legacy-once
 "$CONTROLLER" plan --sprint 47 > "$TMP/legacy-plan.json"
 json_check "recovered legacy lane becomes launchable without duplication" "$TMP/legacy-plan.json" 'data["launch"] == ["PROJ-60"]'
 run_fail "legacy recovery capability is one-shot" "$CONTROLLER" recover-legacy --sprint 47 --ticket PROJ-60 --reason replay

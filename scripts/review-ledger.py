@@ -304,10 +304,7 @@ def ledger_path(args: argparse.Namespace) -> Path:
             continue
         if (
             isinstance(subject, dict)
-            and (
-                subject.get("id") == identifier
-                or str(candidate_state.get("pr")) == identifier
-            )
+            and subject.get("id") == identifier
             and subject.get("repository") == requested["repository"]
         ):
             matches.append(candidate)
@@ -548,17 +545,71 @@ def _component(
             "redesigned_at_repair_failure": 0,
         }
         state["components"][key] = component
-    component.setdefault(
-        "claims",
-        {
+    if not isinstance(component.get("claims"), dict):
+        component["claims"] = {}
+    if not component["claims"] and component.get("gates"):
+        component["claims"].update(
+            {
             gate: {
                 "status": component.get("status", "open"),
                 "last_round": component.get("last_round", round_no),
+                "generation": component.get("review_generation", 1),
             }
             for gate in component.get("gates", [])
-        },
-    )
+            }
+        )
     return component
+
+
+def apply_gate_claims(
+    state: dict[str, Any],
+    *,
+    gate: str,
+    accepted: list[tuple[str, str]],
+    finding_details: dict[str, dict[str, Any]],
+    round_no: int,
+) -> list[str]:
+    """Atomically apply one gate's claims without disturbing other owners."""
+    accepted_keys = {key for key, _ in accepted}
+    for key, raw in accepted:
+        component = _component(state, key, raw, round_no)
+        component["strikes"] += 1
+        component["status"] = "open"
+        component["display"] = raw.strip()
+        component["last_round"] = round_no
+        component["rounds"].append(round_no)
+        if key in finding_details:
+            component["finding"] = finding_details[key]
+        if gate not in component["gates"]:
+            component["gates"].append(gate)
+        component["claims"][gate] = {
+            "status": "open",
+            "last_round": round_no,
+            "generation": state.get("review_generation", 1),
+        }
+
+    resolved: list[str] = []
+    for key, component in state["components"].items():
+        claims = _component(state, key, component.get("display", key), round_no)[
+            "claims"
+        ]
+        claim = claims.get(gate)
+        if claim and claim.get("status") == "open" and key not in accepted_keys:
+            claim.update(
+                {
+                    "status": "resolved",
+                    "resolved_round": round_no,
+                    "resolved_generation": state.get("review_generation", 1),
+                }
+            )
+        aggregate_open = any(item.get("status") == "open" for item in claims.values())
+        was_open = component.get("status") == "open"
+        component["status"] = "open" if aggregate_open else "resolved"
+        if was_open and not aggregate_open:
+            component["resolved_round"] = round_no
+            component["resolved_by_gate"] = gate
+            resolved.append(key)
+    return resolved
 
 
 def cmd_record(args: argparse.Namespace) -> None:
@@ -650,38 +701,42 @@ def cmd_record(args: argparse.Namespace) -> None:
                 demoted.append((key, raw))
 
         accepted_keys = {key for key, _ in accepted}
-        for key, raw in accepted:
-            component = _component(state, key, raw, round_no)
-            component["strikes"] += 1
-            component["status"] = "open"
-            component["display"] = raw.strip()
-            component["last_round"] = round_no
-            component["rounds"].append(round_no)
-            if key in finding_details:
-                component["finding"] = finding_details[key]
-            if args.gate not in component["gates"]:
-                component["gates"].append(args.gate)
-            component["claims"][args.gate] = {"status": "open", "last_round": round_no}
-
-        # A gate may close only its own claim. Another gate's independently
-        # reported claim remains open until that gate completes without it.
-        resolved: list[str] = []
-        for key, component in state["components"].items():
-            claims = _component(state, key, component.get("display", key), round_no)[
-                "claims"
-            ]
-            claim = claims.get(args.gate)
-            if claim and claim.get("status") == "open" and key not in accepted_keys:
-                claim.update({"status": "resolved", "resolved_round": round_no})
-            aggregate_open = any(
-                item.get("status") == "open" for item in claims.values()
+        pending_attempt = (
+            state["repair_attempts"][-1]
+            if state.get("repair_pending_review") and state.get("repair_attempts")
+            else None
+        )
+        if pending_attempt is not None:
+            staged = pending_attempt.setdefault("gate_claims", {})
+            if args.gate in staged:
+                raise LedgerError(
+                    f"gate {args.gate} already recorded for review generation "
+                    f"{state.get('review_generation', 1)}"
+                )
+            staged[args.gate] = {
+                "round": round_no,
+                "accepted": [
+                    {
+                        "key": key,
+                        "display": raw,
+                        **(
+                            {"finding": finding_details[key]}
+                            if key in finding_details
+                            else {}
+                        ),
+                    }
+                    for key, raw in accepted
+                ],
+            }
+            resolved = []
+        else:
+            resolved = apply_gate_claims(
+                state,
+                gate=args.gate,
+                accepted=accepted,
+                finding_details=finding_details,
+                round_no=round_no,
             )
-            was_open = component.get("status") == "open"
-            component["status"] = "open" if aggregate_open else "resolved"
-            if was_open and not aggregate_open:
-                component["resolved_round"] = round_no
-                component["resolved_by_gate"] = args.gate
-                resolved.append(key)
 
         advisories = [
             {
@@ -862,6 +917,14 @@ def cmd_record_repair(args: argparse.Namespace) -> None:
         }
         state["repair_attempts"].append(attempt)
         state["review_generation"] += 1
+        superseded_at = now()
+        for permit in state.get("review_permits", []):
+            if (
+                permit.get("review_generation", 1) < state["review_generation"]
+                and not permit.get("receipt_consumed_at")
+            ):
+                permit["superseded_at"] = superseded_at
+                permit["superseded_by_generation"] = state["review_generation"]
         state["repair_pending_review"] = True
         save(path, state)
         emit(
@@ -887,6 +950,27 @@ def cmd_complete_repair_review(args: argparse.Namespace) -> None:
             raise LedgerError(
                 f"repair review is incomplete; missing gates: {', '.join(missing)}"
             )
+        for gate in attempt["required_gates"]:
+            staged = attempt.get("gate_claims", {}).get(gate)
+            if not staged:
+                raise LedgerError(f"repair review has no staged claims for gate: {gate}")
+            accepted = [
+                (str(item["key"]), str(item["display"]))
+                for item in staged.get("accepted", [])
+            ]
+            details = {
+                str(item["key"]): item["finding"]
+                for item in staged.get("accepted", [])
+                if "finding" in item
+            }
+            apply_gate_claims(
+                state,
+                gate=gate,
+                accepted=accepted,
+                finding_details=details,
+                round_no=int(staged["round"]),
+            )
+        attempt["claims_finalized_at"] = now()
         remaining = {item["key"] for item in open_components(state)}
         attempt["open_after"] = sorted(remaining)
         attempt["closed"] = sorted(set(attempt["open_before"]) - remaining)
@@ -1168,6 +1252,7 @@ def cmd_status(args: argparse.Namespace) -> None:
             "gates": component["gates"],
             "rounds": component["rounds"],
             "display": component["display"],
+            "claims": component.get("claims", {}),
         }
         for key, component in sorted(state["components"].items())
     }
@@ -1369,6 +1454,29 @@ def cmd_alias(args: argparse.Namespace) -> None:
         canonical["strikes"] += merged["strikes"]
         canonical["rounds"] = sorted(set(canonical["rounds"] + merged["rounds"]))
         canonical["gates"] = sorted(set(canonical["gates"] + merged["gates"]))
+        canonical_claims = canonical.setdefault("claims", {})
+        merged_claims = merged.get("claims", {})
+        for gate in canonical["gates"]:
+            left = canonical_claims.get(gate)
+            right = merged_claims.get(gate)
+            if left is None and right is not None:
+                canonical_claims[gate] = right
+            elif left is not None and right is not None:
+                canonical_claims[gate] = {
+                    **left,
+                    **right,
+                    "status": "open"
+                    if "open" in {left.get("status"), right.get("status")}
+                    else "resolved",
+                    "generation": max(
+                        int(left.get("generation", 1)),
+                        int(right.get("generation", 1)),
+                    ),
+                    "last_round": max(
+                        int(left.get("last_round", 0)),
+                        int(right.get("last_round", 0)),
+                    ),
+                }
         canonical["first_round"] = min(canonical["first_round"], merged["first_round"])
         if merged["status"] == "open":
             canonical["status"] = "open"
@@ -1431,6 +1539,9 @@ def cmd_permit_review(args: argparse.Namespace) -> None:
             for item in state.get("review_permits", [])
             if item.get("role") == args.role
             and item.get("head") == actual_head
+            and item.get("review_generation", 1) == state.get("review_generation", 1)
+            and not item.get("cancelled_at")
+            and not item.get("superseded_at")
             and not item.get("receipt_consumed_at")
         ]
         if active:

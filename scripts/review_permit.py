@@ -31,6 +31,7 @@ def ledger_path(shared_root: Path, ledger_dir: str, pr: str) -> Path:
             "review ledger directory must stay in the shared repository"
         )
     directory = shared_root / relative
+    repository = str(shared_root.resolve())
     legacy = directory / f"pr-{safe_pr(pr)}.json"
     candidates = []
     for candidate in directory.glob("subject-*.json") if directory.exists() else []:
@@ -39,12 +40,30 @@ def ledger_path(shared_root: Path, ledger_dir: str, pr: str) -> Path:
         except (OSError, json.JSONDecodeError):
             continue
         subject = state.get("work_subject")
-        if isinstance(subject, dict) and subject.get("id") == str(pr):
+        if (
+            isinstance(subject, dict)
+            and subject.get("id") == str(pr)
+            and subject.get("repository") == repository
+        ):
             candidates.append(candidate)
     if len(candidates) == 1:
         return candidates[0]
     if len(candidates) > 1:
         raise ReviewPermitError("review subject is ambiguous")
+    if legacy.exists():
+        try:
+            state = json.loads(legacy.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ReviewPermitError(f"cannot read legacy review ledger: {exc}") from exc
+        subject = state.get("work_subject")
+        if not (
+            isinstance(subject, dict)
+            and subject.get("id") == str(pr)
+            and subject.get("repository") == repository
+        ):
+            raise ReviewPermitError(
+                "legacy review ledger subject is ambiguous; migrate it explicitly"
+            )
     return legacy
 
 
@@ -73,7 +92,14 @@ def consume(
             ),
             None,
         )
-        if not permit or permit.get("started_at") or permit.get("completion_receipt"):
+        if (
+            not permit
+            or permit.get("started_at")
+            or permit.get("completion_receipt")
+            or permit.get("cancelled_at")
+            or permit.get("superseded_at")
+            or permit.get("receipt_consumed_at")
+        ):
             raise ReviewPermitError("review phase permit is missing or already started")
         expected = {
             "work_subject": state.get("work_subject"),
@@ -136,7 +162,13 @@ def complete(
         state = json.loads(path.read_text(encoding="utf-8"))
         permits = state.get("review_permits", [])
         permit = next((item for item in permits if item.get("token") == token), None)
-        if not permit or permit.get("completion_receipt"):
+        if (
+            not permit
+            or permit.get("completion_receipt")
+            or permit.get("cancelled_at")
+            or permit.get("superseded_at")
+            or permit.get("receipt_consumed_at")
+        ):
             raise ReviewPermitError(
                 "review phase permit is missing or already completed"
             )
@@ -205,6 +237,8 @@ def cancel_started(
             or any(permit.get(key) != value for key, value in expected.items())
             or not permit.get("started_at")
             or permit.get("completion_receipt")
+            or permit.get("cancelled_at")
+            or permit.get("superseded_at")
         ):
             raise ReviewPermitError(
                 "only a started, incomplete matching permit can be cancelled"
@@ -238,6 +272,9 @@ def consume_completion(
         not permit
         or not permit.get("completion_receipt")
         or permit.get("receipt_consumed_at")
+        or permit.get("cancelled_at")
+        or permit.get("superseded_at")
+        or permit.get("review_generation", 1) != state.get("review_generation", 1)
         or permit.get("result_sha256") != digest
     ):
         return False
@@ -251,5 +288,7 @@ def consumed_permit(state: dict[str, Any], token: str, *, role: str, head: str) 
         and item.get("role") == role
         and item.get("head") == head.lower()
         and item.get("completion_receipt")
+        and not item.get("cancelled_at")
+        and not item.get("superseded_at")
         for item in state.get("review_permits", [])
     )
