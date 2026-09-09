@@ -52,9 +52,35 @@ eq "a no-tracker PR owns an immutable repository-bound subject" \
 if led open 1 --work-kind jira --work-id PROJ-1 >/dev/null 2>&1; then
   bad "an existing ledger work subject cannot be rebound"
 else ok "an existing ledger work subject cannot be rebound"; fi
-led open jira-work --work-kind jira --work-id proj-101 >/dev/null
-eq "a Jira-backed ledger normalizes its work subject" "PROJ-101" \
-  "$(led status jira-work | python3 -c 'import json,sys; print(json.load(sys.stdin)["work_subject"]["id"])')"
+led open PROJ-100 --work-kind jira --work-id proj-100 >/dev/null
+eq "a Jira-backed ledger normalizes its work subject" "PROJ-100" \
+  "$(led status PROJ-100 | python3 -c 'import json,sys; print(json.load(sys.stdin)["work_subject"]["id"])')"
+led open 30 --work-kind jira --work-id PROJ-101 >/dev/null
+eq "a Jira-backed ledger resolves through its distinct PR number" "PROJ-101" \
+  "$(led status 30 | python3 -c 'import json,sys; print(json.load(sys.stdin)["work_subject"]["id"])')"
+cat > "$TMP/jira-pr-pass.json" <<'JSON'
+{"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[{"name":"review","status":"pass"}],"findings":[]}
+JSON
+eq "distinct Jira and PR ids complete permit and record end to end" "gates-clear" \
+  "$(review_record 30 code "$TMP/jira-pr-pass.json" | field next_action)"
+if led design-open 30 >/dev/null 2>&1; then
+  bad "the same PR cannot collide across work-subject kinds"
+else ok "the same PR cannot collide across work-subject kinds"; fi
+led open 31 --work-kind jira --work-id PROJ-102 >/dev/null
+JIRA_CANCEL_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+JIRA_CANCEL_PERMIT="$(led permit-review 31 --role code-reviewer --head "$JIRA_CANCEL_HEAD" | field review_phase_permit)"
+python3 - "$TMP" "$JIRA_CANCEL_PERMIT" "$JIRA_CANCEL_HEAD" "$LEDGER" <<'PY'
+import importlib.util,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location("review_permit",str(Path(sys.argv[4]).with_name("review_permit.py")))
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+common=dict(shared_root=Path(sys.argv[1]),ledger_dir=".orchestration/.review-ledger",pr="31",token=sys.argv[2],role="code-reviewer",head=sys.argv[3])
+module.consume(**common,timestamp="start")
+module.cancel_started(**common,timestamp="cancel")
+PY
+if led complete-review 31 --role code-reviewer --phase-permit "$JIRA_CANCEL_PERMIT" --result "$TMP/jira-pr-pass.json" >/dev/null 2>&1; then
+  bad "cancelled permit resolves by PR when Jira id differs"
+else ok "cancelled permit resolves by PR when Jira id differs"; fi
 led open no-tracker-e2e >/dev/null
 cat > "$TMP/no-tracker-pass.json" <<'JSON'
 {"schema_version":1,"gate":"code-review","verdict":"PASS","checks":[{"name":"review","status":"pass"}],"findings":[]}
@@ -79,6 +105,9 @@ eq "sanitized free-form ids retain exact collision-free identity" "free/form" \
   "$(led status 'free/form' | python3 -c 'import json,sys; print(json.load(sys.stdin)["work_subject"]["id"])')"
 eq "colliding free-form ids own distinct ledgers" "free-form" \
   "$(led status 'free-form' | python3 -c 'import json,sys; print(json.load(sys.stdin)["work_subject"]["id"])')"
+if led status 'free form' >/dev/null 2>&1; then
+  bad "lossy aliases cannot select a canonical subject ledger"
+else ok "fallback lookup requires the exact immutable subject"; fi
 
 # --- round 1 has full blocking authority --------------------------------------
 led open 2 >/dev/null
@@ -115,6 +144,22 @@ eq "one gate cannot auto-resolve another gate claim" "src/shared.py:check" \
 eq "aggregate resolves only after every owning gate clears its claim" "" \
   "$(led record gate-owned --gate security-review --verdict FAIL | field open_blocking)"
 
+led open staged-generation >/dev/null
+led record staged-generation --gate code-review --verdict FAIL --blocking 'src/staged.py:check' >/dev/null
+led record staged-generation --gate security-review --verdict FAIL --blocking 'src/staged.py:check' >/dev/null
+cat > "$TMP/staged-repair.json" <<'JSON'
+{"schema_version":1,"head":"abcdef9","findings":[{"component":"src/staged.py:check","status":"closed","root_cause":"shared boundary","change":"fixed shared boundary","verification":"both gate regressions pass"}]}
+JSON
+led record-repair staged-generation --report "$TMP/staged-repair.json" >/dev/null
+led record staged-generation --gate security-review --verdict FAIL --head abcdef9 >/dev/null
+eq "partial generation does not finalize component claims" "src/staged.py:check" \
+  "$(led status staged-generation | field open_blocking)"
+led record staged-generation --gate code-review --verdict FAIL --head abcdef9 >/dev/null
+eq "all gate results remain staged until explicit generation finalization" "src/staged.py:check" \
+  "$(led status staged-generation | field open_blocking)"
+eq "finalization applies every gate claim atomically" "" \
+  "$(led complete-repair-review staged-generation | field open_blocking)"
+
 led open concurrent-permits >/dev/null
 HEAD_CONCURRENT="$(git -C "$TMP" rev-parse HEAD)"
 CODE_PERMIT="$(led permit-review concurrent-permits --role code-reviewer --head "$HEAD_CONCURRENT" | field review_phase_permit)"
@@ -134,14 +179,35 @@ else
   bad "concurrent gate permits remain completable and recordable in either order"
 fi
 
+# A provider-side pre-ack cancellation is terminal, not a reusable permit.
+led open cancelled-permit >/dev/null
+CANCEL_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+CANCEL_PERMIT="$(led permit-review cancelled-permit --role code-reviewer --head "$CANCEL_HEAD" | field review_phase_permit)"
+python3 - "$TMP" "$CANCEL_PERMIT" "$CANCEL_HEAD" "$LEDGER" <<'PY'
+import importlib.util,json,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location("review_permit",str(Path(sys.argv[4]).with_name("review_permit.py")))
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+module.consume(shared_root=Path(sys.argv[1]),ledger_dir=".orchestration/.review-ledger",pr="cancelled-permit",token=sys.argv[2],role="code-reviewer",head=sys.argv[3],timestamp="start")
+module.cancel_started(shared_root=Path(sys.argv[1]),ledger_dir=".orchestration/.review-ledger",pr="cancelled-permit",token=sys.argv[2],role="code-reviewer",head=sys.argv[3],timestamp="cancel")
+PY
+if led complete-review cancelled-permit --role code-reviewer --phase-permit "$CANCEL_PERMIT" --result "$TMP/concurrent-code.json" >/dev/null 2>&1; then
+  bad "cancelled permit cannot complete"
+else ok "cancelled permit cannot complete"; fi
+
 # --- explicit repairs, redesign, and the cap ----------------------------------
 led open 5 --max-rounds 2 >/dev/null
 led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef1 >/dev/null
 led repair-brief 5 | grep -q 'stable finding ID' && ok "repair brief carries stable IDs" || bad "repair brief carries stable IDs"
+STALE_HEAD="$(git -C "$TMP" rev-parse HEAD)"
+STALE_PERMIT="$(led permit-review 5 --role code-reviewer --head "$STALE_HEAD" | field review_phase_permit)"
 cat > "$TMP/repair-1.json" <<'JSON'
 {"schema_version":1,"head":"abcdef1","findings":[{"component":"src/a.ts:foo","status":"closed","root_cause":"wrong branch","change":"corrected branch","verification":"named regression passes"}]}
 JSON
 eq "recording a repair starts a pending review" "True" "$(led record-repair 5 --report "$TMP/repair-1.json" | field repair_pending_review)"
+if led complete-review 5 --role code-reviewer --phase-permit "$STALE_PERMIT" --result "$TMP/concurrent-code.json" >/dev/null 2>&1; then
+  bad "superseded generation permit cannot complete"
+else ok "superseded generation permit cannot complete"; fi
 if led record 5 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --head abcdef2 >/dev/null 2>&1; then
   bad "a reviewer cannot record against the wrong repaired head"
 else ok "a reviewer cannot record against the wrong repaired head"; fi
@@ -255,6 +321,46 @@ led open 8 >/dev/null
 led record 8 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' >/dev/null
 led record 8 --gate code-review --verdict FAIL --blocking 'src/a.ts:foo' --blocking 'src/a.ts:fooHelper' --regression 'src/a.ts:fooHelper' >/dev/null
 eq "aliasing a drifted key merges its strikes" "3" "$(led alias 8 --from 'src/a.ts:fooHelper' --to 'src/a.ts:foo' | field strikes)"
+
+led open alias-claims >/dev/null
+led record alias-claims --gate code-review --verdict FAIL --blocking 'src/a.ts:canonical' >/dev/null
+led record alias-claims --gate security-review --verdict FAIL --blocking 'src/a.ts:drifted' >/dev/null
+led alias alias-claims --from 'src/a.ts:drifted' --to 'src/a.ts:canonical' >/dev/null
+eq "aliasing preserves every gate owner" "code-review,security-review" \
+  "$(led status alias-claims | python3 -c 'import json,sys; print(",".join(sorted(json.load(sys.stdin)["components"]["src/a.ts:canonical"]["claims"])))')"
+eq "code gate cannot resolve aliased security ownership" "src/a.ts:canonical" \
+  "$(led record alias-claims --gate code-review --verdict FAIL | field open_blocking)"
+
+led open legacy-alias-claims >/dev/null
+led record legacy-alias-claims --gate code-review --verdict FAIL --blocking 'src/a.ts:canonical' >/dev/null
+led record legacy-alias-claims --gate security-review --verdict FAIL --blocking 'src/a.ts:drifted' >/dev/null
+python3 - "$TMP/.orchestration/.review-ledger" <<'PY'
+import json,sys
+from pathlib import Path
+path=next(p for p in Path(sys.argv[1]).glob("subject-*.json") if json.loads(p.read_text()).get("pr") == "legacy-alias-claims")
+state=json.loads(path.read_text())
+for component in state["components"].values(): component.pop("claims", None)
+path.write_text(json.dumps(state, indent=2, sort_keys=True)+"\n")
+PY
+led alias legacy-alias-claims --from 'src/a.ts:drifted' --to 'src/a.ts:canonical' >/dev/null
+eq "alias backfills every legacy per-gate owner before merge" "code-review,security-review" \
+  "$(led status legacy-alias-claims | python3 -c 'import json,sys; print(",".join(sorted(json.load(sys.stdin)["components"]["src/a.ts:canonical"]["claims"])))')"
+
+led open recorded-alias >/dev/null
+led record recorded-alias --gate code-review --verdict FAIL --blocking 'src/a.ts:canonical' --blocking 'src/a.ts:old' >/dev/null
+led alias recorded-alias --from 'src/a.ts:old' --to 'src/a.ts:canonical' >/dev/null
+eq "direct recording resolves persisted aliases" "src/a.ts:canonical" \
+  "$(led record recorded-alias --gate code-review --verdict FAIL --blocking 'src/a.ts:old' | field accepted_blocking)"
+eq "direct recording cannot recreate an aliased component" "src/a.ts:canonical" \
+  "$(led status recorded-alias | python3 -c 'import json,sys; print(",".join(sorted(json.load(sys.stdin)["components"])))')"
+cat > "$TMP/recorded-alias-repair.json" <<'JSON'
+{"schema_version":1,"head":"abcdef8","findings":[{"component":"src/a.ts:canonical","status":"closed","root_cause":"drift","change":"canonicalized","verification":"alias regression"}]}
+JSON
+led record-repair recorded-alias --report "$TMP/recorded-alias-repair.json" >/dev/null
+led record recorded-alias --gate code-review --verdict FAIL --blocking 'src/a.ts:old' --head abcdef8 >/dev/null
+led complete-repair-review recorded-alias >/dev/null
+eq "staged recording resolves persisted aliases" "src/a.ts:canonical" \
+  "$(led status recorded-alias | field open_blocking)"
 
 # --- v0.7 ledgers preserve their already-spent budget -------------------------
 cat > "$TMP/.orchestration/.review-ledger/pr-legacy.json" <<'JSON'

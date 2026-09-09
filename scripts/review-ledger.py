@@ -33,6 +33,7 @@ from review_permit import (
     ReviewPermitError,
     complete as complete_review_permit,
     consume_completion,
+    subject_ledger_candidates,
 )
 from runtime_state import (
     RuntimeStateError,
@@ -137,6 +138,19 @@ def normalize_key(raw: str) -> str:
     if not path:
         raise LedgerError(f"component key has no path segment: {raw!r}")
     return f"{path}:{symbol}" if symbol else path
+
+
+def resolve_alias(state: dict[str, Any], key: str) -> str:
+    """Resolve a persisted component alias to its canonical stable key."""
+    aliases = state.get("aliases", {})
+    seen: set[str] = set()
+    current = key
+    while current in aliases:
+        if current in seen:
+            raise LedgerError(f"component alias cycle includes {current}")
+        seen.add(current)
+        current = normalize_key(str(aliases[current]))
+    return current
 
 
 # --- state --------------------------------------------------------------------
@@ -258,9 +272,11 @@ def ledger_path(args: argparse.Namespace) -> Path:
         slug = (
             re.sub(r"[^A-Za-z0-9_.-]", "-", subject["id"]).strip("-")[:48] or "subject"
         )
-        encoded = json.dumps(subject, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        encoded = json.dumps(
+            {"pr": identifier, "work_subject": subject},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
         return (
             directory
             / f"subject-{subject['kind']}-{slug}-{hashlib.sha256(encoded).hexdigest()[:20]}.json"
@@ -290,33 +306,37 @@ def ledger_path(args: argparse.Namespace) -> Path:
                 )
             target = canonical_path(legacy_subject)
         os.replace(legacy, target)
-    if target.exists():
-        return target
-
-    # Existing commands historically only carry the display id. Resolve it by
-    # exact embedded subject equality, never by a lossy filename slug.
-    matches: list[Path] = []
-    for candidate in directory.glob("subject-*.json"):
+    # Gate commands carry the PR id even when Jira owns the work subject. Locate
+    # by immutable state.pr, then enforce repository and any explicitly supplied
+    # subject. This also prevents a PR subject and Jira subject from colliding.
+    matches = subject_ledger_candidates(
+        directory, requested["repository"], identifier
+    )
+    explicit_subject = bool(
+        getattr(args, "work_kind", None) or getattr(args, "work_id", None)
+    )
+    exact = []
+    for candidate in matches:
         try:
-            candidate_state = load(candidate)
-            subject = candidate_state.get("work_subject")
+            if load(candidate).get("work_subject") == requested:
+                exact.append(candidate)
         except LedgerError:
             continue
-        if (
-            isinstance(subject, dict)
-            and (
-                subject.get("id") == identifier
-                or str(candidate_state.get("pr")) == identifier
+    if explicit_subject:
+        if len(exact) == 1:
+            return exact[0]
+        if matches:
+            raise LedgerError(
+                "review ledger PR is already bound to a different immutable work subject"
             )
-            and subject.get("repository") == requested["repository"]
-        ):
-            matches.append(candidate)
-    if len(matches) == 1:
+    elif len(matches) == 1:
         return matches[0]
-    if len(matches) > 1:
+    elif len(matches) > 1:
         raise LedgerError(
-            "work subject id is ambiguous; supply --work-kind and --work-id"
+            "PR ledger is ambiguous; supply --work-kind and --work-id"
         )
+    if target.exists():
+        return target
     return target
 
 
@@ -548,17 +568,71 @@ def _component(
             "redesigned_at_repair_failure": 0,
         }
         state["components"][key] = component
-    component.setdefault(
-        "claims",
-        {
+    if not isinstance(component.get("claims"), dict):
+        component["claims"] = {}
+    if not component["claims"] and component.get("gates"):
+        component["claims"].update(
+            {
             gate: {
                 "status": component.get("status", "open"),
                 "last_round": component.get("last_round", round_no),
+                "generation": component.get("review_generation", 1),
             }
             for gate in component.get("gates", [])
-        },
-    )
+            }
+        )
     return component
+
+
+def apply_gate_claims(
+    state: dict[str, Any],
+    *,
+    gate: str,
+    accepted: list[tuple[str, str]],
+    finding_details: dict[str, dict[str, Any]],
+    round_no: int,
+) -> list[str]:
+    """Atomically apply one gate's claims without disturbing other owners."""
+    accepted_keys = {key for key, _ in accepted}
+    for key, raw in accepted:
+        component = _component(state, key, raw, round_no)
+        component["strikes"] += 1
+        component["status"] = "open"
+        component["display"] = raw.strip()
+        component["last_round"] = round_no
+        component["rounds"].append(round_no)
+        if key in finding_details:
+            component["finding"] = finding_details[key]
+        if gate not in component["gates"]:
+            component["gates"].append(gate)
+        component["claims"][gate] = {
+            "status": "open",
+            "last_round": round_no,
+            "generation": state.get("review_generation", 1),
+        }
+
+    resolved: list[str] = []
+    for key, component in state["components"].items():
+        claims = _component(state, key, component.get("display", key), round_no)[
+            "claims"
+        ]
+        claim = claims.get(gate)
+        if claim and claim.get("status") == "open" and key not in accepted_keys:
+            claim.update(
+                {
+                    "status": "resolved",
+                    "resolved_round": round_no,
+                    "resolved_generation": state.get("review_generation", 1),
+                }
+            )
+        aggregate_open = any(item.get("status") == "open" for item in claims.values())
+        was_open = component.get("status") == "open"
+        component["status"] = "open" if aggregate_open else "resolved"
+        if was_open and not aggregate_open:
+            component["resolved_round"] = round_no
+            component["resolved_by_gate"] = gate
+            resolved.append(key)
+    return resolved
 
 
 def cmd_record(args: argparse.Namespace) -> None:
@@ -637,60 +711,72 @@ def cmd_record(args: argparse.Namespace) -> None:
         # The security gate never loses blocking authority to the scope freeze: a
         # data leak found late is not a process nit.
         exempt = args.gate == "security-review"
-        regressions = {normalize_key(k) for k in args.regression}
+        finding_details = {
+            resolve_alias(state, key): value for key, value in finding_details.items()
+        }
+        regressions = {
+            resolve_alias(state, normalize_key(k)) for k in args.regression
+        }
 
         accepted: list[tuple[str, str]] = []
         demoted: list[tuple[str, str]] = []
+        accepted_seen: set[str] = set()
         for raw in args.blocking:
-            key = normalize_key(raw)
+            key = resolve_alias(state, normalize_key(raw))
             known = key in state["components"]
             if scope == FULL or known or key in regressions or exempt:
-                accepted.append((key, raw))
+                if key not in accepted_seen:
+                    accepted.append((key, raw))
+                    accepted_seen.add(key)
             else:
                 demoted.append((key, raw))
 
         accepted_keys = {key for key, _ in accepted}
-        for key, raw in accepted:
-            component = _component(state, key, raw, round_no)
-            component["strikes"] += 1
-            component["status"] = "open"
-            component["display"] = raw.strip()
-            component["last_round"] = round_no
-            component["rounds"].append(round_no)
-            if key in finding_details:
-                component["finding"] = finding_details[key]
-            if args.gate not in component["gates"]:
-                component["gates"].append(args.gate)
-            component["claims"][args.gate] = {"status": "open", "last_round": round_no}
-
-        # A gate may close only its own claim. Another gate's independently
-        # reported claim remains open until that gate completes without it.
-        resolved: list[str] = []
-        for key, component in state["components"].items():
-            claims = _component(state, key, component.get("display", key), round_no)[
-                "claims"
-            ]
-            claim = claims.get(args.gate)
-            if claim and claim.get("status") == "open" and key not in accepted_keys:
-                claim.update({"status": "resolved", "resolved_round": round_no})
-            aggregate_open = any(
-                item.get("status") == "open" for item in claims.values()
+        pending_attempt = (
+            state["repair_attempts"][-1]
+            if state.get("repair_pending_review") and state.get("repair_attempts")
+            else None
+        )
+        if pending_attempt is not None:
+            staged = pending_attempt.setdefault("gate_claims", {})
+            if args.gate in staged:
+                raise LedgerError(
+                    f"gate {args.gate} already recorded for review generation "
+                    f"{state.get('review_generation', 1)}"
+                )
+            staged[args.gate] = {
+                "round": round_no,
+                "accepted": [
+                    {
+                        "key": key,
+                        "display": raw,
+                        **(
+                            {"finding": finding_details[key]}
+                            if key in finding_details
+                            else {}
+                        ),
+                    }
+                    for key, raw in accepted
+                ],
+            }
+            resolved = []
+        else:
+            resolved = apply_gate_claims(
+                state,
+                gate=args.gate,
+                accepted=accepted,
+                finding_details=finding_details,
+                round_no=round_no,
             )
-            was_open = component.get("status") == "open"
-            component["status"] = "open" if aggregate_open else "resolved"
-            if was_open and not aggregate_open:
-                component["resolved_round"] = round_no
-                component["resolved_by_gate"] = args.gate
-                resolved.append(key)
 
         advisories = [
             {
-                "key": normalize_key(raw),
+                "key": resolve_alias(state, normalize_key(raw)),
                 "display": raw.strip(),
                 "reason": "reported-advisory",
                 **(
-                    {"finding": finding_details[normalize_key(raw)]}
-                    if normalize_key(raw) in finding_details
+                    {"finding": finding_details[resolve_alias(state, normalize_key(raw))]}
+                    if resolve_alias(state, normalize_key(raw)) in finding_details
                     else {}
                 ),
             }
@@ -862,6 +948,14 @@ def cmd_record_repair(args: argparse.Namespace) -> None:
         }
         state["repair_attempts"].append(attempt)
         state["review_generation"] += 1
+        superseded_at = now()
+        for permit in state.get("review_permits", []):
+            if (
+                permit.get("review_generation", 1) < state["review_generation"]
+                and not permit.get("receipt_consumed_at")
+            ):
+                permit["superseded_at"] = superseded_at
+                permit["superseded_by_generation"] = state["review_generation"]
         state["repair_pending_review"] = True
         save(path, state)
         emit(
@@ -887,6 +981,27 @@ def cmd_complete_repair_review(args: argparse.Namespace) -> None:
             raise LedgerError(
                 f"repair review is incomplete; missing gates: {', '.join(missing)}"
             )
+        for gate in attempt["required_gates"]:
+            staged = attempt.get("gate_claims", {}).get(gate)
+            if not staged:
+                raise LedgerError(f"repair review has no staged claims for gate: {gate}")
+            accepted = [
+                (str(item["key"]), str(item["display"]))
+                for item in staged.get("accepted", [])
+            ]
+            details = {
+                str(item["key"]): item["finding"]
+                for item in staged.get("accepted", [])
+                if "finding" in item
+            }
+            apply_gate_claims(
+                state,
+                gate=gate,
+                accepted=accepted,
+                finding_details=details,
+                round_no=int(staged["round"]),
+            )
+        attempt["claims_finalized_at"] = now()
         remaining = {item["key"] for item in open_components(state)}
         attempt["open_after"] = sorted(remaining)
         attempt["closed"] = sorted(set(attempt["open_before"]) - remaining)
@@ -1168,6 +1283,7 @@ def cmd_status(args: argparse.Namespace) -> None:
             "gates": component["gates"],
             "rounds": component["rounds"],
             "display": component["display"],
+            "claims": component.get("claims", {}),
         }
         for key, component in sorted(state["components"].items())
     }
@@ -1362,20 +1478,54 @@ def cmd_alias(args: argparse.Namespace) -> None:
     with locked(path):
         state = load(path)
         source = normalize_key(args.source)
-        target = normalize_key(args.target)
+        target = resolve_alias(state, normalize_key(args.target))
         if source == target:
             raise LedgerError("alias source and target normalize to the same key")
         if source not in state["components"]:
             raise LedgerError(f"no such component on the ledger: {source}")
+        # Materialize legacy gate ownership before either component is removed
+        # or combined. Old ledgers recorded `gates` without per-gate claims.
+        _component(
+            state,
+            source,
+            state["components"][source].get("display", args.source),
+            int(state["components"][source].get("last_round", 1)),
+        )
         merged = state["components"].pop(source)
         canonical = _component(state, target, args.target, merged["first_round"])
         canonical["strikes"] += merged["strikes"]
         canonical["rounds"] = sorted(set(canonical["rounds"] + merged["rounds"]))
         canonical["gates"] = sorted(set(canonical["gates"] + merged["gates"]))
+        canonical_claims = canonical.setdefault("claims", {})
+        merged_claims = merged.get("claims", {})
+        for gate in canonical["gates"]:
+            left = canonical_claims.get(gate)
+            right = merged_claims.get(gate)
+            if left is None and right is not None:
+                canonical_claims[gate] = right
+            elif left is not None and right is not None:
+                canonical_claims[gate] = {
+                    **left,
+                    **right,
+                    "status": "open"
+                    if "open" in {left.get("status"), right.get("status")}
+                    else "resolved",
+                    "generation": max(
+                        int(left.get("generation", 1)),
+                        int(right.get("generation", 1)),
+                    ),
+                    "last_round": max(
+                        int(left.get("last_round", 0)),
+                        int(right.get("last_round", 0)),
+                    ),
+                }
         canonical["first_round"] = min(canonical["first_round"], merged["first_round"])
         if merged["status"] == "open":
             canonical["status"] = "open"
         state.setdefault("aliases", {})[source] = target
+        for alias, destination in list(state["aliases"].items()):
+            if alias != source and normalize_key(str(destination)) == source:
+                state["aliases"][alias] = target
         save(path, state)
         emit(
             {
@@ -1434,6 +1584,9 @@ def cmd_permit_review(args: argparse.Namespace) -> None:
             for item in state.get("review_permits", [])
             if item.get("role") == args.role
             and item.get("head") == actual_head
+            and item.get("review_generation", 1) == state.get("review_generation", 1)
+            and not item.get("cancelled_at")
+            and not item.get("superseded_at")
             and not item.get("receipt_consumed_at")
         ]
         if active:
