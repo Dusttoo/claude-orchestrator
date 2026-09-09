@@ -80,10 +80,29 @@ Non-interactive background lanes can be prepared with `prepare-batch`. The
 controller accepts only current `plan.launch` tickets explicitly marked as
 background and non-interactive, reserves them under the sprint lock, and writes
 an Anthropic Message Batches JSON request or OpenAI Batch JSONL plus a durable
-marker beneath the configured checkpoint directory. The host submits the batch
-and records its provider id. Reconciliation invokes the provider adapter for
-terminal state and complete results, then applies each `custom_id` idempotently
-before normal per-ticket `finish` calls.
+marker beneath the configured checkpoint directory. `submit-batch` invokes the
+credential-owning adapter, which uploads or submits the immutable request and
+records a content-addressed acceptance receipt. `reconcile-batch` invokes that
+same adapter for terminal state and every native result/error page, freezes a
+content-addressed normalized bundle, and applies each `custom_id` idempotently
+before normal per-ticket `finish` calls. An ambiguous submission, nonterminal
+status, or missing terminal row leaves only the unresolved reservations fenced;
+successful rows are settled and provider-proven nonexecuted rows are released.
+
+Batch credentials are bound to the providers' built-in API origins. A custom
+gateway must be approved in the canonical
+`.orchestration/provider-origins.json` operator policy; caller environment base
+URLs are ignored by the batch adapter. The policy maps credential names, never
+credential values, to HTTPS URLs:
+
+```json
+{"schema_version":1,"credentials":{"OPENAI_API_KEY":"https://gateway.example/v1"}}
+```
+
+`inspect-batch` migrates a schema-v1 marker to a fail-closed
+`legacy_uncertain` marker. `recover-legacy-batch --reason ...` records operator
+disposition without releasing its usage reservations; provider uncertainty must
+still be resolved outside the legacy marker before those funds can be reused.
 
 ## Ready ordering
 

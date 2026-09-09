@@ -1185,8 +1185,13 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             )
         request = {"requests": requests}
         endpoint = "/v1/messages/batches" if provider == "anthropic" else "/v1/batches"
+        if provider == "anthropic":
+            write_json(request_path, request)
+        else:
+            write_jsonl(request_path, requests)
+        request_sha256 = hashlib.sha256(request_path.read_bytes()).hexdigest()
         marker = {
-            "schema_version": 1,
+            "schema_version": 2,
             "batch_id": batch_id,
             "sprint_id": state["sprint"]["id"],
             "provider": provider,
@@ -1195,15 +1200,12 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             else "pending_upload",
             "endpoint": endpoint,
             "request_file": str(request_path),
+            "request_sha256": request_sha256,
             "provider_batch_id": "",
             "jobs": marker_jobs,
             "created_at": now(),
             "updated_at": now(),
         }
-        if provider == "anthropic":
-            write_json(request_path, request)
-        else:
-            write_jsonl(request_path, requests)
         state.setdefault("batches", {})[batch_id] = marker
         save(path, state)
         write_json(marker_path, marker)
@@ -1219,67 +1221,226 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     )
 
 
-def reconcile_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
-    """Settle or release every reservation owned by one durable batch marker."""
-    marker_path = cfg["state_dir"] / f"batch-{args.batch}.state.json"
-    if not marker_path.is_file():
-        raise SprintError(f"batch marker not found: {marker_path}")
-    marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    if args.provider_evidence:
-        raise SprintError("caller-authored provider evidence is never authoritative")
-    if not marker.get("provider_batch_id"):
-        if not args.provider_batch_id:
-            raise SprintError(
-                "provider batch id is required before terminal reconciliation"
-            )
-        marker["provider_batch_id"] = args.provider_batch_id
-        marker["status"] = "submitted"
-        write_json(marker_path, marker)
-    elif (
-        args.provider_batch_id and args.provider_batch_id != marker["provider_batch_id"]
-    ):
-        raise SprintError("provider batch identity is immutable")
-    bundle_path = cfg["state_dir"] / f"batch-{args.batch}.terminal.json"
-    adapter = Path(__file__).with_name("provider_batch_fetch.py")
+def run_batch_adapter(
+    action: str,
+    marker_path: Path,
+    cfg: dict[str, Any],
+    *,
+    in_process_runner: Any | None = None,
+) -> dict[str, Any]:
+    if in_process_runner is not None:
+        value = in_process_runner(action, marker_path, cfg)
+        if not isinstance(value, dict):
+            raise SprintError("provider batch adapter returned an invalid receipt")
+        return value
+    adapter = Path(__file__).with_name("provider_batch_adapter.py")
     command = [
         sys.executable,
         str(adapter),
+        action,
         "--marker",
         str(marker_path),
-        "--bundle",
-        str(bundle_path),
     ]
-    if args.test_transport:
-        if not cfg["allow_test_evidence"]:
-            raise SprintError(
-                "test transport cannot authorize production reconciliation"
-            )
-        command.extend(["--test-transport", args.test_transport])
+    if action == "fetch":
+        command.extend(["--output-dir", str(cfg["state_dir"])])
     try:
-        subprocess.run(
+        result = subprocess.run(
             command, cwd=cfg["shared_root"], check=True, capture_output=True, text=True
         )
-        evidence = json.loads(bundle_path.read_text(encoding="utf-8"))
+        value = json.loads(result.stdout)
     except (OSError, json.JSONDecodeError, subprocess.CalledProcessError) as exc:
         raise SprintError(
-            "provider batch lookup did not produce authoritative terminal evidence; uncertainty remains reserved"
+            f"provider batch {action} did not produce authoritative adapter evidence; uncertainty remains reserved"
+        ) from exc
+    if not isinstance(value, dict):
+        raise SprintError("provider batch adapter returned an invalid receipt")
+    return value
+
+
+def load_batch_marker(marker_path: Path, *, migrate: bool = True) -> dict[str, Any]:
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SprintError("batch marker is unreadable") from exc
+    if marker.get("schema_version") == 1:
+        if not migrate:
+            return marker
+        legacy_digest = hashlib.sha256(
+            json.dumps(marker, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        marker.update(
+            {
+                "schema_version": 2,
+                "status": "legacy_uncertain",
+                "legacy_marker_sha256": legacy_digest,
+                "legacy_status": str(marker.get("status") or "unknown"),
+                "operator_recovery_required": True,
+                "updated_at": now(),
+            }
+        )
+        write_json(marker_path, marker)
+    if marker.get("schema_version") != 2:
+        raise SprintError("unsupported batch marker schema")
+    return marker
+
+
+def inspect_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    marker_path = cfg["state_dir"] / f"batch-{args.batch}.state.json"
+    if not marker_path.is_file():
+        raise SprintError(f"batch marker not found: {marker_path}")
+    with locked(marker_path):
+        marker = load_batch_marker(marker_path)
+        emit(
+            {
+                "batch_id": args.batch,
+                "status": marker.get("status"),
+                "provider_batch_id": marker.get("provider_batch_id") or "",
+                "reservations_fenced": marker.get("status")
+                in {"legacy_uncertain", "legacy_operator_action"},
+                "operator_recovery_required": bool(
+                    marker.get("operator_recovery_required")
+                ),
+            }
+        )
+
+
+def recover_legacy_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    marker_path = cfg["state_dir"] / f"batch-{args.batch}.state.json"
+    if not args.reason.strip():
+        raise SprintError("legacy batch recovery requires an operator reason")
+    with locked(marker_path):
+        marker = load_batch_marker(marker_path)
+        if marker.get("status") != "legacy_uncertain":
+            raise SprintError("batch is not awaiting legacy operator recovery")
+        marker.update(
+            {
+                "status": "legacy_operator_action",
+                "operator_recovery_required": False,
+                "operator_reason": args.reason.strip(),
+                "reservations_released": False,
+                "updated_at": now(),
+            }
+        )
+        write_json(marker_path, marker)
+    emit(
+        {
+            "batch_id": args.batch,
+            "status": "legacy_operator_action",
+            "reservations_fenced": True,
+        }
+    )
+
+
+def submit_batch(
+    args: argparse.Namespace, cfg: dict[str, Any], in_process_runner: Any | None = None
+) -> None:
+    """Submit a prepared request through the credential-owning provider adapter."""
+    marker_path = cfg["state_dir"] / f"batch-{args.batch}.state.json"
+    if not marker_path.is_file():
+        raise SprintError(f"batch marker not found: {marker_path}")
+    marker = load_batch_marker(marker_path)
+    if marker.get("status") in {"legacy_uncertain", "legacy_operator_action"}:
+        raise SprintError(
+            "legacy batch is fenced; run inspect-batch for operator recovery"
+        )
+    receipt = run_batch_adapter(
+        "submit", marker_path, cfg, in_process_runner=in_process_runner
+    )
+    marker = load_batch_marker(marker_path)
+    if (
+        marker.get("status") != "submitted"
+        or receipt.get("provider_batch_id") != marker.get("provider_batch_id")
+        or receipt.get("request_sha256") != marker.get("request_sha256")
+        or receipt.get("sha256")
+        != hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in receipt.items() if key != "sha256"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    ):
+        raise SprintError("provider adapter acceptance receipt is invalid")
+    emit(
+        {
+            "batch_id": args.batch,
+            "provider_batch_id": marker["provider_batch_id"],
+            "status": "submitted",
+        }
+    )
+
+
+def reconcile_batch(
+    args: argparse.Namespace, cfg: dict[str, Any], in_process_runner: Any | None = None
+) -> None:
+    marker_path = cfg["state_dir"] / f"batch-{args.batch}.state.json"
+    with locked(marker_path):
+        _reconcile_batch_locked(args, cfg, in_process_runner)
+
+
+def _reconcile_batch_locked(
+    args: argparse.Namespace, cfg: dict[str, Any], in_process_runner: Any | None = None
+) -> None:
+    """Apply one immutable adapter-owned terminal bundle exactly once per job."""
+    marker_path = cfg["state_dir"] / f"batch-{args.batch}.state.json"
+    if not marker_path.is_file():
+        raise SprintError(f"batch marker not found: {marker_path}")
+    marker = load_batch_marker(marker_path)
+    if args.provider_evidence or args.results or args.provider_batch_id:
+        raise SprintError(
+            "caller-authored provider identity, evidence, and results are never authoritative"
+        )
+    if marker.get("status") not in {
+        "submitted",
+        "reconciling",
+        "completed",
+        "failed",
+        "completed_with_failures",
+        "completed_with_uncertainty",
+    }:
+        raise SprintError("batch has no certain adapter-owned provider submission")
+    bundle_ref = marker.get("terminal_bundle")
+    if bundle_ref:
+        bundle_path = Path(str(bundle_ref.get("path") or "")).resolve()
+    else:
+        bundle_ref = run_batch_adapter(
+            "fetch", marker_path, cfg, in_process_runner=in_process_runner
+        )
+        bundle_path = Path(str(bundle_ref.get("path") or "")).resolve()
+    if (
+        bundle_path != cfg["shared_root"]
+        and cfg["shared_root"] not in bundle_path.parents
+    ):
+        raise SprintError("provider terminal bundle escapes the shared repository")
+    try:
+        evidence = json.loads(bundle_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SprintError(
+            "provider terminal bundle is unreadable; reservations remain fenced"
         ) from exc
     evidence_digest = hashlib.sha256(
-        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+    if (
+        bundle_ref.get("sha256") != evidence_digest
+        or bundle_path.name
+        != f"batch-{args.batch}.terminal.sha256-{evidence_digest}.json"
+    ):
+        raise SprintError(
+            "provider terminal bundle is not immutable and content-addressed"
+        )
     expected_jobs = sorted(str(item["custom_id"]) for item in marker.get("jobs", []))
     if (
         not isinstance(evidence, dict)
-        or evidence.get("schema_version") != 1
+        or evidence.get("schema_version") != 2
         or evidence.get("adapter") != f"{marker.get('provider')}-batch"
-        or evidence.get("authority")
-        not in (
-            {"provider-network", "test-only"}
-            if cfg["allow_test_evidence"]
-            else {"provider-network"}
-        )
+        or evidence.get("authority") != "provider-network"
         or evidence.get("batch_id") != marker.get("batch_id")
-        or not str(evidence.get("provider_batch_id") or "").strip()
+        or evidence.get("provider_batch_id") != marker.get("provider_batch_id")
+        or evidence.get("request_sha256") != marker.get("request_sha256")
+        or evidence.get("acceptance_receipt_sha256")
+        != marker.get("acceptance_receipt", {}).get("sha256")
+        or evidence.get("acceptance_receipt") != marker.get("acceptance_receipt")
         or sorted(evidence.get("job_ids") or []) != expected_jobs
     ):
         raise SprintError(
@@ -1290,7 +1451,12 @@ def reconcile_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         str(evidence.get("approved_origin") or ""),
     ):
         raise SprintError("provider batch evidence has no approved HTTPS origin")
-    for raw_ref in evidence.get("raw", []):
+    raw_refs = [evidence.get("acceptance_receipt", {}).get("raw")] + list(
+        evidence.get("raw_pages", [])
+    )
+    for raw_ref in raw_refs:
+        if not isinstance(raw_ref, dict):
+            raise SprintError("provider evidence has an invalid raw page reference")
         raw_path = Path(str(raw_ref.get("path") or "")).resolve()
         if (
             raw_path != cfg["shared_root"]
@@ -1306,123 +1472,126 @@ def reconcile_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             or raw_path.name != f"sha256-{raw_digest}.json"
         ):
             raise SprintError("provider raw evidence is not content-addressed")
-    terminal = {
-        "completed": {"completed", "ended"},
-        "failed": {"failed", "cancelled", "expired"},
-    }[args.outcome]
-    if evidence.get("status") not in terminal:
-        raise SprintError(
-            f"provider status {evidence.get('status')!r} is not terminal for {args.outcome}"
-        )
-    final_status = "completed" if args.outcome == "completed" else "failed"
-    if marker.get("status") == final_status:
-        if marker.get("provider_evidence_sha256") != evidence_digest:
-            raise SprintError("completed batch reconciliation evidence is immutable")
-        emit({"batch_id": args.batch, "status": final_status})
-        return
-    if marker.get("status") not in {
-        "pending_submission",
-        "pending_upload",
-        "submitted",
-        "reconciling_completed",
-        "reconciling_failed",
+    if evidence.get("status") not in {
+        "completed",
+        "ended",
+        "failed",
+        "cancelled",
+        "expired",
     }:
-        raise SprintError("batch is not awaiting reconciliation")
-    expected_reconciling = f"reconciling_{args.outcome}"
+        raise SprintError("provider status is not terminal")
+    if marker.get("status") in {
+        "completed",
+        "failed",
+        "completed_with_failures",
+        "completed_with_uncertainty",
+    }:
+        if marker.get("terminal_bundle", {}).get("sha256") != evidence_digest:
+            raise SprintError("completed batch reconciliation evidence is immutable")
+        emit({"batch_id": args.batch, "status": marker["status"]})
+        return
+    usage_ledger = UsageLedger(cfg["shared_root"])
+    rows = evidence.get("results")
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise SprintError("batch results require a normalized jobs array")
+    results_by_custom = {str(row.get("custom_id")): row for row in rows}
+    unresolved = set(evidence.get("unresolved_job_ids") or [])
     if (
-        str(marker.get("status")).startswith("reconciling_")
-        and marker.get("status") != expected_reconciling
+        len(results_by_custom) != len(rows)
+        or set(results_by_custom) & unresolved
+        or set(results_by_custom) | unresolved != set(expected_jobs)
     ):
-        raise SprintError("batch is already reconciling a different terminal outcome")
-    if marker.get("provider_evidence_sha256") not in {None, "", evidence_digest}:
-        raise SprintError("batch terminal evidence changed during reconciliation")
+        raise SprintError(
+            "batch results and unresolved jobs must partition reservations"
+        )
+    if (
+        evidence.get("results_sha256")
+        != hashlib.sha256(
+            json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    ):
+        raise SprintError("normalized provider results digest is invalid")
+    config = load_yaml(cfg["config"])
+    reservation_events = {
+        str(event.get("reservation_id")): event
+        for event in usage_ledger._events()
+        if event.get("kind") == "reservation"
+    }
+    journal = marker.setdefault("application_journal", {})
+    # Freeze the accepted bundle, normalized results, and every per-job intent
+    # before the first ledger settlement or requeue can occur.
     marker.update(
         {
-            "status": expected_reconciling,
-            "provider_batch_id": evidence["provider_batch_id"],
+            "status": "reconciling",
+            "terminal_bundle": bundle_ref,
             "provider_terminal_status": evidence["status"],
-            "provider_evidence_sha256": evidence_digest,
+            "results_sha256": evidence.get("results_sha256"),
             "updated_at": now(),
         }
     )
-    write_json(marker_path, marker)
-    usage_ledger = UsageLedger(cfg["shared_root"])
-    results: dict[str, dict[str, Any]] = {}
-    if args.outcome == "completed":
-        rows = evidence.get("results")
-        if not isinstance(rows, list):
-            raise SprintError("batch results require a jobs array")
-        by_custom = {item["custom_id"]: item["ticket"] for item in marker["jobs"]}
-        results = {
-            by_custom[str(row.get("custom_id"))]: row
-            for row in rows
-            if isinstance(row, dict) and str(row.get("custom_id")) in by_custom
-        }
-        if set(results) != {item["ticket"] for item in marker["jobs"]}:
-            raise SprintError(
-                "batch results must cover every reserved ticket exactly once"
-            )
-    config = load_yaml(cfg["config"])
-    settlements: dict[str, tuple[dict[str, int], str, str]] = {}
-    if args.outcome == "completed":
-        reservation_events = {
-            str(event.get("reservation_id")): event
-            for event in usage_ledger._events()
-            if event.get("kind") == "reservation"
-        }
-        for item in marker["jobs"]:
-            row = results[item["ticket"]]
-            raw_usage = row.get("usage")
-            if not isinstance(raw_usage, dict):
-                raise SprintError(f"batch result for {item['ticket']} requires usage")
-            normalized = {
-                key: int(raw_usage.get(key, 0))
-                for key in (
-                    "input_tokens",
-                    "cache_write_tokens",
-                    "cache_read_tokens",
-                    "output_tokens",
-                )
-            }
-            normalized["reasoning_tokens"] = int(raw_usage.get("reasoning_tokens", 0))
-            response_id = str(row.get("response_id") or "")
-            event = reservation_events.get(str(item["reservation_id"]))
-            if sum(normalized.values()) <= 0 or not response_id or not event:
-                raise SprintError(
-                    f"batch result for {item['ticket']} requires an open reservation, response_id, and nonzero usage"
-                )
-            settlements[item["ticket"]] = (normalized, response_id, str(event["model"]))
-    journal = marker.setdefault("application_journal", {})
     for item in marker["jobs"]:
-        if journal.get(item["custom_id"]) == args.outcome:
-            continue
-        if args.outcome == "failed":
+        row = results_by_custom.get(item["custom_id"], {})
+        job_outcome = str(row.get("outcome") or "ambiguous")
+        result_digest = hashlib.sha256(
+            json.dumps(row, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        prior = journal.get(item["custom_id"])
+        intent = {
+            "outcome": job_outcome,
+            "result_sha256": result_digest,
+            "ledger_applied": job_outcome == "ambiguous",
+            "state_applied": job_outcome in {"completed", "ambiguous"},
+        }
+        if prior and (
+            prior.get("outcome") != job_outcome
+            or prior.get("result_sha256") != result_digest
+        ):
+            raise SprintError("frozen per-job reconciliation intent changed")
+        journal.setdefault(item["custom_id"], intent)
+    write_json(marker_path, marker)
+    for item in marker["jobs"]:
+        entry = journal[item["custom_id"]]
+        row = results_by_custom.get(item["custom_id"], {})
+        if not entry["ledger_applied"] and entry["outcome"] == "failed":
+            if row.get("provider_proven_nonexecuted") is not True:
+                raise SprintError("failed provider row is not proven nonexecuted")
             usage_ledger.release(
                 item["reservation_id"], item["run_id"], "provider batch failed"
             )
-            journal[item["custom_id"]] = args.outcome
+            entry["ledger_applied"] = True
             write_json(marker_path, marker)
-            continue
-        normalized, response_id, model = settlements[item["ticket"]]
-        usage_ledger.settle(
-            item["reservation_id"],
-            run_id=item["run_id"],
-            ticket=item["ticket"],
-            sprint=str(marker["sprint_id"]),
-            provider=str(marker["provider"]),
-            model=str(model),
-            response_id=response_id,
-            usage=normalized,
-            cost=Pricing.from_config(config, str(model)).actual_cost(normalized),
-            role="sprint-worker",
-        )
-        journal[item["custom_id"]] = args.outcome
-        write_json(marker_path, marker)
-    if args.outcome == "failed":
-        checkpoint = state_path(cfg["state_dir"], str(marker["sprint_id"]))
-        with locked(checkpoint):
-            state = load(checkpoint)
-            for item in marker["jobs"]:
+        elif not entry["ledger_applied"]:
+            usage = row.get("usage")
+            response_id = str(row.get("response_id") or "")
+            event = reservation_events.get(str(item["reservation_id"]))
+            if (
+                not isinstance(usage, dict)
+                or sum(int(x) for x in usage.values()) <= 0
+                or not response_id
+                or not event
+            ):
+                raise SprintError(
+                    f"batch result for {item['ticket']} requires reservation, response id, and usage"
+                )
+            model = str(event["model"])
+            usage_ledger.settle(
+                item["reservation_id"],
+                run_id=item["run_id"],
+                ticket=item["ticket"],
+                sprint=str(marker["sprint_id"]),
+                provider=str(marker["provider"]),
+                model=model,
+                response_id=response_id,
+                usage=usage,
+                cost=Pricing.from_config(config, model).actual_cost(usage),
+                role="sprint-worker",
+            )
+            entry["ledger_applied"] = True
+            write_json(marker_path, marker)
+        if not entry["state_applied"]:
+            checkpoint = state_path(cfg["state_dir"], str(marker["sprint_id"]))
+            with locked(checkpoint):
+                state = load(checkpoint)
                 ticket = state["tickets"].get(item["ticket"])
                 if (
                     ticket
@@ -1441,8 +1610,19 @@ def reconcile_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                     ticket["history"].append(
                         {"at": now(), "event": "batch-failed-requeued"}
                     )
-            save(checkpoint, state)
-    marker["status"] = final_status
+                save(checkpoint, state)
+            entry["state_applied"] = True
+            write_json(marker_path, marker)
+    outcomes = {entry["outcome"] for entry in journal.values()}
+    marker["status"] = (
+        "completed_with_uncertainty"
+        if "ambiguous" in outcomes
+        else "failed"
+        if outcomes == {"failed"}
+        else "completed"
+        if outcomes == {"completed"}
+        else "completed_with_failures"
+    )
     marker["updated_at"] = now()
     write_json(marker_path, marker)
     emit({"batch_id": args.batch, "status": marker["status"]})
@@ -2252,6 +2432,16 @@ def parser() -> argparse.ArgumentParser:
     batch_parser.add_argument("--sprint", required=True)
     batch_parser.add_argument("--jobs", required=True)
     batch_parser.set_defaults(func=prepare_batch)
+    submit_batch_parser = commands.add_parser("submit-batch")
+    submit_batch_parser.add_argument("--batch", required=True)
+    submit_batch_parser.set_defaults(func=submit_batch)
+    inspect_batch_parser = commands.add_parser("inspect-batch")
+    inspect_batch_parser.add_argument("--batch", required=True)
+    inspect_batch_parser.set_defaults(func=inspect_batch)
+    recover_batch_parser = commands.add_parser("recover-legacy-batch")
+    recover_batch_parser.add_argument("--batch", required=True)
+    recover_batch_parser.add_argument("--reason", required=True)
+    recover_batch_parser.set_defaults(func=recover_legacy_batch)
     reconcile_batch_parser = commands.add_parser("reconcile-batch")
     reconcile_batch_parser.add_argument("--batch", required=True)
     reconcile_batch_parser.add_argument(
@@ -2260,7 +2450,6 @@ def parser() -> argparse.ArgumentParser:
     reconcile_batch_parser.add_argument("--results")
     reconcile_batch_parser.add_argument("--provider-evidence")
     reconcile_batch_parser.add_argument("--provider-batch-id")
-    reconcile_batch_parser.add_argument("--test-transport", help=argparse.SUPPRESS)
     reconcile_batch_parser.set_defaults(func=reconcile_batch)
     reserve_parser = commands.add_parser("reserve")
     reserve_parser.add_argument("--sprint", required=True)

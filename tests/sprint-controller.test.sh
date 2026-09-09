@@ -266,6 +266,8 @@ import json, sys
 from pathlib import Path
 for path in Path(sys.argv[1]).glob("*.json"):
     state = json.loads(path.read_text())
+    if not isinstance(state.get("tickets"), dict):
+        continue
     for ticket in state["tickets"].values():
         ticket.pop("priority", None)
     path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
@@ -394,18 +396,9 @@ cat > "$TMP/batch-terminal.json" <<JSON
 JSON
 run_fail "hand-authored terminal JSON cannot transition an uncertain batch" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --provider-evidence "$TMP/batch-terminal.json"
 cat > "$TMP/batch-transport.json" <<'JSON'
-{"status":{"id":"msgbatch_test","processing_status":"cancelled"},"result_pages":[]}
+{"submit":{"id":"msgbatch_test","type":"message_batch","processing_status":"in_progress"},"status":{"id":"msgbatch_test","processing_status":"cancelled"},"result_pages":[]}
 JSON
-run_ok "adapter-owned terminal lookup releases reservations" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --provider-batch-id msgbatch_test --test-transport "$TMP/batch-transport.json"
-run_ok "terminal batch reconciliation is idempotent" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --test-transport "$TMP/batch-transport.json"
-python3 - "$TMP/batch-result.json" <<'PY'
-import json,sys
-result=json.load(open(sys.argv[1])); marker=json.load(open(result["marker"])); marker["status"]="reconciling_failed"
-json.dump(marker,open(result["marker"],"w"),indent=2)
-PY
-run_ok "crash-partial batch reconciliation resumes idempotently" "$CONTROLLER" reconcile-batch --batch "$BATCH_ID" --outcome failed --test-transport "$TMP/batch-transport.json"
-"$CONTROLLER" plan --sprint 45 > "$TMP/batch-retry-plan.json"
-json_check "failed batch lanes return to bounded scheduling" "$TMP/batch-retry-plan.json" 'data["launch"] == ["PROJ-40", "PROJ-41"]'
+run_fail "production CLI has no synthetic batch transport authority" "$CONTROLLER" submit-batch --batch "$BATCH_ID" --test-transport "$TMP/batch-transport.json"
 
 cat > "$TMP/repo/interactive-job.json" <<'JSON'
 {"jobs":[{"ticket":"PROJ-40","background":true,"interactive":true,"params":{"model":"claude-sonnet-5","max_tokens":10,"messages":[{"role":"user","content":"x"}]}}]}
@@ -432,6 +425,8 @@ assert line["method"] == "POST" and line["url"] == "/v1/responses"
 assert marker["endpoint"] == "/v1/batches" and marker["provider"] == "openai"
 PY
 if [ "$?" -eq 0 ]; then ok "OpenAI background lanes serialize to Batch JSONL"; else fail_case "OpenAI background lanes serialize to Batch JSONL"; fi
+OPENAI_BATCH_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["batch_id"])' "$TMP/openai-batch-result.json")"
+run_fail "OpenAI production CLI also rejects synthetic transport" "$CONTROLLER" submit-batch --batch "$OPENAI_BATCH_ID" --test-transport "$TMP/openai-nonterminal.json"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi

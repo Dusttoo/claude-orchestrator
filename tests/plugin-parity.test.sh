@@ -58,7 +58,7 @@ contains_contract "Codex stdin sentinel" '--cd <repository> -' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "adapter-owned Jira fetch" 'sync --inventory-template' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
-contains_contract "adapter-owned terminal batch reconciliation" 'reconcile-batch.*--provider-batch-id' \
+contains_contract "adapter-owned provider batch submission" 'submit-batch --batch' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "per-ticket workflow dispatch" 'orchestrate' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md

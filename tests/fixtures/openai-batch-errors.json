@@ -1,0 +1,8 @@
+[
+  {
+    "id": "batch_req_02",
+    "custom_id": "job-b",
+    "response": null,
+    "error": {"code": "invalid_request_error", "message": "bad request"}
+  }
+]
