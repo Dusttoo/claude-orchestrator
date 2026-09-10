@@ -596,16 +596,16 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             raise SprintError("Jira fetch artifact is truncated before provider total")
         return sorted(keys)
 
-    parent_keys = sorted(
+    inventory_keys = sorted(
         normalize_key(item.get("key")) for item in raw_tickets if isinstance(item, dict)
     )
-    if proven_keys(by_kind["parents"], source_query) != parent_keys:
+    sprint_keys = proven_keys(by_kind["parents"], source_query)
+    child_keys = proven_keys(by_kind["children"], subtask_source_query)
+    if sorted(set(sprint_keys) | set(child_keys)) != inventory_keys:
         raise SprintError(
-            "Jira parent pages do not bind the exact inventory ticket keys"
+            "Jira sprint and child pages do not bind the exact inventory ticket keys"
         )
-    if proven_keys(by_kind["children"], subtask_source_query) != sorted(
-        discovered_subtasks
-    ):
+    if child_keys != sorted(discovered_subtasks):
         raise SprintError(
             "Jira child pages do not bind the exact independent child keys"
         )
