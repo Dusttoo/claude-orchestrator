@@ -401,7 +401,7 @@ def priority_rank(issue: dict[str, Any], priority_order: list[str]) -> int | Non
     return ranks[normalized]
 
 
-def policy_queries(project: str, sprint_policy: str) -> tuple[str, str]:
+def sprint_policy_query(project: str, sprint_policy: str) -> str:
     if not re.fullmatch(r"[A-Z][A-Z0-9_]*", project):
         raise ValueError("configured Jira project must be a canonical project key")
     if sprint_policy.casefold() == "active":
@@ -411,8 +411,14 @@ def policy_queries(project: str, sprint_policy: str) -> tuple[str, str]:
     else:
         escaped = sprint_policy.replace("\\", "\\\\").replace('"', '\\"')
         sprint_clause = f'sprint = "{escaped}"'
-    base = f'project = "{project}" AND {sprint_clause}'
-    return base, base + " AND issuetype in subTaskIssueTypes()"
+    return f'project = "{project}" AND {sprint_clause}'
+
+
+def subtask_policy_query(parent_keys: list[str]) -> str:
+    canonical = sorted({issue_key({"key": key}) for key in parent_keys})
+    if not canonical:
+        raise ValueError("Jira subtask query requires at least one proven parent key")
+    return "parent in (" + ",".join(canonical) + ")"
 
 
 def verify_issue_policy(
@@ -439,22 +445,27 @@ def build_inventory(
     priority_order: list[str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     del template
-    parent_jql, child_jql = policy_queries(project, sprint_policy)
+    parent_jql = sprint_policy_query(project, sprint_policy)
     parent_pages, parents = exhaustive(fetch, parent_jql, "parents", raw_dir, fields)
-    child_pages, children = exhaustive(fetch, child_jql, "children", raw_dir, fields)
     if not parents:
         raise ValueError(
             "Jira sprint query returned no issues; sprint identity is unproven"
         )
-    all_issues = parents + children
     keys = [issue_key(issue) for issue in parents]
     if len(keys) != len(set(keys)):
         raise ValueError("Jira parent query contains duplicate issues")
-    if not {issue_key(issue) for issue in children}.issubset(set(keys)):
-        raise ValueError("Jira child query returned an issue outside the sprint query")
+    child_jql = subtask_policy_query(keys)
+    child_pages, children = exhaustive(fetch, child_jql, "children", raw_dir, fields)
+    child_keys = [issue_key(issue) for issue in children]
+    if len(child_keys) != len(set(child_keys)):
+        raise ValueError("Jira child query contains duplicate issues")
+    for child in children:
+        key = issue_key(child)
+        if not key.startswith(f"{project}-"):
+            raise ValueError(f"Jira issue {key} is outside configured project {project}")
     sprints = {
         verify_issue_policy(issue, sprint_field, project, sprint_policy)
-        for issue in all_issues
+        for issue in parents
     }
     if len(sprints) != 1:
         raise ValueError("Jira issues disagree on exact sprint identity")
@@ -463,11 +474,12 @@ def build_inventory(
     issue_by_key = {issue_key(issue): issue for issue in parents}
     for child in children:
         key = issue_key(child)
-        combined = dict(issue_by_key[key])
+        combined = dict(issue_by_key.get(key, {}))
         combined["fields"] = {
-            **(issue_by_key[key].get("fields") or {}),
+            **(issue_by_key.get(key, {}).get("fields") or {}),
             **(child.get("fields") or {}),
         }
+        combined["key"] = key
         issue_by_key[key] = combined
     dependencies = {
         key: dependency_keys(issue, dependency_links)

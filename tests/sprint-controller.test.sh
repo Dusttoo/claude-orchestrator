@@ -33,8 +33,8 @@ jira_receipt() {
   local inventory="$1" artifact="$1.fetch.json" transport="$1.transport.json"
   python3 - "$inventory" "$transport" <<'PY'
 import json,sys
-value=json.load(open(sys.argv[1])); parents=sorted(x["key"].upper() for x in value["tickets"])
-children=sorted(x.upper() for x in value["subtask_keys"])
+value=json.load(open(sys.argv[1])); children=sorted(x.upper() for x in value["subtask_keys"])
+parents=sorted(x["key"].upper() for x in value["tickets"] if x["key"].upper() not in set(children))
 by_key={x["key"].upper():x for x in value["tickets"]}
 sprint=value["sprint"]
 def fields(item):

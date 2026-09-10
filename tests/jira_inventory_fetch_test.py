@@ -163,7 +163,6 @@ class JiraInventoryFetchTest(unittest.TestCase):
                         "summary": "child",
                         "status": {"name": "Ready"},
                         "priority": None,
-                        "sprint": {"id": "42", "name": "Provider Sprint"},
                         "parent": {"key": "PROJ-1"},
                         "subtasks": [],
                         "issuelinks": [],
@@ -173,9 +172,9 @@ class JiraInventoryFetchTest(unittest.TestCase):
         }
         parent = {
             "startAt": 0,
-            "total": 2,
+            "total": 1,
             "isLast": True,
-            "issues": [root_issue, child["issues"][0]],
+            "issues": [root_issue],
         }
         external = {
             "startAt": 0,
@@ -208,14 +207,19 @@ class JiraInventoryFetchTest(unittest.TestCase):
         self.assertEqual(output["dependency_status"], {"EXT-9": "In Progress"})
         self.assertNotIn("EVIL-9", json.dumps(output))
         self.assertEqual(artifact["authority"], "test-only")
+        self.assertEqual(
+            artifact["queries"][1]["jql"],
+            "parent in (PROJ-1)",
+        )
 
     def test_policy_constructs_queries_and_rejects_wrong_project(self) -> None:
         self.assertEqual(
-            jira.policy_queries("PROJ", "42"),
-            (
-                'project = "PROJ" AND sprint = 42',
-                'project = "PROJ" AND sprint = 42 AND issuetype in subTaskIssueTypes()',
-            ),
+            jira.sprint_policy_query("PROJ", "42"),
+            'project = "PROJ" AND sprint = 42',
+        )
+        self.assertEqual(
+            jira.subtask_policy_query(["PROJ-9", "PROJ-2"]),
+            "parent in (PROJ-2,PROJ-9)",
         )
         with self.assertRaisesRegex(ValueError, "outside configured project"):
             jira.verify_issue_policy(
