@@ -862,7 +862,7 @@ class HttpTransport:
             connect_timeout=min(10, self.timeout),
             read_timeout=self.timeout,
             max_pool_connections=20,
-            user_agent_appid="orka/0.12.0",
+            user_agent_appid="orka/1.0.0",
         )
         session = boto3.Session()
         self._bedrock_client = session.client(
@@ -992,7 +992,7 @@ class HttpTransport:
                 f"{provider.upper()}_API_KEY is required for {provider} API execution"
             )
         headers["Content-Type"] = "application/json"
-        headers["User-Agent"] = "orka-api-agent/0.12.0"
+        headers["User-Agent"] = "orka-api-agent/1.0.0"
         if idempotency_key:
             if provider == "azure_adm":
                 headers["x-ms-client-request-id"] = idempotency_key
