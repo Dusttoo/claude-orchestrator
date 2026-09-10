@@ -83,7 +83,7 @@ def _call(
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise AuthorityError(f"host operator authority failed: {exc}") from exc
-    if result.returncode == 3 and command == "budget-ceiling":
+    if result.returncode == 3 and command in {"budget-ceiling", "relaunch-ceiling"}:
         return None
     if result.returncode != 0:
         detail = result.stderr.strip() or "request denied"
@@ -122,6 +122,40 @@ def activate_budget(repository: Path, ticket: str, token: str) -> Decimal:
         raise AuthorityError("host authority returned an invalid budget ceiling") from exc
     if not value.is_finite() or value <= 0:
         raise AuthorityError("host authority returned a non-positive budget ceiling")
+    return value
+
+
+def relaunch_ceiling(repository: Path, ticket: str) -> int | None:
+    raw = _call(
+        "relaunch-ceiling",
+        _scope("relaunch", repository, ticket),
+        no_authority_ok=True,
+    )
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise AuthorityError("host authority returned an invalid attempt ceiling") from exc
+    if value <= 0:
+        raise AuthorityError("host authority returned a non-positive attempt ceiling")
+    return value
+
+
+def activate_relaunch(repository: Path, ticket: str, token: str) -> int:
+    if not token.strip():
+        raise AuthorityError("relaunch capability must not be empty")
+    raw = _call(
+        "activate-relaunch",
+        _scope("relaunch", repository, ticket),
+        token=token.strip(),
+    )
+    try:
+        value = int(raw or "")
+    except ValueError as exc:
+        raise AuthorityError("host authority returned an invalid attempt ceiling") from exc
+    if value <= 0:
+        raise AuthorityError("host authority returned a non-positive attempt ceiling")
     return value
 
 

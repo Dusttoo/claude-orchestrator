@@ -32,8 +32,10 @@ from api_agent import AgentError, Pricing, UsageLedger, budgets_from_config, loa
 from operator_authority import (
     AuthorityError,
     activate_budget,
+    activate_relaunch,
     budget_ceiling as authorized_budget_ceiling,
     consume_recovery,
+    relaunch_ceiling as authorized_relaunch_ceiling,
 )
 
 from runtime_state import (
@@ -840,6 +842,35 @@ def blockers(state: dict[str, Any], key: str, cfg: dict[str, Any]) -> list[str]:
     return sorted(set(reasons))
 
 
+def attempt_limit_reason(
+    ticket: dict[str, Any], cfg: dict[str, Any]
+) -> str | None:
+    """Return a launch blocker when this ticket has used every authorized attempt."""
+    attempts = int(ticket.get("attempts") or 0)
+    base_ceiling = cfg["max_lane_relaunches"] + 1
+    if attempts < base_ceiling:
+        return None
+    try:
+        grant_ceiling = authorized_relaunch_ceiling(
+            cfg["shared_root"], str(ticket["key"])
+        )
+    except AuthorityError as exc:
+        raise SprintError(str(exc)) from exc
+    effective_ceiling = max(base_ceiling, grant_ceiling or 0)
+    if attempts < effective_ceiling:
+        return None
+    grant_detail = (
+        f"; active ticket ceiling={grant_ceiling}"
+        if grant_ceiling is not None
+        else ""
+    )
+    return (
+        f"attempt ceiling exhausted after {attempts} attempts "
+        f"(max_lane_relaunches={cfg['max_lane_relaunches']}{grant_detail}); "
+        "root-issued ticket relaunch authority is required"
+    )
+
+
 def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
     path = cfg["shared_root"] / ".orchestration/.llm-usage/usage.jsonl"
     result: dict[str, dict[str, Any]] = {}
@@ -1054,11 +1085,21 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         key for key, ticket in state["tickets"].items() if ticket["state"] == "running"
     )
     ordered = sorted(state["tickets"].values(), key=order_key)
+    admission_reasons = {
+        ticket["key"]: sorted(
+            set(
+                blockers(state, ticket["key"], cfg)
+                + ([reason] if (reason := attempt_limit_reason(ticket, cfg)) else [])
+            )
+        )
+        for ticket in ordered
+        if ticket["state"] == "pending"
+    }
     ready = [
         ticket["key"]
         for ticket in ordered
         if ticket["state"] == "pending"
-        and not blockers(state, ticket["key"], cfg)
+        and not admission_reasons[ticket["key"]]
         and spend.get(ticket["key"], {}).get("state") != "operator_action"
     ]
     available = max(0, cfg["concurrency_max"] - len(running))
@@ -1066,10 +1107,10 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         {
             "key": ticket["key"],
             "priority": ticket.get("priority"),
-            "reasons": blockers(state, ticket["key"], cfg),
+            "reasons": admission_reasons[ticket["key"]],
         }
         for ticket in ordered
-        if ticket["state"] == "pending" and blockers(state, ticket["key"], cfg)
+        if ticket["state"] == "pending" and admission_reasons[ticket["key"]]
     ]
     launch = ready[:available]
     return {
@@ -1164,10 +1205,9 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         reservations: list[tuple[str, str]] = []
         prepared = []
         for key in ordered_keys:
-            if state["tickets"][key]["attempts"] > cfg["max_lane_relaunches"]:
-                raise SprintError(
-                    f"ticket {key} exceeded max_lane_relaunches; background batches cannot supply human approval"
-                )
+            limit_reason = attempt_limit_reason(state["tickets"][key], cfg)
+            if limit_reason:
+                raise SprintError(f"ticket {key} is blocked: {limit_reason}")
             custom_id = f"ticket_{key.replace('-', '_')}_{batch_id}"
             run_ref = f"{provider}-batch:{batch_id}:{custom_id}"
             run_id = f"batch-{batch_id}-{key}"
@@ -1730,11 +1770,9 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             raise SprintError(
                 f"concurrency_max={cfg['concurrency_max']} is already reached"
             )
-        if ticket["attempts"] > cfg["max_lane_relaunches"]:
-            raise SprintError(
-                f"ticket {key} exceeded max_lane_relaunches={cfg['max_lane_relaunches']}; "
-                "operator policy change is required"
-            )
+        limit_reason = attempt_limit_reason(ticket, cfg)
+        if limit_reason:
+            raise SprintError(f"ticket {key} is blocked: {limit_reason}")
         ticket["state"] = "running"
         ticket["reason"] = ""
         ticket["run_ref"] = args.run_ref
@@ -2239,6 +2277,35 @@ def grant_budget(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     emit({"ticket": key, "budget_ceiling_usd": str(ceiling), "state": ticket["state"]})
 
 
+def grant_relaunch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    """Activate a root-issued absolute total-attempt ceiling for one ticket."""
+    path = state_path(cfg["state_dir"], str(args.sprint))
+    key = normalize_key(args.ticket)
+    with locked(path):
+        state = load(path)
+        ticket = state["tickets"].get(key)
+        if not ticket or ticket["state"] == "completed":
+            current = ticket["state"] if ticket else "missing"
+            raise SprintError(
+                f"ticket {key} cannot receive a relaunch grant from state {current}"
+            )
+        try:
+            ceiling = activate_relaunch(
+                cfg["shared_root"], key, operator_capability(args)
+            )
+        except AuthorityError as exc:
+            raise SprintError(str(exc)) from exc
+        ticket["history"].append(
+            {
+                "at": now(),
+                "event": "operator-relaunch-granted",
+                "ceiling_attempts": ceiling,
+            }
+        )
+        save(path, state)
+    emit({"ticket": key, "attempt_ceiling": ceiling, "state": ticket["state"]})
+
+
 def recover_terminal(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     """Requeue a terminal lane using a separately issued recovery capability."""
     path = state_path(cfg["state_dir"], str(args.sprint))
@@ -2507,11 +2574,15 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
                 item["reason"] = "; ".join(reasons)
                 result["blocked"].append(item)
             else:
-                item["reason"] = (
-                    "ticket spend pause requires durable human approval"
-                    if item["spend"].get("state") == "operator_action"
-                    else "ready but not launched"
-                )
+                limit_reason = attempt_limit_reason(ticket, cfg)
+                if limit_reason:
+                    item["reason"] = limit_reason
+                elif item["spend"].get("state") == "operator_action":
+                    item["reason"] = (
+                        "ticket spend pause requires durable human approval"
+                    )
+                else:
+                    item["reason"] = "ready but not launched"
                 result["user_action"].append(item)
     result["finished"] = not plan_value(state, cfg)["autonomous_work_remaining"]
     result["spend"] = spend
@@ -2627,6 +2698,13 @@ def parser() -> argparse.ArgumentParser:
     budget_capability.add_argument("--operator-capability")
     budget_capability.add_argument("--operator-capability-stdin", action="store_true")
     budget_parser.set_defaults(func=grant_budget)
+    relaunch_parser = commands.add_parser("grant-relaunch")
+    relaunch_parser.add_argument("--sprint", required=True)
+    relaunch_parser.add_argument("--ticket", required=True)
+    relaunch_capability = relaunch_parser.add_mutually_exclusive_group(required=True)
+    relaunch_capability.add_argument("--operator-capability")
+    relaunch_capability.add_argument("--operator-capability-stdin", action="store_true")
+    relaunch_parser.set_defaults(func=grant_relaunch)
     terminal_recovery_parser = commands.add_parser("recover-terminal")
     terminal_recovery_parser.add_argument("--sprint", required=True)
     terminal_recovery_parser.add_argument("--ticket", required=True)

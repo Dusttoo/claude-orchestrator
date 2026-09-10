@@ -195,6 +195,24 @@ does not relax per-run or sprint budgets, run-count/reviewer-count breakers,
 concurrency, review gates, or merge policy. `revoke-budget` removes it early;
 otherwise it expires automatically.
 
+When one ticket has exhausted its normal launch count but a bounded additional
+attempt is justified, root can issue a separate capability with an **absolute
+total-attempt ceiling**. For example, `--ceiling-attempts 4` permits attempts 1
+through 4; it does not add four more attempts:
+
+```text
+sudo /usr/local/libexec/orchestration-recovery-authority issue-relaunch \
+  --repository /absolute/repo --ticket PROJ-123 --ceiling-attempts 4 \
+| python3 /absolute/plugin/scripts/sprint-controller.py grant-relaunch \
+  --sprint 65 --ticket PROJ-123 --operator-capability-stdin
+```
+
+The active grant applies only to that repository and ticket. It does not alter
+budgets, model/reviewer run-count breakers, dependencies, concurrency, review
+gates, or merge policy. `revoke-relaunch` removes it early; otherwise it expires
+automatically. A terminal ticket still requires the separate recovery flow
+below before it can return to `pending`.
+
 A terminal checkpoint that lost its attempt token or execution-unit identity
 also requires a separate one-shot, attempt-bound capability:
 

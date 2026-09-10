@@ -82,6 +82,8 @@ contains_contract "root-authorized bounded ticket continuation" 'grant-budget' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "root-authorized terminal recovery" 'recover-terminal' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "root-authorized ticket relaunch ceiling" 'grant-relaunch' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "operator capability stdin hygiene" 'operator-capability-stdin' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 

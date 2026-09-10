@@ -160,6 +160,13 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    A terminal checkpoint missing its attempt token or verified execution-unit
    identity requires a separate root-issued, attempt-bound capability consumed
    by `recover-terminal`; there is no same-user CLI bypass.
+   An exhausted launch count is independently bounded. Root may issue an
+   expiring, repository-and-ticket-scoped capability with an absolute total
+   attempt ceiling and activate it through `grant-relaunch` with
+   `--operator-capability-stdin`. Never raise repository-wide
+   `max_lane_relaunches` to rescue one ticket. The grant changes no budget,
+   run-count, dependency, review, concurrency, or merge boundary and does not
+   recover a terminal checkpoint by itself.
 
    In the default event-driven status mode, block on worker wait primitives or
    detached process ids instead of spending model turns polling unchanged

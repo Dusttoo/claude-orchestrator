@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Root-owned, file-backed authority for recovery and budget capabilities.
+"""Root-owned, file-backed authority for recovery, budget, and relaunch capabilities.
 
 Runtime commands are intended to be exposed through a narrow sudoers rule.
 Issuance and revocation commands require a real root invocation and are never
@@ -183,6 +183,13 @@ def record_ceiling(record: dict[str, Any]) -> Decimal:
     return value
 
 
+def record_attempt_ceiling(record: dict[str, Any]) -> int:
+    value = record.get("ceiling_attempts")
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError("relaunch capability has an invalid attempt ceiling")
+    return value
+
+
 def locked(root: Path):
     class Lock:
         def __enter__(self):
@@ -211,6 +218,11 @@ def issue(args: argparse.Namespace, kind: str) -> int:
             raise ValueError("ceiling must be a decimal number") from exc
         if not ceiling.is_finite() or ceiling <= 0:
             raise ValueError("ceiling must be positive")
+    attempt_ceiling = None
+    if kind == "relaunch":
+        attempt_ceiling = args.ceiling_attempts
+        if attempt_ceiling <= 0:
+            raise ValueError("attempt ceiling must be positive")
     token = secrets.token_hex(32)
     root = state_root()
     ensure_layout(root)
@@ -222,6 +234,8 @@ def issue(args: argparse.Namespace, kind: str) -> int:
     }
     if ceiling is not None:
         record["ceiling_usd"] = str(ceiling)
+    if attempt_ceiling is not None:
+        record["ceiling_attempts"] = attempt_ceiling
     with locked(root):
         atomic_json(root / "pending" / f"{token}.json", record)
     print(token)
@@ -294,6 +308,57 @@ def budget_ceiling(args: argparse.Namespace) -> int:
     return 0
 
 
+def activate_relaunch(args: argparse.Namespace) -> int:
+    scope = canonical_scope(args.scope, "relaunch")
+    token = read_token()
+    root = state_root()
+    require_layout(root)
+    source = root / "pending" / f"{token}.json"
+    key = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    target = root / "active" / f"{key}.json"
+    with locked(root):
+        if not source.is_file():
+            return fail("capability is missing or already consumed")
+        record = load_record(source)
+        if record.get("kind") != "relaunch" or not live(record):
+            return fail("relaunch capability is invalid or expired")
+        if not hmac.compare_digest(str(record.get("scope") or ""), scope):
+            return fail("relaunch capability scope mismatch")
+        if target.is_file():
+            current = load_record(target)
+            if (
+                live(current)
+                and record_attempt_ceiling(current) > record_attempt_ceiling(record)
+            ):
+                record = current
+        record_attempt_ceiling(record)
+        atomic_json(target, record)
+        os.replace(source, root / "consumed" / f"{token}.json")
+    print(record["ceiling_attempts"])
+    return 0
+
+
+def relaunch_ceiling(args: argparse.Namespace) -> int:
+    scope = canonical_scope(args.scope, "relaunch")
+    root = state_root()
+    require_layout(root)
+    key = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    target = root / "active" / f"{key}.json"
+    with locked(root):
+        if not target.is_file():
+            return 3
+        record = load_record(target)
+        if (
+            record.get("kind") != "relaunch"
+            or not live(record)
+            or not hmac.compare_digest(str(record.get("scope") or ""), scope)
+        ):
+            return 3
+        record_attempt_ceiling(record)
+    print(record["ceiling_attempts"])
+    return 0
+
+
 def revoke_budget(args: argparse.Namespace) -> int:
     require_real_root()
     scope = build_scope("budget", args.repository, args.ticket, None)
@@ -305,10 +370,27 @@ def revoke_budget(args: argparse.Namespace) -> int:
     return 0
 
 
+def revoke_relaunch(args: argparse.Namespace) -> int:
+    require_real_root()
+    scope = build_scope("relaunch", args.repository, args.ticket, None)
+    root = state_root()
+    ensure_layout(root)
+    key = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    with locked(root):
+        (root / "active" / f"{key}.json").unlink(missing_ok=True)
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
-    for name in ("consume-recovery", "activate-budget", "budget-ceiling"):
+    for name in (
+        "consume-recovery",
+        "activate-budget",
+        "budget-ceiling",
+        "activate-relaunch",
+        "relaunch-ceiling",
+    ):
         command = commands.add_parser(name)
         command.add_argument("--scope", required=True)
     recovery = commands.add_parser("issue-recovery")
@@ -321,9 +403,17 @@ def parser() -> argparse.ArgumentParser:
     budget.add_argument("--ticket", required=True)
     budget.add_argument("--ceiling-usd", required=True)
     budget.add_argument("--expires-hours", type=float, default=24)
+    relaunch = commands.add_parser("issue-relaunch")
+    relaunch.add_argument("--repository", required=True)
+    relaunch.add_argument("--ticket", required=True)
+    relaunch.add_argument("--ceiling-attempts", required=True, type=int)
+    relaunch.add_argument("--expires-hours", type=float, default=24)
     revoke = commands.add_parser("revoke-budget")
     revoke.add_argument("--repository", required=True)
     revoke.add_argument("--ticket", required=True)
+    revoke_relaunch_parser = commands.add_parser("revoke-relaunch")
+    revoke_relaunch_parser.add_argument("--repository", required=True)
+    revoke_relaunch_parser.add_argument("--ticket", required=True)
     return result
 
 
@@ -334,14 +424,22 @@ def main() -> int:
             return issue(args, "recovery")
         if args.command == "issue-budget":
             return issue(args, "budget")
+        if args.command == "issue-relaunch":
+            return issue(args, "relaunch")
         if args.command == "consume-recovery":
             return consume_recovery(args)
         if args.command == "activate-budget":
             return activate_budget(args)
         if args.command == "budget-ceiling":
             return budget_ceiling(args)
+        if args.command == "activate-relaunch":
+            return activate_relaunch(args)
+        if args.command == "relaunch-ceiling":
+            return relaunch_ceiling(args)
         if args.command == "revoke-budget":
             return revoke_budget(args)
+        if args.command == "revoke-relaunch":
+            return revoke_relaunch(args)
     except (OSError, ValueError, PermissionError, json.JSONDecodeError) as exc:
         return fail(str(exc))
     return fail("unsupported command")

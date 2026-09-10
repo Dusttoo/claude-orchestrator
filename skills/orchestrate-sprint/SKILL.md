@@ -125,8 +125,11 @@ repository config. Caller environment and CLI values cannot replace that policy.
    operator recovery capability consumed by the distinct host authority. A
    repository file, home-directory secret, or same-UID helper is never recovery
    authority. After
-   `max_lane_relaunches`, stop for operator policy action; there is no same-user
-   approval flag.
+   `max_lane_relaunches`, stop for operator action. A same-user flag cannot
+   bypass this boundary. Root may issue an expiring ticket-scoped relaunch
+   capability with an absolute total-attempt ceiling; activate it with
+   `grant-relaunch`. This authority changes only that ticket's launch ceiling
+   and does not recover a terminal checkpoint by itself.
 
 5. **Reserve, then launch.** Launch only keys returned in `plan.launch`, which
    is already ordered by `(priority, key)`; never reorder or reprioritize it
@@ -260,6 +263,14 @@ Before launching, resolve the executable because non-interactive SSH shells may 
    attempt-bound recovery capability and use `recover-terminal`; do not
    fabricate inventory or identity. Include warning state, projected spend,
    active absolute ceiling, and run count in meaningful status updates.
+
+   An exhausted launch count is a separate hard stop. Continue only after root
+   issues an expiring ticket-scoped `issue-relaunch` capability whose
+   `--ceiling-attempts` is the absolute total number of starts allowed, and pipe
+   it to `grant-relaunch`. Never raise repository-wide `max_lane_relaunches` to
+   rescue one ticket. The relaunch grant does not change dollar or run-count
+   breakers and does not turn `blocked` or `user_action` back into `pending`;
+   terminal work still needs its separately scoped `recover-terminal` token.
 
    **Quiet captain contract.** When `sprint_status_update_mode` is `event`, do
    not spend model turns polling, rereading full transcripts, or narrating
