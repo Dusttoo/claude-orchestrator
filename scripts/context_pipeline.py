@@ -49,6 +49,7 @@ FALLBACKS = {"desktop", "none"}
 EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 REVIEW_MODES = {"code-review", "security-review"}
 REVIEW_SCHEMA_VERSION = 1
+DEFAULT_PAYLOAD_MAX_TOKENS = 8192
 
 
 class ContextError(RuntimeError):
@@ -234,6 +235,40 @@ def _flat_config_scalar(lines: list[str], key: str) -> str | None:
             value = _unquote(match.group(1))
             return value or None
     return None
+
+
+def max_output_tokens_from_config(path: Path) -> int:
+    """Resolve the repository's payload ceiling without a YAML dependency."""
+    if not path.is_file():
+        return DEFAULT_PAYLOAD_MAX_TOKENS
+    llm_indent: int | None = None
+    budgets_indent: int | None = None
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        clean = _strip_yaml_comment(raw).rstrip()
+        if not clean.strip():
+            continue
+        indent = len(clean) - len(clean.lstrip(" "))
+        text = clean.strip()
+        if llm_indent is None:
+            if re.fullmatch(r"llm\s*:\s*", text):
+                llm_indent = indent
+            continue
+        if indent <= llm_indent:
+            break
+        if budgets_indent is None:
+            if re.fullmatch(r"budgets\s*:\s*", text):
+                budgets_indent = indent
+            continue
+        if indent <= budgets_indent:
+            break
+        match = re.fullmatch(r"max_output_tokens_per_turn\s*:\s*(.*?)\s*", text)
+        if not match:
+            continue
+        value = _unquote(match.group(1))
+        if not re.fullmatch(r"[1-9][0-9]*", value):
+            raise ContextError("llm.budgets.max_output_tokens_per_turn must be a positive integer")
+        return int(value)
+    return DEFAULT_PAYLOAD_MAX_TOKENS
 
 
 def _canonical_role(role: str) -> str:
@@ -688,6 +723,16 @@ def provider_payload(args: argparse.Namespace) -> dict[str, Any]:
         args.provider = route["provider"]
         args.model = route["model"]
         args.effort = route["effort"] or None
+    configured_cap = (
+        max_output_tokens_from_config(Path(args.config))
+        if args.config else DEFAULT_PAYLOAD_MAX_TOKENS
+    )
+    if args.max_tokens is None:
+        args.max_tokens = configured_cap
+    elif args.max_tokens < 1:
+        raise ContextError("--max-tokens must be a positive integer")
+    elif args.config:
+        args.max_tokens = min(args.max_tokens, configured_cap)
     if not args.provider:
         raise ContextError("--provider is required without an API route config")
     if not args.model:
@@ -729,7 +774,14 @@ def add_payload_arguments(command: argparse.ArgumentParser, provider: bool = Tru
     )
     command.add_argument("--cache-boundary", choices=["auto", "rules", "repo-map"], default="auto")
     command.add_argument("--model")
-    command.add_argument("--max-tokens", type=int, default=8192)
+    command.add_argument(
+        "--max-tokens",
+        type=int,
+        help=(
+            "output-token request; defaults to llm.budgets.max_output_tokens_per_turn "
+            "when --config is provided, otherwise 8192"
+        ),
+    )
     command.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
 
 

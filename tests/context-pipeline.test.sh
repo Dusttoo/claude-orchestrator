@@ -44,6 +44,7 @@ check "Anthropic reviewers use a native strict output shape" 'data["output_confi
 check "OpenAI Responses payload preserves the same stable-prefix order" '[x["text"].splitlines()[0] for x in data["input"][0]["content"]] == ["# Global role briefs", "# Repository rules and conventions", "# Stable repository map"]' "$TMP/openai.json"
 check "OpenAI payload omits every optional cache request field" 'all(field not in str(data) for field in ["prompt_cache_key", "prompt_cache_options", "prompt_cache_breakpoint", "prompt_cache_retention"]) and data["reasoning"]["effort"] == "low"' "$TMP/openai.json"
 check "OpenAI reviewers use low-verbosity strict structured output" 'data["text"]["verbosity"] == "low" and data["text"]["format"]["type"] == "json_schema" and data["text"]["format"]["strict"] is True' "$TMP/openai.json"
+check "payloads without repository config retain the 8192 compatibility default" 'data["max_output_tokens"] == 8192' "$TMP/openai.json"
 
 "$PIPELINE" payload --provider openai --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
   --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --mode implement \
@@ -134,6 +135,8 @@ llm:
   model: claude-global
   effort: high
   fallback: desktop
+  budgets:
+    max_output_tokens_per_turn: 32768
   roles:
     code-reviewer:
       provider: openai
@@ -154,6 +157,19 @@ check "desktop role override disables an inherited API fallback" 'data["executio
   --execution gate > "$TMP/routed-payload.json"
 check "payload construction consumes the resolved API role route" 'data["model"] == "gpt-review" and data["reasoning"]["effort"] == "low" and "input" in data' "$TMP/routed-payload.json"
 check "configured isolated worker profile reaches API reviewers" '"Selected profile: isolated-worker" in data["input"][0]["content"][0]["text"]' "$TMP/routed-payload.json"
+check "routed payload defaults to the repository output-token ceiling" 'data["max_output_tokens"] == 32768' "$TMP/routed-payload.json"
+
+"$PIPELINE" payload --config "$TMP/routes.yaml" --role code-reviewer \
+  --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" --repo-map "$TMP/map.txt" \
+  --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" --mode code-review --max-tokens 4096 \
+  --execution gate > "$TMP/routed-explicit-smaller.json"
+check "an explicit smaller output cap is preserved" 'data["max_output_tokens"] == 4096' "$TMP/routed-explicit-smaller.json"
+
+"$PIPELINE" payload --config "$TMP/routes.yaml" --role code-reviewer \
+  --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" --repo-map "$TMP/map.txt" \
+  --ticket "$TMP/ticket.json" --diff "$TMP/change.diff" --mode code-review --max-tokens 65536 \
+  --execution gate > "$TMP/routed-explicit-larger.json"
+check "an explicit output request cannot exceed repository policy" 'data["max_output_tokens"] == 32768' "$TMP/routed-explicit-larger.json"
 run_fail "desktop routes refuse API payload construction" "$PIPELINE" payload \
   --config "$TMP/routes.yaml" --role security-reviewer --role-file "$TMP/role.md" \
   --rules-file "$TMP/AGENTS.md" --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json"
