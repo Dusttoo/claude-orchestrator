@@ -8,6 +8,7 @@ ok() { printf 'ok   %s\n' "$1"; }
 bad() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }
 
 if python3 -m unittest \
+  "$ROOT/tests/jira_decomposition_test.py" \
   "$ROOT/tests/provider_batch_adapter_test.py" \
   "$ROOT/tests/sprint_controller_batch_test.py"; then
   ok "provider-native batch normalization unit matrix"

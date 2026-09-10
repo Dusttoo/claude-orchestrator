@@ -49,6 +49,7 @@ from runtime_state import (
 MILLION = Decimal("1000000")
 TOOL_NAMES = {"read_file", "search", "git_diff", "git_status", "run_check", "apply_patch"}
 READ_TOOLS = {"read_file", "search", "git_diff", "git_status", "run_check"}
+SCOPING_TOOLS = {"read_file", "search", "git_status"}
 OPENAI_CACHE_REQUEST_FIELDS = {
     "prompt_cache_key",
     "prompt_cache_options",
@@ -71,12 +72,14 @@ def strip_openai_cache_request_fields(value: Any) -> None:
 
 
 ROLE_TOOL_CEILINGS = {
+    "ticket-scoper": SCOPING_TOOLS,
     "design-reviewer": READ_TOOLS,
     "code-reviewer": READ_TOOLS,
     "security-reviewer": READ_TOOLS,
     "implementer": TOOL_NAMES,
     "sprint-worker": TOOL_NAMES,
 }
+POST_IMPLEMENTATION_REVIEWER_ROLES = {"code-reviewer", "security-reviewer"}
 DEFAULT_BUDGETS = {
     "max_usd_per_run": Decimal("10.00"),
     "max_usd_per_ticket": Decimal("30.00"),
@@ -554,19 +557,32 @@ class UsageLedger:
                 except AuthorityError as exc:
                     raise BudgetError(str(exc)) from exc
             if ticket:
-                last_pause = max(
-                    (index for index, event in enumerate(events)
-                     if event.get("kind") == "ticket_budget_pause"
-                     and self._matches(event, "ticket", ticket)),
-                    default=-1,
-                )
+                counter_pause_reasons = {
+                    "max_model_runs_per_ticket",
+                    "max_reviewer_runs_per_ticket",
+                }
+                cost_pause_indexes = [
+                    index
+                    for index, event in enumerate(events)
+                    if event.get("kind") == "ticket_budget_pause"
+                    and self._matches(event, "ticket", ticket)
+                    and str(event.get("reason") or "") not in counter_pause_reasons
+                ]
+                last_cost_pause = max(cost_pause_indexes, default=-1)
                 last_reset = max(
                     (index for index, event in enumerate(events)
                      if event.get("kind") == "ticket_budget_reset"
                      and self._matches(event, "ticket", ticket)),
                     default=-1,
                 )
-                if last_pause > last_reset and authority_ceiling is None:
+                # Run-count incidents are recomputed below from the current,
+                # phase-aware counters. They must not leave a stale dollar
+                # pause behind after a reviewed plugin upgrade changes the
+                # classification. Genuine cost pauses remain capability-gated.
+                if (
+                    last_cost_pause > last_reset
+                    and authority_ceiling is None
+                ):
                     raise BudgetError(f"ticket_budget_pause is active for {ticket}; operator reset required")
                 run_ids = {
                     str(event.get("run_id"))
@@ -585,18 +601,19 @@ class UsageLedger:
                     raise BudgetError(
                         f"max_model_runs_per_ticket={max_runs} reached for {ticket}; human action required"
                     )
-                reviewer_roles = {"design-reviewer", "code-reviewer", "security-reviewer"}
                 reviewer_run_ids = {
                     str(event.get("run_id"))
                     for event in events
                     if event.get("kind") == "reservation"
                     and self._matches(event, "ticket", ticket)
-                    and event.get("role") in reviewer_roles
+                    and event.get("role") in POST_IMPLEMENTATION_REVIEWER_ROLES
                     and event.get("run_id")
                 }
                 max_reviewers = limits["max_reviewer_runs_per_ticket"]
                 if (
-                    is_new_run and role in reviewer_roles and max_reviewers
+                    is_new_run
+                    and role in POST_IMPLEMENTATION_REVIEWER_ROLES
+                    and max_reviewers
                     and len(reviewer_run_ids) >= max_reviewers
                 ):
                     self._append_locked({
@@ -604,7 +621,8 @@ class UsageLedger:
                         "run_id": run_id, "reason": "max_reviewer_runs_per_ticket",
                     })
                     raise BudgetError(
-                        f"max_reviewer_runs_per_ticket={max_reviewers} reached for {ticket}; "
+                        f"max_reviewer_runs_per_ticket={max_reviewers} post-implementation "
+                        f"review runs reached for {ticket}; "
                         "human action required"
                     )
             scopes = [
@@ -844,7 +862,7 @@ class HttpTransport:
             connect_timeout=min(10, self.timeout),
             read_timeout=self.timeout,
             max_pool_connections=20,
-            user_agent_appid="claude-orchestrator/0.10.1",
+            user_agent_appid="orka/0.12.0",
         )
         session = boto3.Session()
         self._bedrock_client = session.client(
@@ -974,7 +992,7 @@ class HttpTransport:
                 f"{provider.upper()}_API_KEY is required for {provider} API execution"
             )
         headers["Content-Type"] = "application/json"
-        headers["User-Agent"] = "claude-orchestrator-api-agent/0.11.6"
+        headers["User-Agent"] = "orka-api-agent/0.12.0"
         if idempotency_key:
             if provider == "azure_adm":
                 headers["x-ms-client-request-id"] = idempotency_key

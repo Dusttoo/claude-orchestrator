@@ -40,10 +40,17 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    desktop fallback may reuse the provisional reservation only when no
    provider/run id was created. Uncertain API work remains reserved.
 
+   Resolve `ticket-scoper` separately for `plan.scope`. Run its bounded role
+   brief in a fresh worker—never in the captain context. A desktop route uses a
+   fresh native worker; an API route uses `context_pipeline.py payload --mode
+   scope --role ticket-scoper` and `api_agent.py run --role ticket-scoper`.
+
 2. The controller-owned adapter constructs one entire-sprint JQL query and one
    independent child JQL query from canonical `ticket.project` and `sprint_id`.
-   It requests only `key,summary,status,priority,subtasks,parent,issuelinks` plus
-   the configured sprint field and rejects returned issues outside that policy.
+   It requests `key,summary,status,priority,subtasks,parent,issuelinks` plus the
+   configured sprint field and rejects returned issues outside that policy.
+   Automatic decomposition additionally enables sanitized `description` for
+   the controller's single-ticket `scope-context`; otherwise it remains absent.
    The controller-owned adapter passes the compact fields plus scheduler-required
    relation and configured `jira_sprint_field` fields, exhausts pagination, and
    applies `context_pipeline.py sanitize-jira`. It derives exact sprint identity,
@@ -80,13 +87,21 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    `--attempt-token` and the controller-bound PID/start fingerprint, or
    a separately provisioned single-use operator capability.
 
+   If `plan.scope` contains tickets, obtain each sanitized Jira body through
+   `scope-context`, send the body to the fresh `ticket-scoper` using the
+   `scope-ticket` contract, persist its schema-v1 assessment, and call
+   `record-scope`. Process `plan.decomposition` through the configured,
+   idempotent `jira_decomposition.py --apply` adapter, sync Jira again, and bind
+   the returned children with `record-decomposition`. Routine technical slicing
+   is autonomous; only product/security choices become `operator_decision`.
+
 5. For each key in `plan.launch` — already ordered by `(priority, key)`, so
    launch in that order and never reprioritize locally — first create a unique
    provisional reference and run `reserve --sprint <id> --ticket <key>
    --run-ref <provisional>`. Reserve is the authoritative `concurrency_max`
    check. Preserve the returned `attempt_token` for finish/requeue and the
    separate one-use `attach_capability` for controller-owned launch. Then launch a fresh isolated
-   worker that runs `/orchestration:orchestrate <key>` with the freshly fetched
+   worker that runs `/orka:orchestrate <key>` with the freshly fetched
    ticket body and acceptance criteria. On Codex SSH/CLI hosts, if native
    multi-agent tools are unavailable, use `launch-local` to start a detached
    `codex exec --ephemeral --json --sandbox danger-full-access` worker in the repository.
@@ -135,10 +150,12 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    ticket and its reservations stay fenced.
 
 6. On every worker result, immediately run `finish --sprint <id> --ticket <key>
-   --outcome completed|blocked|user_action --summary <text> --pr <pr> --branch
-   <branch> --attempt-token <token>`. Completed means the per-ticket pipeline verified its merge;
-   technical failures are blocked; missing authority, credentials, clarification,
-   or external coordination are user action.
+   --outcome completed|blocked|external_blocked|operator_decision|needs_decomposition|needs_repair|recoverable --summary <text> --pr <pr> --branch
+   <branch> --attempt-token <token>`. Completed means the per-ticket pipeline verified its merge.
+   Keep recoverable work, repair work, decomposition, external blockers, and real
+   operator decisions as distinct states. Record durable milestones with
+   `record-progress --attempt-token <token>`; stop and recover or decompose a lane reported in
+   `plan.stalled` instead of allowing spend without progress.
 
 7. Re-plan after every outcome, filling newly available lanes and continuing
    independent work past blocked tickets. Stop only when
@@ -150,13 +167,17 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    `max_heavy_processes`. If the API ledger shows sustained throttling for one
    provider, pause new admissions to that provider while preserving reservations
    and letting healthy routes continue; `api_agent.py` owns bounded retries.
-   Treat `spend.state: operator_action` and model/reviewer run-count errors as
+   Drain `plan.recovery`, `plan.repair`, and `plan.decomposition`, and continue
+   independent work around external blockers. Treat `spend.state:
+   operator_action` and model/post-implementation-reviewer run-count errors as
    user actions, never reasons to relaunch. A human may extend a ticket pause
    only through a root-issued, expiring, ticket-scoped capability carrying an
    exact absolute ceiling. Pipe it into `grant-budget --operator-capability-stdin`;
    never print, persist, or invent it. The grant
    raises only that ticket's pause and hard ticket-cost ceiling. It never
    relaxes per-run/sprint budgets, run-count breakers, gates, or concurrency.
+   Design rounds use their own ledger and do not consume code/security reviewer
+   capacity; provider continuations retain one stable logical run id.
    A terminal checkpoint missing its attempt token or verified execution-unit
    identity requires a separate root-issued, attempt-bound capability consumed
    by `recover-terminal`; there is no same-user CLI bypass.

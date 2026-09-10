@@ -273,7 +273,22 @@ class JiraInventoryFetchTest(unittest.TestCase):
                 "parent",
                 "issuelinks",
                 "customfield_10020",
+                "description",
             ],
+        )
+
+    def test_jira_adf_description_flattens_for_scope_context(self) -> None:
+        self.assertEqual(
+            jira.jira_text(
+                {
+                    "type": "doc",
+                    "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "First"}]},
+                        {"type": "paragraph", "content": [{"type": "text", "text": "Second"}]},
+                    ],
+                }
+            ),
+            "First\nSecond",
         )
 
     def test_non_adjacent_cursor_cycle_and_bounds_fail_closed(self) -> None:

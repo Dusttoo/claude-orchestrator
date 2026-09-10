@@ -65,17 +65,17 @@ file is `~/.agents/plugins/marketplace.json`, and its plugin entries resolve
 For local development, clone or symlink this repository to:
 
 ```bash
-~/plugins/claude-orchestrator
+~/plugins/orka
 ```
 
 Then ensure `~/.agents/plugins/marketplace.json` contains this entry:
 
 ```json
 {
-  "name": "claude-orchestrator",
+  "name": "orka",
   "source": {
     "source": "local",
-    "path": "./plugins/claude-orchestrator"
+    "path": "./plugins/orka"
   },
   "policy": {
     "installation": "AVAILABLE",
@@ -95,10 +95,10 @@ If the file does not exist yet, seed it as:
   },
   "plugins": [
     {
-      "name": "claude-orchestrator",
+      "name": "orka",
       "source": {
         "source": "local",
-        "path": "./plugins/claude-orchestrator"
+        "path": "./plugins/orka"
       },
       "policy": {
         "installation": "AVAILABLE",
@@ -113,7 +113,7 @@ If the file does not exist yet, seed it as:
 Install it from the default personal marketplace:
 
 ```bash
-codex plugin add claude-orchestrator@personal
+codex plugin add orka@personal
 ```
 
 The default personal marketplace is discovered implicitly by Codex; it does not
@@ -126,19 +126,19 @@ A non-default marketplace root should use this shape:
 ```text
 <marketplace-root>/
   .agents/plugins/marketplace.json
-  plugins/claude-orchestrator/
+  plugins/orka/
     .codex-plugin/plugin.json
     skills/
     agents/
     scripts/
 ```
 
-The marketplace entry should point at `./plugins/claude-orchestrator`. Then add
+The marketplace entry should point at `./plugins/orka`. Then add
 and install from that marketplace:
 
 ```bash
 codex plugin marketplace add <marketplace-root-or-git-url>
-codex plugin add claude-orchestrator@<marketplace-name>
+codex plugin add orka@<marketplace-name>
 ```
 
 Use the `name` field from `.agents/plugins/marketplace.json` as

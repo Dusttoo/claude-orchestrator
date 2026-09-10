@@ -127,6 +127,31 @@ The controller orders, and the host obeys. `reserve` still admits any unblocked
 pending ticket so a host can reconcile out of order after a restart; it is not
 an ordering authority. Hosts must launch the keys `plan.launch` returns.
 
+## Autonomous scope, recovery, and progress
+
+Repositories may opt into `sprint_decomposition.auto_decompose_large_tickets`.
+The controller then places unscreened ready tickets in `plan.scope` before
+reservation. A fresh read-only `ticket-scoper` worker—not the long-lived
+captain—produces the schema-v1 `record-scope` result. It either releases a ready ticket,
+places an oversized ticket in `plan.decomposition`, or records a genuine
+`operator_decision`. A `ready` result at or above the configured
+`complexity_threshold` is rejected. The idempotent Jira decomposition adapter creates a bounded
+set of linked subtasks with deterministic labels; after authoritative Jira sync,
+`record-decomposition` binds the exact child inventory and leaves the parent as
+a tracking record.
+
+Recoverable execution, review repair, and decomposition are autonomous queues,
+not generic user-action stops. `autonomous_work_remaining` remains true while
+any of those queues, a live lane, or a launchable ticket exists. External
+blockers remain visible without stopping independent lanes.
+
+Workers record durable milestones through attempt-fenced `record-progress`.
+`plan.stalled`
+compares actual settled spend—not pessimistic reservations—since the last
+milestone against `max_usd_without_progress`. Crossing that threshold never
+weakens a gate or grants budget; it tells the captain to stop the execution unit
+and recover or decompose its preserved work.
+
 ## Rejected fragile designs
 
 - Host-specific queues were rejected because Claude and Codex would drift.
@@ -224,7 +249,8 @@ sudo /usr/local/libexec/orchestration-recovery-authority issue-recovery \
   --operator-capability-stdin
 ```
 
-Only `blocked` and `user_action` entries can use terminal recovery. The command
+`blocked`, `external_blocked`, `operator_decision`, and legacy `user_action`
+entries can use terminal recovery after their cause is resolved. The command
 records the reason, consumes the capability exactly once, clears stale launch
 identity, and returns the ticket to `pending`; the next normal `plan`/`reserve`
 creates a fresh fenced attempt.

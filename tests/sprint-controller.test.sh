@@ -41,7 +41,7 @@ def fields(item):
   links=[{"type":{"name":"Blocks"},"outwardIssue":{"key":dep}} for dep in item.get("dependencies",[])]
   priority=item.get("priority")
   priority_names={1:"Highest",2:"High",3:"Medium",4:"Low",5:"Lowest"}
-  return {"summary":item.get("summary",""),"status":{"name":item.get("status","")},
+  return {"summary":item.get("summary",""),"description":item.get("description",""),"status":{"name":item.get("status","")},
     "priority":({"id":"opaque-"+str(priority),"name":priority_names[int(priority)]} if priority is not None else None),"sprint":sprint,
     "subtasks":[{"key":x} for x in item.get("subtasks",[])],"issuelinks":links,
     **({"parent":{"key":item["parent"]}} if item.get("parent") else {})}
@@ -510,6 +510,48 @@ PY
 json_check "model and reviewer run breakers remove doomed replacements" "$TMP/limit-plan.json" 'data["launch"] == [] and all(data["spend"][key]["state"] == "operator_action" for key in ("PROJ-70","PROJ-71")) and data["spend"]["PROJ-71"]["reviewer_run_count"] == 6'
 "$CONTROLLER" summary --sprint 48 > "$TMP/limit-summary.json"
 json_check "run-limited-only sprint is terminal for captain" "$TMP/limit-summary.json" 'data["finished"] is True and [x["key"] for x in data["user_action"]] == ["PROJ-70","PROJ-71"]'
+
+sed -i.bak 's/auto_decompose_large_tickets: false/auto_decompose_large_tickets: true/' "$TMP/repo/.orchestration/config.yaml"
+rm "$TMP/repo/.orchestration/config.yaml.bak"
+cat > "$TMP/repo/design-limit-inventory.json" <<'JSON'
+{"project":"PROJ","sprint":{"id":"50","name":"phase counts"},"source_query":"q","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-72","description":"two independently releasable boundaries","status":"Ready","dependencies":[],"subtasks":[]}]}
+JSON
+jira_receipt "$TMP/repo/design-limit-inventory.json"
+run_ok "phase-count inventory syncs" "$CONTROLLER" sync --inventory design-limit-inventory.json
+python3 - "$TMP/repo/.orchestration/.llm-usage/usage.jsonl" <<'PY'
+import json,sys
+from pathlib import Path
+p=Path(sys.argv[1])
+with p.open('a') as f:
+  for i in range(6):
+    f.write(json.dumps({"kind":"reservation","reservation_id":f"design-{i}","run_id":f"design-{i}","ticket":"PROJ-72","sprint":"50","role":"design-reviewer","projected_cost_usd":"0.001"})+'\n')
+  f.write(json.dumps({"kind":"ticket_budget_pause","ticket":"PROJ-72","run_id":"legacy-review-stop","reason":"max_reviewer_runs_per_ticket"})+'\n')
+PY
+"$CONTROLLER" plan --sprint 50 > "$TMP/design-limit-plan.json"
+json_check "design attempts preserve code and security review capacity" "$TMP/design-limit-plan.json" 'data["scope"] == ["PROJ-72"] and data["spend"]["PROJ-72"]["design_review_run_count"] == 6 and data["spend"]["PROJ-72"]["reviewer_run_count"] == 0 and data["spend"]["PROJ-72"]["state"] == "ok"'
+
+"$CONTROLLER" plan --sprint 50 > "$TMP/scope-plan.json"
+json_check "opted-in tickets enter autonomous scope before launch" "$TMP/scope-plan.json" 'data["scope"] == ["PROJ-72"] and data["launch"] == [] and data["autonomous_work_remaining"] is True'
+"$CONTROLLER" scope-context --sprint 50 --ticket PROJ-72 > "$TMP/scope-context.json"
+json_check "scope context exposes only the requested sanitized Jira body" "$TMP/scope-context.json" 'data["ticket"] == "PROJ-72" and data["description"] == "two independently releasable boundaries"'
+cat > "$TMP/repo/.orchestration/proj-72-scope.json" <<'JSON'
+{"schema_version":1,"ticket":"PROJ-72","verdict":"decompose","complexity_score":88,"reasons":["crosses two independently releasable boundaries"],"slices":[{"id":"foundation","summary":"Foundation","behavior":"add the independent foundation","acceptance_criteria":["foundation test passes"],"depends_on":[]},{"id":"cutover","summary":"Cutover","behavior":"activate the new foundation","acceptance_criteria":["cutover test passes"],"depends_on":["foundation"]}]}
+JSON
+run_ok "structured scope result enters decomposition queue" "$CONTROLLER" record-scope --sprint 50 --ticket PROJ-72 --assessment .orchestration/proj-72-scope.json
+"$CONTROLLER" plan --sprint 50 > "$TMP/decomposition-plan.json"
+json_check "decomposition remains autonomous work" "$TMP/decomposition-plan.json" 'data["decomposition"] == ["PROJ-72"] and data["autonomous_work_remaining"] is True'
+cat > "$TMP/repo/design-limit-inventory.json" <<'JSON'
+{"project":"PROJ","sprint":{"id":"50","name":"phase counts"},"source_query":"q","subtask_source_query":"children","subtask_keys":["PROJ-73","PROJ-74"],"tickets":[{"key":"PROJ-72","status":"Ready","dependencies":[],"subtasks":["PROJ-73","PROJ-74"]},{"key":"PROJ-73","parent":"PROJ-72","status":"Ready","dependencies":[],"subtasks":[]},{"key":"PROJ-74","parent":"PROJ-72","status":"Ready","dependencies":["PROJ-73"],"subtasks":[]}]}
+JSON
+jira_receipt "$TMP/repo/design-limit-inventory.json"
+run_ok "fresh Jira sync proves decomposition children" "$CONTROLLER" sync --inventory design-limit-inventory.json
+run_ok "tracking parent binds exact synchronized children" "$CONTROLLER" record-decomposition --sprint 50 --ticket PROJ-72 --children PROJ-73,PROJ-74
+"$CONTROLLER" plan --sprint 50 > "$TMP/child-scope-plan.json"
+json_check "new children enter scope in dependency order" "$TMP/child-scope-plan.json" 'data["scope"] == ["PROJ-73"] and data["decomposition"] == []'
+"$CONTROLLER" summary --sprint 50 > "$TMP/decomposed-summary.json"
+json_check "summary separates decomposed tracking parents" "$TMP/decomposed-summary.json" '[x["key"] for x in data["decomposed"]] == ["PROJ-72"]'
+sed -i.bak 's/auto_decompose_large_tickets: true/auto_decompose_large_tickets: false/' "$TMP/repo/.orchestration/config.yaml"
+rm "$TMP/repo/.orchestration/config.yaml.bak"
 
 cat > "$TMP/repo/batch-inventory.json" <<'JSON'
 {"project":"PROJ","sprint":{"id":"45","name":"batch"},"source_query":"q","subtask_source_query":"children","subtask_keys":[],"tickets":[{"key":"PROJ-40","summary":"batch one","status":"Ready","dependencies":[],"subtasks":[]},{"key":"PROJ-41","summary":"batch two","status":"Ready","dependencies":[],"subtasks":[]}]}

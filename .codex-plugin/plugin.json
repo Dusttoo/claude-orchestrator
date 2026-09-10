@@ -1,13 +1,13 @@
 {
-  "name": "claude-orchestrator",
-  "version": "0.11.6",
-  "description": "Multi-agent orchestration harness for Codex and Claude Code: resumable Jira sprint scheduling, pre-code design and adversarial-test gates, isolated implementation, batched reviews, and merge-on-green.",
+  "name": "orka",
+  "version": "0.12.0",
+  "description": "Orka is a multi-agent engineering harness for Codex and Claude Code: resilient Jira sprint scheduling, ticket decomposition, isolated implementation, bounded reviews, and merge-on-green.",
   "author": {
     "name": "Dusty Mumphrey",
     "url": "https://github.com/Dusttoo"
   },
-  "homepage": "https://github.com/Dusttoo/claude-orchestrator",
-  "repository": "https://github.com/Dusttoo/claude-orchestrator",
+  "homepage": "https://github.com/Dusttoo/orka",
+  "repository": "https://github.com/Dusttoo/orka",
   "license": "MIT",
   "keywords": [
     "orchestration",
@@ -24,7 +24,7 @@
   ],
   "skills": "./skills/",
   "interface": {
-    "displayName": "Claude Orchestrator",
+    "displayName": "Orka",
     "shortDescription": "Run gated ticket and sprint workflows",
     "longDescription": "Drive one ticket or a dependency-linked Jira sprint through isolated implementation, independent review and security gates, optional verification, merge-on-green, configured release/candidate workflows, ticket scoping, and resumable recovery. Codex uses the natural-language skills and shared controllers; Claude Code can also use the slash commands and hook metadata bundled in this repository.",
     "developerName": "Dusty Mumphrey",
@@ -33,7 +33,7 @@
       "Interactive",
       "Write"
     ],
-    "websiteURL": "https://github.com/Dusttoo/claude-orchestrator",
+    "websiteURL": "https://github.com/Dusttoo/orka",
     "defaultPrompt": [
       "Orchestrate this ticket end to end",
       "Orchestrate the configured Jira sprint",

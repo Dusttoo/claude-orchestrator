@@ -67,6 +67,8 @@ llm:
     max_usd_per_sprint: 20.00
     max_model_runs_per_ticket: 12 # unique run ids, not provider tool-round calls
     max_reviewer_runs_per_ticket: 6
+    # Design reviews use max_design_rounds and do not consume this independent
+    # code/security-review allowance.
     max_output_tokens_per_turn: 4096
     max_tool_rounds: 8
     max_tool_output_chars: 12000
@@ -125,6 +127,12 @@ llm:
     #   cache_read_per_mtok: 0.60
     #   output_per_mtok: 2.50
   roles:
+    # ticket-scoper:
+    #   execution: api
+    #   provider: openai
+    #   model: gpt-5.6-sol
+    #   effort: medium
+    #   allowed_tools: [read_file, search, git_status]
     # implementer:
     #   execution: api
     #   provider: anthropic
@@ -326,6 +334,19 @@ sprint_done_statuses:
 sprint_blocked_statuses:
   - Blocked
 sprint_checkpoint_dir: .orchestration/.sprint-state
+# Opt-in bounded technical decomposition. When enabled, the controller scopes
+# each otherwise-launchable ticket before reservation. Oversized tickets become
+# a decomposition action rather than a user stop. Jira children are created
+# only through the idempotent adapter and only when this repository policy opts in.
+sprint_decomposition:
+  auto_decompose_large_tickets: false
+  complexity_threshold: 70
+  max_auto_slices: 6
+  jira_child_issue_type: Sub-task
+# A running lane that spends this much without recording a durable milestone is
+# surfaced as stalled. The captain stops/recoveries that execution unit; it does
+# not silently grant more budget or weaken a gate.
+max_usd_without_progress: 5.00
 # Captain messages are event-driven so an interactive control session does not
 # spend model tokens narrating unchanged polls. A compact heartbeat preserves
 # visibility during long-running lanes; set to 0 to disable periodic heartbeats

@@ -5,9 +5,9 @@
   },
   "plugins": [
     {
-      "name": "claude-orchestrator",
+      "name": "orka",
       "source": "./",
-      "description": "Multi-agent orchestration harness for Claude Code: pre-code design and adversarial-test gates, isolated implementation, batched independent reviews, redesign escalation, and mechanical merge-on-green.",
+      "description": "Orka is a multi-agent engineering harness for Claude Code and Codex with resilient sprint scheduling, isolated implementation, bounded independent reviews, and mechanical merge-on-green.",
       "category": "workflow"
     }
   ]

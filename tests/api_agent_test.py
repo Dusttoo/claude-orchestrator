@@ -1110,6 +1110,34 @@ self_check:
                 ticket="PROJ-2", sprint="S-1", provider="anthropic", model="m", role="implementer",
             )
 
+    def test_design_rounds_do_not_exhaust_post_implementation_review_capacity(self):
+        ledger = api_agent.UsageLedger(self.root)
+        limits = dict(api_agent.DEFAULT_BUDGETS)
+        limits["max_reviewer_runs_per_ticket"] = 1
+        for index in range(6):
+            ledger.reserve(
+                projected=api_agent.Decimal("0.01"), limits=limits,
+                run_id=f"design-{index}", ticket="PROJ-3", sprint="S-1",
+                provider="openai", model="m", role="design-reviewer",
+            )
+        # Simulate the stale pause emitted by the old shared reviewer counter.
+        ledger._append_locked({
+            "kind": "ticket_budget_pause", "timestamp": api_agent.utc_now(),
+            "ticket": "PROJ-3", "run_id": "old-code-review",
+            "reason": "max_reviewer_runs_per_ticket",
+        })
+        ledger.reserve(
+            projected=api_agent.Decimal("0.01"), limits=limits,
+            run_id="code-1", ticket="PROJ-3", sprint="S-1",
+            provider="openai", model="m", role="code-reviewer",
+        )
+        with self.assertRaisesRegex(api_agent.BudgetError, "post-implementation"):
+            ledger.reserve(
+                projected=api_agent.Decimal("0.01"), limits=limits,
+                run_id="security-2", ticket="PROJ-3", sprint="S-1",
+                provider="openai", model="m", role="security-reviewer",
+            )
+
     def test_ticket_pause_is_durable_and_has_no_self_approval_bypass(self):
         ledger = api_agent.UsageLedger(self.root)
         limits = dict(api_agent.DEFAULT_BUDGETS)
@@ -1122,6 +1150,17 @@ self_check:
             )
         events = ledger._events()
         self.assertTrue(any(event.get("kind") == "ticket_budget_pause" for event in events))
+        ledger._append_locked({
+            "kind": "ticket_budget_pause", "timestamp": api_agent.utc_now(),
+            "ticket": "PROJ-9", "run_id": "later-counter-stop",
+            "reason": "max_reviewer_runs_per_ticket",
+        })
+        with self.assertRaisesRegex(api_agent.BudgetError, "ticket_budget_pause"):
+            ledger.reserve(
+                projected=api_agent.Decimal("0.01"), limits=limits,
+                run_id="still-paused", ticket="PROJ-9", sprint="S-1",
+                provider="openai", model="m", role="implementer",
+            )
         self.assertFalse(hasattr(ledger, "approve_ticket_budget"))
 
     def test_external_budget_authority_extends_only_the_ticket_cost_ceiling(self):
@@ -1315,6 +1354,17 @@ self_check:
                 sprint=None,
                 run_id="forbidden-tool",
                 transport=FakeTransport([]),
+            )
+
+    def test_ticket_scoper_is_read_only_and_cannot_run_checks(self):
+        tools = api_agent.tools_for_role("ticket-scoper", None, "openai")
+        self.assertEqual(
+            {tool["type"] + ":" + tool["name"] for tool in tools},
+            {"function:read_file", "function:search", "function:git_status"},
+        )
+        with self.assertRaisesRegex(api_agent.AgentError, "may not receive"):
+            api_agent.tools_for_role(
+                "ticket-scoper", ["read_file", "run_check"], "openai"
             )
 
     def test_tool_paths_cannot_escape_repository(self):

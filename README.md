@@ -1,4 +1,4 @@
-# claude-orchestrator
+# Orka
 
 A reusable harness for running a small team of coding agents against real
 tickets or a dependency-linked Jira sprint, with **independent review and
@@ -129,7 +129,7 @@ supports them.
 
 | Layer | What it is |
 |---|---|
-| `agents/` | Role briefs: design-reviewer, implementer, code-reviewer, security-reviewer, visual-qa |
+| `agents/` | Role briefs: ticket-scoper, design-reviewer, implementer, code-reviewer, security-reviewer, visual-qa |
 | `commands/` | Claude Code slash commands: `/orchestrate`, `/orchestrate-sprint`, `/gate`, `/release`, `/orchestration-init`, `/orchestration-report` |
 | `hooks/` | Claude Code/Codex `PreToolUse` merge-guard + `Stop` worktree sweep |
 | `scripts/` | The mechanics: config reader, sprint controller, workflow engine, gate runner, merge-guard, safe-merge, worktree lifecycle, verification |
@@ -186,8 +186,8 @@ The plugin is a marketplace-installable Claude Code plugin. In an interactive
 Claude Code session:
 
 ```
-/plugin marketplace add Dusttoo/claude-orchestrator
-/plugin install claude-orchestrator@builtbydusty
+/plugin marketplace add Dusttoo/orka
+/plugin install orka@builtbydusty
 ```
 
 Installing it activates the agents and commands. Hosts that support plugin hooks
@@ -212,11 +212,11 @@ sanctioned scripts enforce merges and cleanup directly.
 This repository is also a Codex plugin folder via
 [`.codex-plugin/plugin.json`](.codex-plugin/plugin.json). Codex installs plugins
 from marketplace roots, so local development typically means cloning or
-symlinking this repo to `~/plugins/claude-orchestrator`, ensuring the personal
-marketplace entry points at `./plugins/claude-orchestrator`, then running:
+symlinking this repo to `~/plugins/orka`, ensuring the personal marketplace
+entry points at `./plugins/orka`, then running:
 
 ```
-codex plugin add claude-orchestrator@personal
+codex plugin add orka@personal
 ```
 
 Codex users invoke the same flows in natural language: "orchestrate PROJ-90 end to
@@ -330,7 +330,7 @@ or behavior changes, major for breaking config or contract changes.
 
 Why this is non-optional: an installed plugin is a **pinned snapshot**, not a live
 checkout of this repo (Claude Code caches it under
-`~/.claude/plugins/cache/<marketplace>/claude-orchestrator/<version>/`). Update
+`~/.claude/plugins/cache/<marketplace>/orka/<version>/`). Update
 detection keys off the version string. Merging to `main` without bumping the
 version means a user's next plugin update sees the same version and does nothing --
 the fix never lands, silently. A merge is not a release; the version bump is.

@@ -89,7 +89,7 @@ class ApprovedOriginRedirectHandler(HTTPRedirectHandler):
 def required_fields(
     sprint_field: str, configured: list[str] | None = None
 ) -> list[str]:
-    del configured
+    scoped = [field for field in (configured or []) if field == "description"]
     return list(
         dict.fromkeys(
             (
@@ -101,9 +101,23 @@ def required_fields(
                 "parent",
                 "issuelinks",
                 sprint_field,
+                *scoped,
             )
         )
     )
+
+
+def jira_text(value: Any) -> str:
+    """Flatten Jira ADF/string descriptions for ephemeral scope assessment."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "\n".join(filter(None, (jira_text(item) for item in value))).strip()
+    if isinstance(value, dict):
+        own = str(value.get("text") or "").strip()
+        children = jira_text(value.get("content", []))
+        return "\n".join(filter(None, (own, children))).strip()
+    return ""
 
 
 def sanitize_page(value: Any, fields: list[str]) -> dict[str, Any]:
@@ -526,6 +540,8 @@ def build_inventory(
             if authority == "provider-network"
             else "",
         }
+        if "description" in fields:
+            ticket["description"] = jira_text(data.get("description"))
         if key in child_parents:
             ticket["parent"] = child_parents[key]
         tickets.append(ticket)
@@ -553,7 +569,7 @@ def build_inventory(
 def scalar_config(path: Path, key: str, default: str) -> str:
     if not path.is_file():
         return default
-    match = re.search(rf"(?m)^{re.escape(key)}:\s*([^#\n]+)", path.read_text())
+    match = re.search(rf"(?m)^\s*{re.escape(key)}:\s*([^#\n]+)", path.read_text())
     return match.group(1).strip().strip("\"'") if match else default
 
 
@@ -652,7 +668,12 @@ def run_adapter(
             "ticket.project and sprint_id are required canonical Jira policy"
         )
     sprint_field = scalar_config(config, "jira_sprint_field", "sprint")
-    fields = required_fields(sprint_field)
+    decomposition_enabled = scalar_config(
+        config, "auto_decompose_large_tickets", "false"
+    ).casefold() in {"true", "yes", "1", "on"}
+    fields = required_fields(
+        sprint_field, ["description"] if decomposition_enabled else None
+    )
     links = dependency_links_from_config(config)
     priority_order = list_config(config, "jira_priority_order", DEFAULT_PRIORITY_ORDER)
     raw_dir = Path(args.artifact).resolve().parent / "jira-raw"

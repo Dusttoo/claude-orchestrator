@@ -120,14 +120,18 @@ shared limit. A request that could exceed any configured ceiling is not sent.
 Ticket controls are layered: `warn_usd_per_ticket` records an event without
 stopping work, `pause_usd_per_ticket` is a hard operator-action stop, and
 `max_usd_per_ticket` remains the hard ceiling. Unique run IDs are bounded by
-`max_model_runs_per_ticket` and `max_reviewer_runs_per_ticket`; tool rounds
-inside one run do not consume extra run slots. Repository configuration may
+`max_model_runs_per_ticket`. Independent post-implementation code/security run
+IDs are separately bounded by `max_reviewer_runs_per_ticket`; design attempts
+use the durable `max_design_rounds` ledger and do not consume that later gate
+capacity. Tool rounds and reconciled provider continuations inside one stable
+run ID do not consume extra run slots. Repository configuration may
 tighten the compiled incident ceilings but cannot raise or disable them. There
 is deliberately no same-user CLI approval bypass.
 
 A host operator may authorize one ticket to continue to an exact absolute
 ceiling with the separately installed root authority. This raises only that
-ticket's cost pause and hard ticket-cost ceiling; run-count, reviewer-count,
+ticket's cost pause and hard ticket-cost ceiling; model-run and
+post-implementation-reviewer-run,
 per-run, sprint, and provider breakers remain unchanged. The grant expires and
 cannot be created from repository configuration or by the runtime user. The
 sprint controller activates it with `grant-budget`; API reservations query the
