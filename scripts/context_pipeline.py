@@ -762,7 +762,9 @@ def add_payload_arguments(command: argparse.ArgumentParser, provider: bool = Tru
     command.add_argument("--ticket")
     command.add_argument("--diff")
     command.add_argument(
-        "--mode", choices=["implement", "code-review", "security-review"], default="implement"
+        "--mode",
+        choices=["scope", "implement", "code-review", "security-review"],
+        default="implement",
     )
     # Retained as a call-site label. Cache breakpoints are now unconditional:
     # an execution mode must never be able to silently disable prompt caching.

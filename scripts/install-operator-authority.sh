@@ -22,8 +22,8 @@ id "$RUNTIME_USER" >/dev/null 2>&1 || {
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE="$HERE/../host-tools/orchestration-recovery-authority.py"
 TARGET="/usr/local/libexec/orchestration-recovery-authority"
-STATE="/var/lib/claude-orchestrator-authority"
-SUDOERS="/etc/sudoers.d/claude-orchestrator-authority"
+STATE="/var/lib/orka-authority"
+SUDOERS="/etc/sudoers.d/orka-authority"
 
 for path in "$STATE" "$STATE/pending" "$STATE/active" "$STATE/consumed"; do
   if [ -L "$path" ]; then

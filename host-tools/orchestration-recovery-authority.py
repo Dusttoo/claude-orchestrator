@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_STATE = Path("/var/lib/claude-orchestrator-authority")
+DEFAULT_STATE = Path("/var/lib/orka-authority")
 
 
 def test_mode() -> bool:

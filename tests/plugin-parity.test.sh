@@ -30,6 +30,35 @@ contains_engine skills/orchestrate-ticket/SKILL.md
 contains_engine commands/gate.md
 contains_engine skills/gate-pr/SKILL.md
 
+if python3 - "$ROOT" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+claude = json.loads((root / ".claude-plugin/plugin.json").read_text())
+codex = json.loads((root / ".codex-plugin/plugin.json").read_text())
+marketplace = json.loads((root / ".claude-plugin/marketplace.json").read_text())
+assert claude["name"] == codex["name"] == marketplace["plugins"][0]["name"] == "orka"
+assert claude["version"] == codex["version"]
+assert codex["interface"]["displayName"] == "Orka"
+assert codex["repository"] == "https://github.com/Dusttoo/orka"
+PY
+then
+  ok "Claude, Codex, and marketplace manifests share the Orka identity"
+else
+  fail_case "plugin manifests disagree on the Orka identity"
+fi
+
+retired_slug="claude"'-orchestrator'
+retired_title="claude"' orchestrator'
+if rg -i --hidden -g '!.git' -g '!.git/**' -g '!tests/fixtures/**' \
+  "$retired_slug|$retired_title|Dusttoo/$retired_slug" "$ROOT" >/dev/null; then
+  fail_case "retired plugin branding remains in the source tree"
+else
+  ok "retired plugin branding is absent from the source tree"
+fi
+
 contains_contract() {
   local label="$1" pattern="$2"; shift 2
   local file
@@ -83,6 +112,14 @@ contains_contract "root-authorized bounded ticket continuation" 'grant-budget' \
 contains_contract "root-authorized terminal recovery" 'recover-terminal' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "root-authorized ticket relaunch ceiling" 'grant-relaunch' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "autonomous ticket decomposition" 'jira_decomposition\.py' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "fresh ticket scoper preserves captain context" 'ticket-scoper' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "progress-aware sprint watchdog" 'record-progress' \
+  commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
+contains_contract "recoverable sprint queues" 'plan\.recovery' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md
 contains_contract "operator capability stdin hygiene" 'operator-capability-stdin' \
   commands/orchestrate-sprint.md skills/orchestrate-sprint/SKILL.md

@@ -90,7 +90,7 @@ Steps:
    worktree, SELF_CHECK).
 
 4. **Gate.** Run the gate pipeline on the resulting PR -- invoke
-   `/orchestration:gate <pr>` (code-review and, when the diff
+   `/orka:gate <pr>` (code-review and, when the diff
    hits a `security_required_when` trigger). Both must return validated structured
    PASS results with no blocking findings. Launch both required reviewers
    concurrently against the same exact head and round brief.

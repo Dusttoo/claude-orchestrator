@@ -47,6 +47,11 @@ check "OpenAI reviewers use low-verbosity strict structured output" 'data["text"
 check "payloads without repository config retain the 8192 compatibility default" 'data["max_output_tokens"] == 8192' "$TMP/openai.json"
 
 "$PIPELINE" payload --provider openai --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
+  --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --mode scope \
+  --execution on-demand --model test-model > "$TMP/scope.json"
+check "ticket scoping is a distinct non-review payload" '"text" not in data and "<ticket>" in data["input"][1]["content"][0]["text"] and "<active_branch_unified_diff>" not in data["input"][1]["content"][0]["text"]' "$TMP/scope.json"
+
+"$PIPELINE" payload --provider openai --role-file "$TMP/role.md" --rules-file "$TMP/AGENTS.md" \
   --repo-map "$TMP/map.txt" --ticket "$TMP/ticket.json" --mode implement \
   --execution on-demand --model test-model > "$TMP/implement.json"
 check "implementers are not forced into the reviewer schema" '"text" not in data' "$TMP/implement.json"

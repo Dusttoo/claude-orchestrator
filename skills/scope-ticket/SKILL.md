@@ -77,3 +77,35 @@ matrix, then state the verdict
 (Ready / Not Ready) and, if Not Ready, the exact gap that blocks it. If the
 repo's `rules_docs` define a ticket template or extra required fields (a
 surface-area label, a definition-of-done clause), honor that template too.
+
+When the sprint controller requests a scope assessment, also write a repository
+artifact using this schema so the result can be scheduled without interpreting
+prose:
+
+```json
+{
+  "schema_version": 1,
+  "ticket": "PROJ-123",
+  "verdict": "ready | decompose | operator_decision",
+  "complexity_score": 0,
+  "reasons": ["evidence-based reason"],
+  "slices": [
+    {
+      "id": "stable-short-id",
+      "summary": "independently releasable slice",
+      "behavior": "user-visible or system behavior",
+      "acceptance_criteria": ["testable outcome"],
+      "depends_on": []
+    }
+  ]
+}
+```
+
+Use `decompose` when the ticket crosses multiple independently releasable
+boundaries or cannot reasonably complete design, implementation, and review
+inside one ticket budget. Produce two through the repository's configured
+`max_auto_slices` slices. Each slice must be safe to merge independently and
+must assign migration ownership, rollout ordering, and security invariants in
+its behavior or acceptance criteria. Use `operator_decision` only when slicing
+would choose product behavior or weaken a required invariant; ordinary
+technical decomposition is not a human decision.

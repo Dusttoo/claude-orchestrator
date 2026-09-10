@@ -20,8 +20,9 @@ checkpoint/status event.
 
 ## Shared controller
 
-Resolve `../../scripts/sprint-controller.py` and
-`../../scripts/context_pipeline.py` plus `../../scripts/api_agent.py` from this
+Resolve `../../scripts/sprint-controller.py`,
+`../../scripts/context_pipeline.py`, `../../scripts/api_agent.py`, and
+`../../scripts/jira_decomposition.py` from this
 skill file and execute them by
 absolute path with the target repository as the working directory. Never copy
 the controller or its tests into the repository. Use the explicit `python3`
@@ -38,6 +39,10 @@ The controller atomically writes under `sprint_checkpoint_dir` (default
 - `sprint_blocked_statuses`
 - `sprint_status_update_mode` (default `event`)
 - `sprint_status_heartbeat_minutes` (default `30`; `0` disables heartbeats)
+- `sprint_decomposition.auto_decompose_large_tickets` (default `false`)
+- `sprint_decomposition.complexity_threshold` (default `70`)
+- `sprint_decomposition.max_auto_slices` (default `6`, hard maximum `10`)
+- `max_usd_without_progress` (default `$5`, hard maximum `$10`)
 
 The host reads `ticket.kind`, `ticket.project`, `sprint_id`, `jira_base_url`,
 `jira_priority_order`, and `sprint_dependency_links` semantically from the same
@@ -65,11 +70,19 @@ repository config. Caller environment and CLI values cannot replace that policy.
    reuse the provisional reservation only when
    no provider/run id was created; uncertain API work remains reserved.
 
+   Resolve `ticket-scoper` independently before processing `plan.scope`. Use a
+   fresh worker with `agents/orchestration-ticket-scoper.md`; never perform the
+   assessment in the captain context. Desktop routing uses a fresh native task.
+   API routing uses `context_pipeline.py payload --mode scope --role
+   ticket-scoper` followed by `api_agent.py run --role ticket-scoper`. This
+   worker is read-only and receives exactly one sanitized ticket.
+
 2. **Derive the complete sprint queries.** The controller-owned adapter builds
    the project/sprint JQL and independent child query from canonical repository
    policy. It requests only `key,summary,status,priority,subtasks,parent,issuelinks`
-   plus the configured sprint field. Do not request or persist unused
-   description/components data. The controller-owned adapter passes the compact fields plus
+   plus the configured sprint field. When automatic decomposition is enabled,
+   it additionally requests and sanitizes `description` for `scope-context`;
+   otherwise description/components remain excluded. The controller-owned adapter passes the compact fields plus
    scheduler-required relation and configured `jira_sprint_field` fields, runs
    `context_pipeline.py sanitize-jira`, exhausts pagination, derives exact
    sprint identity, priority, and links, and fetches external dependency status.
@@ -116,6 +129,19 @@ repository config. Caller environment and CLI values cannot replace that policy.
    Codex task/agent and PR state. Finish it when its outcome is known, leave it
    reserved while live, or `requeue` it only after proving no worker remains.
    Never duplicate an uncertain run.
+
+   When `plan.scope` is non-empty, process those tickets before `plan.launch`.
+   Read each synchronized body through `scope-context`, send it to the fresh
+   `ticket-scoper` using the `scope-ticket` contract, and write its schema-v1 assessment beneath
+   `.orchestration/`, and call `record-scope`. A `ready` result becomes
+   launchable. A `decompose` result enters `plan.decomposition`; when repository
+   policy opted in, run `jira_decomposition.py --apply` with that exact artifact,
+   perform a fresh controller-owned Jira sync, then call `record-decomposition`
+   with the exact returned child keys. The adapter uses deterministic labels to
+   recover accepted-but-timed-out creates and checks dependency links
+   idempotently. Never auto-decompose a product decision or exceed the configured
+   slice cap. An `operator_decision` result is the only scoping outcome that
+   requires the user.
 
    If a previously blocked or user-action ticket becomes safe to retry, requeue
    it explicitly with the evidence in `--reason`; completed tickets cannot be
@@ -226,14 +252,24 @@ Before launching, resolve the executable because non-interactive SSH shells may 
 
    ```text
    sprint-controller.py finish --sprint <id> --ticket <key> \
-     --outcome completed|blocked|user_action --summary <text> \
+     --outcome completed|blocked|external_blocked|operator_decision|needs_decomposition|needs_repair|recoverable --summary <text> \
      --pr <number-or-url> --branch <name> --attempt-token <token>
    ```
 
-   Use `completed` only after the ticket workflow verifies its merge. Use
-   `blocked` for technical or dependency failures and `user_action` for missing
-   authority, credentials, clarification, or external coordination. One blocked
-   ticket must not stop unrelated tickets.
+   Use `completed` only after the ticket workflow verifies its merge.
+   Irrecoverable technical failures are `blocked`; transient failures with
+   preserved work are `recoverable`; review findings are `needs_repair`;
+   oversized work is `needs_decomposition`; external dependencies are
+   `external_blocked`; and only a real product/security/budget choice is
+   `operator_decision`. Preserve legacy `user_action` only while reconciling old
+   checkpoints. One blocked ticket must not stop unrelated tickets.
+
+   Record `design_passed`, `failing_test`, `implementation_commit`, `pr_opened`,
+   `ci_advanced`, and `review_finding_closed` through `record-progress` with
+   concrete evidence and the current `--attempt-token`. If `plan.stalled` reports a lane at the configured
+   no-progress spend threshold, stop its execution unit and route its preserved
+   state to recovery or decomposition. Never grant more money merely because a
+   lane is stalled.
 
 7. **Continue to exhaustion.** Re-run `plan` after every outcome. Fill newly
    available lanes, including tickets unlocked by completed prerequisites. Wait
@@ -250,15 +286,21 @@ Before launching, resolve the executable because non-interactive SSH shells may 
    preserve reservations and allow independent work on healthy routes to
    continue. Bounded retries remain owned by `api_agent.py`.
 
-   Treat controller `spend` as authoritative. Stop admission when a ticket is
-   `operator_action`; never relaunch to evade a model/reviewer run-count breaker.
+   Drain `plan.recovery`, `plan.repair`, and `plan.decomposition`, and continue
+   independent `plan.launch` work around external blockers before asking the
+   user. Treat controller `spend` as authoritative. Stop admission when a ticket
+   is `operator_action`; never relaunch to evade a model or post-implementation
+   reviewer run-count breaker. Design rounds use their own durable ledger and do
+   not consume code/security reviewer capacity. Provider continuations retain a
+   stable logical run id and are reconciled rather than replaced.
    A pause is a hard stop until root issues an expiring, ticket-scoped budget
    capability with an exact absolute ceiling and it is consumed by
    `grant-budget`. Pipe issuance to `--operator-capability-stdin`; never print,
    store, or invent the token. The grant changes only that ticket's pause and
    hard ticket-cost ceiling. It does not relax per-run/sprint limits,
-   model/reviewer run-count breakers, gates, or concurrency. If a terminal
-   `blocked`/`user_action` checkpoint has lost its attempt token or mechanically
+   model/post-implementation-reviewer run-count breakers, gates, or concurrency. If a terminal
+   `blocked`/`external_blocked`/`operator_decision`/`user_action` checkpoint has
+   lost its attempt token or mechanically
    verified execution-unit identity, require a separate root-issued,
    attempt-bound recovery capability and use `recover-terminal`; do not
    fabricate inventory or identity. Include warning state, projected spend,

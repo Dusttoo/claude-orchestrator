@@ -48,8 +48,26 @@ from runtime_state import (
 
 
 SCHEMA_VERSION = 2
-TERMINAL = {"completed", "blocked", "user_action"}
-OUTCOMES = TERMINAL
+TERMINAL = {
+    "completed",
+    "blocked",
+    "decomposed",
+    "external_blocked",
+    "operator_decision",
+    "user_action",
+}
+AUTONOMOUS_INTERVENTIONS = {"needs_decomposition", "needs_repair", "recoverable"}
+OUTCOMES = TERMINAL | AUTONOMOUS_INTERVENTIONS
+PROGRESS_MILESTONES = {
+    "design_passed",
+    "failing_test",
+    "implementation_commit",
+    "pr_opened",
+    "ci_advanced",
+    "review_finding_closed",
+}
+DESIGN_REVIEWER_ROLES = {"design-reviewer"}
+POST_IMPLEMENTATION_REVIEWER_ROLES = {"code-reviewer", "security-reviewer"}
 DEFAULT_DONE = ["done", "closed", "resolved"]
 DEFAULT_BLOCKED = ["blocked"]
 DEFAULT_READY = ["ready", "to do", "open", "selected for development"]
@@ -102,6 +120,15 @@ def config_scalar_any_depth(path: Path, key: str, default: str) -> str:
         if match and match.group(1):
             return unquote(match.group(1))
     return default
+
+
+def config_bool_any_depth(path: Path, key: str, default: bool) -> bool:
+    raw = config_scalar_any_depth(path, key, "true" if default else "false").casefold()
+    if raw in {"true", "yes", "1", "on"}:
+        return True
+    if raw in {"false", "no", "0", "off"}:
+        return False
+    raise SprintError(f"{key} must be true or false")
 
 
 def config_list(path: Path, key: str, default: list[str]) -> list[str]:
@@ -183,10 +210,28 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
             or 6,
             6,
         )
+        max_auto_slices = min(
+            int(config_scalar_any_depth(config, "max_auto_slices", "6")) or 6,
+            10,
+        )
+        decomposition_threshold = int(
+            config_scalar_any_depth(config, "complexity_threshold", "70") or 70
+        )
+        max_usd_without_progress = min(
+            float(config_scalar_any_depth(config, "max_usd_without_progress", "5"))
+            or 5,
+            10,
+        )
     except ValueError as exc:
         raise SprintError("ticket budgets and run limits must be numbers") from exc
     if max_model_runs < 1 or max_reviewer_runs < 1:
         raise SprintError("model and reviewer run limits must be positive")
+    if max_auto_slices < 2:
+        raise SprintError("max_auto_slices must be at least 2")
+    if not 1 <= decomposition_threshold <= 100:
+        raise SprintError("complexity_threshold must be from 1 through 100")
+    if max_usd_without_progress <= 0:
+        raise SprintError("max_usd_without_progress must be positive")
     return {
         "config": config,
         "concurrency_max": concurrency,
@@ -197,6 +242,12 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
         "pause_usd_per_ticket": pause_budget,
         "max_model_runs_per_ticket": max_model_runs,
         "max_reviewer_runs_per_ticket": max_reviewer_runs,
+        "max_auto_slices": max_auto_slices,
+        "decomposition_threshold": decomposition_threshold,
+        "max_usd_without_progress": max_usd_without_progress,
+        "auto_decompose_large_tickets": config_bool_any_depth(
+            config, "auto_decompose_large_tickets", False
+        ),
         "ready": {
             x.casefold()
             for x in config_list(config, "sprint_ready_statuses", DEFAULT_READY)
@@ -311,6 +362,7 @@ def load(path: Path) -> dict[str, Any]:
     if value.get("schema_version") != SCHEMA_VERSION:
         raise SprintError(f"unsupported sprint checkpoint schema in {path}")
     for ticket in value.get("tickets", {}).values():
+        ticket.setdefault("description", "")
         ticket.setdefault(
             "worker_identity",
             str(
@@ -322,6 +374,9 @@ def load(path: Path) -> dict[str, Any]:
         ticket.setdefault("attach_capability", "")
         ticket.setdefault("attached_at", "")
         ticket.setdefault("launch_evidence", {})
+        ticket.setdefault("scope_assessment", {})
+        ticket.setdefault("decomposition_children", [])
+        ticket.setdefault("progress", [])
     return value
 
 
@@ -649,6 +704,7 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
         tickets[key] = {
             "key": key,
             "summary": str(item.get("summary", "")).strip(),
+            "description": str(item.get("description", "")).strip(),
             "url": str(item.get("url", "")).strip(),
             "raw_status": raw_status,
             "priority": normalize_priority(item.get("priority"), key),
@@ -665,6 +721,9 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
             "attach_capability": "",
             "attached_at": "",
             "launch_evidence": {},
+            "scope_assessment": {},
+            "decomposition_children": [],
+            "progress": [],
             "history": [],
         }
     missing_subtasks = sorted(
@@ -827,7 +886,13 @@ def blockers(state: dict[str, Any], key: str, cfg: dict[str, Any]) -> list[str]:
             dep_state = internal["state"]
             if dep_state == "completed":
                 continue
-            if dep_state in {"blocked", "user_action"}:
+            if dep_state in {
+                "blocked",
+                "decomposed",
+                "external_blocked",
+                "operator_decision",
+                "user_action",
+            }:
                 reasons.append(f"dependency {dependency} ended {dep_state}")
             else:
                 reasons.append(f"dependency {dependency} is {dep_state}")
@@ -877,7 +942,7 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
     if not path.is_file():
         return result
     open_reservations: dict[str, dict[str, Any]] = {}
-    pause_events: dict[str, float] = {}
+    pause_events: dict[str, dict[str, Any]] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -893,23 +958,25 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                         "spent_usd": 0.0,
                         "reserved_usd": 0.0,
                         "run_ids": set(),
+                        "design_review_run_ids": set(),
                         "reviewer_run_ids": set(),
                     },
                 )
                 if event.get("run_id"):
                     item["run_ids"].add(str(event["run_id"]))
-                    if event.get("role") in {
-                        "design-reviewer",
-                        "code-reviewer",
-                        "security-reviewer",
-                    }:
+                    if event.get("role") in DESIGN_REVIEWER_ROLES:
+                        item["design_review_run_ids"].add(str(event["run_id"]))
+                    if event.get("role") in POST_IMPLEMENTATION_REVIEWER_ROLES:
                         item["reviewer_run_ids"].add(str(event["run_id"]))
         elif kind in {"usage", "release"}:
             open_reservations.pop(str(event.get("reservation_id") or ""), None)
-        if kind == "ticket_budget_pause" and ticket:
-            pause_events[ticket] = max(
-                pause_events.get(ticket, 0), float(event.get("projected_total_usd", 0))
-            )
+        if (
+            kind == "ticket_budget_pause"
+            and ticket
+            and str(event.get("reason") or "")
+            not in {"max_model_runs_per_ticket", "max_reviewer_runs_per_ticket"}
+        ):
+            pause_events[ticket] = event
         if kind == "usage" and ticket:
             item = result.setdefault(
                 ticket,
@@ -917,17 +984,16 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                     "spent_usd": 0.0,
                     "reserved_usd": 0.0,
                     "run_ids": set(),
+                    "design_review_run_ids": set(),
                     "reviewer_run_ids": set(),
                 },
             )
             item["spent_usd"] += float(event.get("cost_usd", 0))
             if event.get("run_id"):
                 item["run_ids"].add(str(event["run_id"]))
-                if event.get("role") in {
-                    "design-reviewer",
-                    "code-reviewer",
-                    "security-reviewer",
-                }:
+                if event.get("role") in DESIGN_REVIEWER_ROLES:
+                    item["design_review_run_ids"].add(str(event["run_id"]))
+                if event.get("role") in POST_IMPLEMENTATION_REVIEWER_ROLES:
                     item["reviewer_run_ids"].add(str(event["run_id"]))
     for event in open_reservations.values():
         ticket = str(event.get("ticket") or "")
@@ -938,20 +1004,20 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                     "spent_usd": 0.0,
                     "reserved_usd": 0.0,
                     "run_ids": set(),
+                    "design_review_run_ids": set(),
                     "reviewer_run_ids": set(),
                 },
             )
             item["reserved_usd"] += float(event.get("projected_cost_usd", 0))
             if event.get("run_id"):
                 item["run_ids"].add(str(event["run_id"]))
-                if event.get("role") in {
-                    "design-reviewer",
-                    "code-reviewer",
-                    "security-reviewer",
-                }:
+                if event.get("role") in DESIGN_REVIEWER_ROLES:
+                    item["design_review_run_ids"].add(str(event["run_id"]))
+                if event.get("role") in POST_IMPLEMENTATION_REVIEWER_ROLES:
                     item["reviewer_run_ids"].add(str(event["run_id"]))
     for ticket, item in result.items():
         item["run_count"] = len(item.pop("run_ids"))
+        item["design_review_run_count"] = len(item.pop("design_review_run_ids"))
         item["reviewer_run_count"] = len(item.pop("reviewer_run_ids"))
         total = item["spent_usd"] + item["reserved_usd"]
         item["projected_total_usd"] = round(total, 6)
@@ -971,7 +1037,10 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
         item["state"] = (
             "operator_action"
             if (
-                (ticket in pause_events and grant_ceiling is None)
+                (
+                    ticket in pause_events
+                    and grant_ceiling is None
+                )
                 or (pause and total > pause)
                 or item["run_count"] >= cfg["max_model_runs_per_ticket"]
                 or item["reviewer_run_count"] >= cfg["max_reviewer_runs_per_ticket"]
@@ -1049,6 +1118,9 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                         "attach_capability",
                         "attached_at",
                         "launch_evidence",
+                        "scope_assessment",
+                        "decomposition_children",
+                        "progress",
                     ):
                         if field in previous:
                             fresh[field] = previous[field]
@@ -1079,6 +1151,223 @@ def get_state(
     return path, load(path)
 
 
+def validated_scope_assessment(
+    raw: dict[str, Any], ticket: str, max_slices: int, threshold: int
+) -> dict[str, Any]:
+    """Validate a scoper result before it can change controller scheduling."""
+    if raw.get("schema_version") != 1:
+        raise SprintError("scope assessment schema_version must be 1")
+    if normalize_key(raw.get("ticket")) != ticket:
+        raise SprintError("scope assessment belongs to a different ticket")
+    verdict = str(raw.get("verdict") or "").strip().casefold()
+    if verdict not in {"ready", "decompose", "operator_decision"}:
+        raise SprintError(
+            "scope assessment verdict must be ready, decompose, or operator_decision"
+        )
+    score = raw.get("complexity_score")
+    if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 100:
+        raise SprintError("scope assessment complexity_score must be an integer from 0 to 100")
+    if verdict == "ready" and score >= threshold:
+        raise SprintError(
+            f"complexity score {score} reaches decomposition threshold {threshold}"
+        )
+    reasons = raw.get("reasons")
+    if (
+        not isinstance(reasons, list)
+        or not reasons
+        or any(not isinstance(item, str) or not item.strip() for item in reasons)
+    ):
+        raise SprintError("scope assessment requires non-empty reasons")
+    if len(reasons) > 20 or any(len(item) > 2000 for item in reasons):
+        raise SprintError("scope assessment reasons exceed the bounded schema")
+    slices = raw.get("slices", [])
+    if verdict == "decompose":
+        if not isinstance(slices, list) or not 2 <= len(slices) <= max_slices:
+            raise SprintError(
+                f"decomposition requires 2 through {max_slices} bounded slices"
+            )
+        identifiers: set[str] = set()
+        for index, item in enumerate(slices, 1):
+            if not isinstance(item, dict):
+                raise SprintError("every decomposition slice must be an object")
+            identifier = str(item.get("id") or "").strip()
+            if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", identifier):
+                raise SprintError(f"slice {index} has an invalid id")
+            if identifier in identifiers:
+                raise SprintError(f"duplicate decomposition slice id: {identifier}")
+            identifiers.add(identifier)
+            for field in ("summary", "behavior"):
+                if not str(item.get(field) or "").strip():
+                    raise SprintError(f"slice {identifier} requires {field}")
+            if len(str(item["summary"])) > 255 or len(str(item["behavior"])) > 8000:
+                raise SprintError(f"slice {identifier} exceeds Jira field limits")
+            criteria = item.get("acceptance_criteria")
+            if (
+                not isinstance(criteria, list)
+                or not criteria
+                or any(not isinstance(value, str) or not value.strip() for value in criteria)
+            ):
+                raise SprintError(
+                    f"slice {identifier} requires testable acceptance_criteria"
+                )
+            if len(criteria) > 30 or any(len(value) > 2000 for value in criteria):
+                raise SprintError(f"slice {identifier} acceptance criteria exceed limits")
+            dependencies = item.get("depends_on", [])
+            if not isinstance(dependencies, list) or any(
+                not isinstance(value, str) for value in dependencies
+            ):
+                raise SprintError(f"slice {identifier} depends_on must be an array")
+        for item in slices:
+            unknown = sorted(set(item.get("depends_on", [])) - identifiers)
+            if unknown or item["id"] in item.get("depends_on", []):
+                raise SprintError(
+                    f"slice {item['id']} has invalid dependencies: {', '.join(unknown) or item['id']}"
+                )
+        graph = {item["id"]: set(item.get("depends_on", [])) for item in slices}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(identifier: str) -> None:
+            if identifier in visiting:
+                raise SprintError("decomposition slice dependencies contain a cycle")
+            if identifier in visited:
+                return
+            visiting.add(identifier)
+            for dependency in graph[identifier]:
+                visit(dependency)
+            visiting.remove(identifier)
+            visited.add(identifier)
+
+        for identifier in graph:
+            visit(identifier)
+    elif slices:
+        raise SprintError("only a decompose verdict may include slices")
+    return {
+        "schema_version": 1,
+        "ticket": ticket,
+        "verdict": verdict,
+        "complexity_score": score,
+        "reasons": [item.strip() for item in reasons],
+        "slices": slices,
+    }
+
+
+def record_scope(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    path = state_path(cfg["state_dir"], str(args.sprint))
+    key = normalize_key(args.ticket)
+    assessment_path = Path(args.assessment).resolve()
+    if assessment_path != cfg["shared_root"] and cfg["shared_root"] not in assessment_path.parents:
+        raise SprintError("scope assessment must be stored inside the repository")
+    raw = read_json(assessment_path, label="scope assessment")
+    assessment = validated_scope_assessment(
+        raw, key, cfg["max_auto_slices"], cfg["decomposition_threshold"]
+    )
+    assessment["artifact"] = str(assessment_path.relative_to(cfg["shared_root"]))
+    assessment["artifact_sha256"] = hashlib.sha256(assessment_path.read_bytes()).hexdigest()
+    assessment["recorded_at"] = now()
+    with locked(path):
+        state = load(path)
+        ticket = state["tickets"].get(key)
+        if not ticket or ticket["state"] not in {"pending", "needs_decomposition"}:
+            current = ticket["state"] if ticket else "missing"
+            raise SprintError(f"ticket {key} cannot be scoped from state {current}")
+        ticket["scope_assessment"] = assessment
+        verdict = assessment["verdict"]
+        if verdict == "ready":
+            ticket["state"] = "pending"
+            ticket["reason"] = "scope assessment passed"
+        elif verdict == "decompose":
+            ticket["state"] = "needs_decomposition"
+            ticket["reason"] = (
+                f"complexity score {assessment['complexity_score']} requires "
+                f"{len(assessment['slices'])} bounded slices"
+            )
+        else:
+            ticket["state"] = "operator_decision"
+            ticket["reason"] = "; ".join(assessment["reasons"])
+        ticket["history"].append(
+            {"at": now(), "event": "scope-recorded", "verdict": verdict}
+        )
+        save(path, state)
+    emit({"ticket": key, "state": ticket["state"], "assessment": assessment})
+
+
+def scope_context(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    """Return only the requested ticket body for one ephemeral scoping pass."""
+    _, state = get_state(args, cfg)
+    key = normalize_key(args.ticket)
+    ticket = state["tickets"].get(key)
+    if not ticket:
+        raise SprintError(f"ticket {key} is absent from the synchronized sprint")
+    emit(
+        {
+            "ticket": key,
+            "summary": ticket.get("summary", ""),
+            "description": ticket.get("description", ""),
+            "url": ticket.get("url", ""),
+            "dependencies": ticket.get("dependencies", []),
+            "subtasks": ticket.get("subtasks", []),
+        }
+    )
+
+
+def record_decomposition(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    """Close a tracking parent after fresh Jira sync proves every created child."""
+    path = state_path(cfg["state_dir"], str(args.sprint))
+    key = normalize_key(args.ticket)
+    requested = sorted({normalize_key(value) for value in args.children.split(",") if value.strip()})
+    if len(requested) < 2:
+        raise SprintError("record-decomposition requires at least two child ticket keys")
+    with locked(path):
+        state = load(path)
+        ticket = state["tickets"].get(key)
+        if not ticket or ticket["state"] != "needs_decomposition":
+            current = ticket["state"] if ticket else "missing"
+            raise SprintError(f"ticket {key} cannot record decomposition from state {current}")
+        if requested != sorted(ticket.get("subtasks", [])):
+            raise SprintError(
+                "created child keys must exactly match the fresh authoritative Jira subtask inventory"
+            )
+        missing = sorted(set(requested) - set(state["tickets"]))
+        if missing:
+            raise SprintError("decomposition children are absent from inventory: " + ", ".join(missing))
+        ticket["state"] = "decomposed"
+        ticket["reason"] = "tracking parent decomposed into " + ", ".join(requested)
+        ticket["decomposition_children"] = requested
+        ticket["history"].append(
+            {"at": now(), "event": "decomposition-recorded", "children": requested}
+        )
+        save(path, state)
+    emit({"ticket": key, "state": "decomposed", "children": requested})
+
+
+def record_progress(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    path = state_path(cfg["state_dir"], str(args.sprint))
+    key = normalize_key(args.ticket)
+    if args.milestone not in PROGRESS_MILESTONES:
+        raise SprintError("unsupported progress milestone")
+    if not args.evidence.strip():
+        raise SprintError("progress evidence must not be empty")
+    with locked(path):
+        state = load(path)
+        ticket = state["tickets"].get(key)
+        if not ticket or ticket["state"] not in {"running", "needs_repair", "recoverable"}:
+            current = ticket["state"] if ticket else "missing"
+            raise SprintError(f"ticket {key} cannot record progress from state {current}")
+        require_attempt(ticket, args.attempt_token)
+        spent = usage_snapshots(cfg).get(key, {}).get("spent_usd", 0.0)
+        event = {
+            "at": now(),
+            "milestone": args.milestone,
+            "evidence": args.evidence.strip(),
+            "spent_usd": spent,
+        }
+        ticket.setdefault("progress", []).append(event)
+        ticket["history"].append({"at": event["at"], "event": "progress", **event})
+        save(path, state)
+    emit({"ticket": key, "state": ticket["state"], "progress": event})
+
+
 def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     spend = usage_snapshots(cfg)
     running = sorted(
@@ -1095,11 +1384,23 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         for ticket in ordered
         if ticket["state"] == "pending"
     }
+    scope = sorted(
+        ticket["key"]
+        for ticket in ordered
+        if ticket["state"] == "pending"
+        and not admission_reasons[ticket["key"]]
+        and not ticket.get("scope_assessment")
+        and cfg["auto_decompose_large_tickets"]
+    )
     ready = [
         ticket["key"]
         for ticket in ordered
         if ticket["state"] == "pending"
         and not admission_reasons[ticket["key"]]
+        and (
+            not cfg["auto_decompose_large_tickets"]
+            or (ticket.get("scope_assessment") or {}).get("verdict") == "ready"
+        )
         and spend.get(ticket["key"], {}).get("state") != "operator_action"
     ]
     available = max(0, cfg["concurrency_max"] - len(running))
@@ -1113,14 +1414,52 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         if ticket["state"] == "pending" and admission_reasons[ticket["key"]]
     ]
     launch = ready[:available]
+    decomposition = sorted(
+        key
+        for key, ticket in state["tickets"].items()
+        if ticket["state"] == "needs_decomposition"
+    )
+    repair = sorted(
+        key
+        for key, ticket in state["tickets"].items()
+        if ticket["state"] == "needs_repair"
+    )
+    recovery = sorted(
+        key
+        for key, ticket in state["tickets"].items()
+        if ticket["state"] == "recoverable"
+    )
+    stalled = []
+    for key in running:
+        ticket = state["tickets"][key]
+        progress = ticket.get("progress") or []
+        baseline = float(progress[-1].get("spent_usd", 0)) if progress else 0.0
+        current = float(spend.get(key, {}).get("spent_usd", 0))
+        delta = max(0.0, current - baseline)
+        if delta >= cfg["max_usd_without_progress"]:
+            stalled.append(
+                {
+                    "key": key,
+                    "usd_since_progress": round(delta, 6),
+                    "threshold_usd": cfg["max_usd_without_progress"],
+                    "last_milestone": progress[-1].get("milestone") if progress else None,
+                }
+            )
     return {
         "sprint": state["sprint"],
         "concurrency_max": cfg["concurrency_max"],
         "running": running,
         "needs_reconcile": running,
         "launch": launch,
+        "scope": scope,
+        "decomposition": decomposition,
+        "repair": repair,
+        "recovery": recovery,
+        "stalled": stalled,
         "waiting": waiting,
-        "autonomous_work_remaining": bool(running or launch),
+        "autonomous_work_remaining": bool(
+            running or launch or scope or decomposition or repair or recovery
+        ),
         "over_capacity": max(0, len(running) - cfg["concurrency_max"]),
         "spend": spend,
     }
@@ -2315,7 +2654,12 @@ def recover_terminal(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     with locked(path):
         state = load(path)
         ticket = state["tickets"].get(key)
-        if not ticket or ticket.get("state") not in {"blocked", "user_action"}:
+        if not ticket or ticket.get("state") not in {
+            "blocked",
+            "external_blocked",
+            "operator_decision",
+            "user_action",
+        }:
             current = ticket.get("state") if ticket else "missing"
             raise SprintError(f"ticket {key} cannot be terminal-recovered from state {current}")
         try:
@@ -2542,6 +2886,12 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         "sprint": state["sprint"],
         "completed": [],
         "blocked": [],
+        "decomposed": [],
+        "decomposition": [],
+        "external_blocked": [],
+        "operator_decision": [],
+        "repair": [],
+        "recovery": [],
         "user_action": [],
         "running": [],
     }
@@ -2562,6 +2912,18 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         }
         if ticket["state"] == "completed":
             result["completed"].append(item)
+        elif ticket["state"] == "decomposed":
+            result["decomposed"].append(item)
+        elif ticket["state"] == "needs_decomposition":
+            result["decomposition"].append(item)
+        elif ticket["state"] == "needs_repair":
+            result["repair"].append(item)
+        elif ticket["state"] == "recoverable":
+            result["recovery"].append(item)
+        elif ticket["state"] == "external_blocked":
+            result["external_blocked"].append(item)
+        elif ticket["state"] == "operator_decision":
+            result["operator_decision"].append(item)
         elif ticket["state"] == "user_action":
             result["user_action"].append(item)
         elif ticket["state"] == "blocked":
@@ -2681,6 +3043,36 @@ def parser() -> argparse.ArgumentParser:
     finish_parser.add_argument("--pr", default="")
     finish_parser.add_argument("--attempt-token", required=True)
     finish_parser.set_defaults(func=finish)
+    scope_parser = commands.add_parser(
+        "record-scope", help="record a structured readiness/decomposition assessment"
+    )
+    scope_parser.add_argument("--sprint", required=True)
+    scope_parser.add_argument("--ticket", required=True)
+    scope_parser.add_argument("--assessment", required=True)
+    scope_parser.set_defaults(func=record_scope)
+    scope_context_parser = commands.add_parser(
+        "scope-context", help="emit one synchronized Jira body for ephemeral scoping"
+    )
+    scope_context_parser.add_argument("--sprint", required=True)
+    scope_context_parser.add_argument("--ticket", required=True)
+    scope_context_parser.set_defaults(func=scope_context)
+    decomposition_parser = commands.add_parser(
+        "record-decomposition",
+        help="bind a decomposed parent to freshly synchronized Jira children",
+    )
+    decomposition_parser.add_argument("--sprint", required=True)
+    decomposition_parser.add_argument("--ticket", required=True)
+    decomposition_parser.add_argument("--children", required=True)
+    decomposition_parser.set_defaults(func=record_decomposition)
+    progress_parser = commands.add_parser(
+        "record-progress", help="record a spend-resetting ticket milestone"
+    )
+    progress_parser.add_argument("--sprint", required=True)
+    progress_parser.add_argument("--ticket", required=True)
+    progress_parser.add_argument("--milestone", required=True, choices=sorted(PROGRESS_MILESTONES))
+    progress_parser.add_argument("--evidence", required=True)
+    progress_parser.add_argument("--attempt-token", required=True)
+    progress_parser.set_defaults(func=record_progress)
     requeue_parser = commands.add_parser("requeue")
     requeue_parser.add_argument("--sprint", required=True)
     requeue_parser.add_argument("--ticket", required=True)
