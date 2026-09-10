@@ -99,6 +99,20 @@ case "$command" in
     [ -f "$cap" ] && [ "$(cat "$cap")" = "$token" ]
     rm "$cap"
     ;;
+  relaunch-ceiling)
+    [ "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ticket"])' "$2")" = "${ORCHESTRATION_TEST_RELAUNCH_TICKET:?}" ] || exit 3
+    [ -f "${ORCHESTRATION_TEST_RELAUNCH_ACTIVE:?}" ] || exit 3
+    cat "$ORCHESTRATION_TEST_RELAUNCH_ACTIVE"
+    ;;
+  activate-relaunch)
+    [ "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ticket"])' "$2")" = "${ORCHESTRATION_TEST_RELAUNCH_TICKET:?}" ]
+    IFS= read -r token
+    [ -f "${ORCHESTRATION_TEST_RELAUNCH_CAP:?}" ]
+    [ "$(cat "$ORCHESTRATION_TEST_RELAUNCH_CAP")" = "$token" ]
+    mv "$ORCHESTRATION_TEST_RELAUNCH_CAP" "$ORCHESTRATION_TEST_RELAUNCH_ACTIVE"
+    printf '4\n' > "$ORCHESTRATION_TEST_RELAUNCH_ACTIVE"
+    printf '4\n'
+    ;;
   *) exit 2 ;;
 esac
 SH
@@ -107,6 +121,9 @@ export ORCHESTRATION_TEST_AUTHORITY_HELPER="$TMP/operator-authority-helper"
 export ORCHESTRATION_TEST_RECOVERY_CAP="$TMP/operator-recovery.cap"
 export ORCHESTRATION_TEST_BUDGET_CAP="$TMP/operator-budget.cap"
 export ORCHESTRATION_TEST_BUDGET_ACTIVE="$TMP/operator-budget.active"
+export ORCHESTRATION_TEST_RELAUNCH_CAP="$TMP/operator-relaunch.cap"
+export ORCHESTRATION_TEST_RELAUNCH_ACTIVE="$TMP/operator-relaunch.active"
+export ORCHESTRATION_TEST_RELAUNCH_TICKET="PROJ-61"
 cp "$ROOT/templates/config.yaml" "$TMP/repo/.orchestration/config.yaml"
 sed -i.bak 's/^concurrency_max:.*/concurrency_max: 2/' "$TMP/repo/.orchestration/config.yaml"
 rm "$TMP/repo/.orchestration/config.yaml.bak"
@@ -423,6 +440,30 @@ fi
 "$CONTROLLER" plan --sprint 47 > "$TMP/terminal-plan.json"
 json_check "authorized terminal lane is launchable below its granted ceiling" "$TMP/terminal-plan.json" '"PROJ-61" in data["launch"] and data["spend"]["PROJ-61"]["state"] != "operator_action"'
 run_fail "terminal recovery capability is one-shot" "$CONTROLLER" recover-terminal --sprint 47 --ticket PROJ-61 --reason replay --operator-capability terminal-recovery-once
+
+python3 - "$TMP/repo/.orchestration/.sprint-state" <<'PY'
+import json,sys
+from pathlib import Path
+path=next(Path(sys.argv[1]).glob('47-*.json'))
+state=json.loads(path.read_text()); state['tickets']['PROJ-61']['attempts']=3
+path.write_text(json.dumps(state)+'\n')
+PY
+"$CONTROLLER" plan --sprint 47 > "$TMP/relaunch-before.json"
+json_check "an exhausted pending ticket is not launchable without root authority" "$TMP/relaunch-before.json" '"PROJ-61" not in data["launch"] and any(x["key"] == "PROJ-61" and "attempt ceiling" in "; ".join(x["reasons"]) for x in data["waiting"])'
+"$CONTROLLER" summary --sprint 47 > "$TMP/relaunch-summary.json"
+json_check "summary reports exhausted attempts as an operator action" "$TMP/relaunch-summary.json" 'any(x["key"] == "PROJ-61" and "root-issued ticket relaunch authority" in x["reason"] for x in data["user_action"])'
+printf 'relaunch-once' > "$ORCHESTRATION_TEST_RELAUNCH_CAP"
+if printf 'relaunch-once\n' | "$CONTROLLER" grant-relaunch --sprint 47 --ticket PROJ-61 --operator-capability-stdin > "$TMP/relaunch-grant.json"; then
+  ok "root-issued relaunch capability activates an absolute ticket attempt ceiling"
+else
+  fail_case "root-issued relaunch capability activates an absolute ticket attempt ceiling"
+fi
+json_check "relaunch grant reports its exact absolute ceiling" "$TMP/relaunch-grant.json" 'data["attempt_ceiling"] == 4'
+"$CONTROLLER" plan --sprint 47 > "$TMP/relaunch-after.json"
+json_check "ticket-scoped relaunch authority restores only the exhausted ticket" "$TMP/relaunch-after.json" '"PROJ-61" in data["launch"]'
+"$CONTROLLER" reserve --sprint 47 --ticket PROJ-61 --run-ref authorized-fourth > "$TMP/relaunch-reserve.json"
+json_check "the authorized final attempt reserves normally" "$TMP/relaunch-reserve.json" 'data["attempt"] == 4'
+run_fail "relaunch capability is one-shot" "$CONTROLLER" grant-relaunch --sprint 47 --ticket PROJ-61 --operator-capability relaunch-once
 
 python3 - "$TMP/repo/.orchestration/.llm-usage/usage.jsonl" <<'PY'
 import json,sys

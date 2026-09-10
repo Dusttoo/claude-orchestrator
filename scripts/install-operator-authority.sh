@@ -42,7 +42,9 @@ trap 'rm -f "$temporary"' EXIT
   printf 'Cmnd_Alias ORCHESTRATION_AUTHORITY_RUNTIME = '
   printf '%s consume-recovery --scope *, ' "$TARGET"
   printf '%s activate-budget --scope *, ' "$TARGET"
-  printf '%s budget-ceiling --scope *\n' "$TARGET"
+  printf '%s budget-ceiling --scope *, ' "$TARGET"
+  printf '%s activate-relaunch --scope *, ' "$TARGET"
+  printf '%s relaunch-ceiling --scope *\n' "$TARGET"
   printf '%s ALL=(root) NOPASSWD: ORCHESTRATION_AUTHORITY_RUNTIME\n' "$RUNTIME_USER"
 } > "$temporary"
 chmod 0440 "$temporary"

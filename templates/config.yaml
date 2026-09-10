@@ -164,7 +164,9 @@ integration_branch: ""          # fill for schema v1, e.g. the branch feature wo
 production_branch: ""           # fill for schema v1, e.g. the protected release/history target
 
 # Initial launch plus this many recovery launches are automatic. A later launch
-# stops for an operator policy change; a worker cannot self-approve a bypass.
+# stops for operator action; a worker cannot self-approve a bypass. Root can
+# grant one ticket a higher absolute attempt ceiling without changing this
+# repository-wide default.
 max_lane_relaunches: 2
 
 # --- Merge strategy per target -------------------------------------------- both
