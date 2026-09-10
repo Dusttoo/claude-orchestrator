@@ -1,5 +1,11 @@
 # Orka
 
+<p align="center">
+  <img src="assets/orka-logo.png" alt="Orka, an AI orchestration agent wearing a headset and working at a laptop" width="280">
+</p>
+
+<p align="center"><strong>High-throughput engineering orchestration with bounded autonomy.</strong></p>
+
 A reusable harness for running a small team of coding agents against real
 tickets or a dependency-linked Jira sprint, with **independent review and
 security gates** and a **mechanical merge-guard**, so that parallel agent work
@@ -19,6 +25,38 @@ graph, gate commands, CI categories, approvals, adapter seams) lives in one
 small config file, and the actual engineering rules live in the target repo's
 own `CLAUDE.md` / `AGENTS.md`. The plugin itself carries no project knowledge,
 so the same harness ports across codebases.
+
+## What 1.0 adds
+
+Orka 1.0 is designed to keep a long-running sprint moving without choosing
+between brittle stop-and-go automation and an unbounded agent that can spend or
+loop indefinitely:
+
+- **Large-ticket decomposition.** An opt-in scoping pass scores ticket
+  complexity before implementation. Oversized technical work can be split into
+  two to ten independently testable Jira children with explicit dependencies,
+  while product and security decisions still stop for an operator.
+- **Progress-aware spend control.** Warning thresholds are informational;
+  spending without a durable milestone triggers recovery or decomposition
+  instead of silently buying more retries. Hard ticket, run, reviewer, and
+  sprint ceilings remain mechanical.
+- **Autonomous intervention queues.** Recoverable work, bounded repairs, and
+  approved decomposition are first-class controller queues. An independent
+  blocked ticket does not freeze the rest of the sprint.
+- **Durable, ticket-scoped continuations.** Root-issued, expiring capabilities
+  can raise one ticket's absolute budget or relaunch ceiling and recover one
+  preserved attempt without weakening repository-wide gates.
+- **Authoritative Jira synchronization.** Sprint parents are fetched first and
+  the exact returned keys define the child query, avoiding stale inventory and
+  project-specific query assumptions.
+- **Provider-safe execution.** OpenAI and Anthropic requests use compatible
+  payloads, conservative retry classification, durable usage reservations, and
+  explicit reconciliation when a provider accepts a request but the response is
+  lost.
+
+These controls preserve the central rule: Orka may recover, repair, decompose,
+and continue within declared policy, but it cannot manufacture authority,
+bypass a failed gate, or merge unverifiable work.
 
 ---
 
@@ -164,8 +202,11 @@ Legacy key blocks:
 | `gates` | which review roles run (`code-review`, `security-review`) |
 | `security_required_when` | diff triggers that make the security gate mandatory |
 | `sprint_id` / `sprint_*` | configured Jira sprint, dependency/status mapping, and checkpoint location |
+| `sprint_decomposition` | optional pre-code complexity assessment and bounded Jira child creation |
 | `concurrency_max` | how many ticket workflows or verification chains run at once |
 | `max_heavy_processes` | separate host-local limit for builds, full tests, and browser suites |
+| `max_lane_relaunches` | ordinary launch-attempt ceiling before ticket-scoped authority is required |
+| `max_usd_without_progress` | recovery/decomposition trigger when spend advances without a durable milestone |
 | `max_design_rounds` / `max_repair_cycles` | independent caps for pre-code design and evidenced post-code repairs |
 | `worktree_cleanup` | `manual` (safe default) or `auto` for clean, unlocked worktrees |
 | `rules_docs` | the docs every gate agent reads (`CLAUDE.md`, `AGENTS.md`) |
@@ -273,9 +314,12 @@ normalizes dependencies, orders ready tickets by optional per-ticket priority
 then key, atomically enforces `concurrency_max`, and checkpoints
 running and terminal work under `.orchestration/.sprint-state/`. Restarts
 reconcile existing worker references before dispatch, blocked tickets do not
-stop independent lanes, and the final report separates completed, blocked, and
-user-action items. Repositories provide configuration and project-specific
-acceptance criteria; they do not vendor the controller or its tests.
+stop independent lanes, and recoverable work, repairs, and decomposition remain
+actionable controller queues. When enabled, the scoping gate can turn an
+oversized technical ticket into bounded, dependency-linked Jira children before
+implementation. The final report separates completed, blocked, and user-action
+items. Repositories provide configuration and project-specific acceptance
+criteria; they do not vendor the controller or its tests.
 See [docs/sprint-controller.md](docs/sprint-controller.md) for the trust boundary,
 impossible guarantees, restart invariant, and rejected fragile designs.
 
