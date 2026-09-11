@@ -499,3 +499,97 @@ These tests use local mock providers and temporary credentials; they do not
 establish live billing accuracy. Native Claude children discard inherited OAuth
 and alternate-provider selectors. Manual thinking budgets are capped below the
 output envelope. Configure prices for auxiliary models as well as the main model.
+
+## Restart allowances and legacy reconciliation
+
+A restart is a bounded operator continuation, not deletion of a ledger. The
+root-owned authority supports `issue-restart`, `activate-restart`,
+`restart-grant`, and `revoke-restart`. Upgrade the host helper and its sudoers
+policy with `scripts/install-operator-authority.sh` before using this feature;
+old helpers fail closed on the new command. Runtime users may activate/query a
+grant, but issuance and revocation are never added to their sudoers allowlist.
+
+After inspecting the ticket's lifetime spend, phase spend, attempts, model runs,
+design rounds, review rounds, and repair cycles, the operator creates a JSON
+allowance file. Every ceiling is an **absolute lifetime total**, not an increment.
+For example (choose values from the actual ledger, not this example):
+
+```json
+{
+  "attempts": 6,
+  "model_runs": 30,
+  "review_runs": 14,
+  "design_rounds": 8,
+  "code_rounds": 7,
+  "security_rounds": 7,
+  "repair_cycles": 8,
+  "ticket_usd": "70",
+  "design_usd": "20",
+  "implementation_usd": "30",
+  "code_review_usd": "10",
+  "security_review_usd": "10",
+  "progress_baseline_usd": "15"
+}
+```
+
+`progress_baseline_usd` acknowledges historical ticket spending for the new
+watchdog interval. It must not exceed recorded spending. Only the successfully
+applied, still-live restart grant can supply this baseline. Ordinary retries,
+requeues, syncs, or checkpoint fields cannot reset the watchdog. Admission checks
+run before reservation, so an already-exhausted watchdog does not consume a launch.
+
+```text
+sudo /usr/local/libexec/orchestration-recovery-authority issue-restart \
+  --repository /absolute/repo --ticket PROJ-123 \
+  --allowances /operator/reviewed-allowances.json \
+  --reason "Approved bounded continuation after reconciliation" \
+  --expires-hours 24 \
+| python3 /absolute/plugin/scripts/sprint-controller.py restart-ticket \
+  --sprint 65 --ticket PROJ-123 --operator-capability-stdin
+```
+
+The checkpoint must already contain the ticket. Restart refuses running,
+completed, or decomposed tickets, unknown execution identities, and outstanding
+provider reservations. Reconcile those first. An existing PR routes to repair;
+its branch, execution fence, findings, failed reviews, and historical counters
+remain intact. A preserved scoping/product decision remains an operator decision.
+The grant does not authorize a merge, change Jira readiness, satisfy dependencies,
+or alter per-run and sprint-wide budgets. Review caps are evaluated against the
+live grant rather than overwritten in the review ledger, so expiry/revocation
+restores normal enforcement. Re-running `restart-ticket` without a token can
+finish applying an already-activated grant after a crash; applying the same grant
+twice does not reset state again. A new grant replaces the previous restart grant.
+
+`plan.legacy_reconciliation` identifies old `blocked`/`user_action` tickets with
+concrete next actions: refresh inventory, inspect a preserved PR, reconcile
+existing children, classify an old worker outcome, or verify Jira readiness.
+Investigate these using current Jira/PR evidence, not free-text guesses. Use
+`reconcile-legacy --sprint ID --ticket KEY --classification operator_decision|external_blocked
+--reason "verified evidence"` to replace opaque non-launching labels while
+retaining the original report. Recovery/restart and authenticated decomposition
+bindings remain distinct operations. Never duplicate an existing child chain.
+
+Untouched tickets that disappeared from a query are refreshed automatically if
+an authenticated sync includes them again. The sync preserves removal/return
+history, worker outcomes, scope decisions, and execution evidence.
+
+## Provider startup failures and completion reporting
+
+A controller-owned native gateway distinguishes upstream rate limits (HTTP 429)
+from local budget refusal (HTTP 402). Only a stopped, fenced launch with explicit
+upstream rejection, no outstanding reservations, and no accepted or uncertain model
+work qualifies for a startup retry credit. A ticket receives at most **two** such
+credits on its normal physical launch ceiling; attempt numbers and fencing tokens
+are never reused or decremented. An explicit relaunch/restart ceiling is still an
+absolute total, compared against that bounded normal allowance, not increased by
+the number of failures. Token-count rejections qualify even when no paid reservation was created. Unknown failures receive no credit.
+
+`plan.retry_waiting` gives a 30-second cooldown deadline for a qualifying native
+startup failure. Waiting tickets keep `autonomous_work_remaining=true` without
+occupying a worker lane. Continue independent work and replan at the deadline.
+This is not an unbounded provider retry loop. Reservations and per-ticket budgets
+are still enforced on every paid request.
+
+Summary `finished` retains its old controller-drained meaning for compatibility.
+Use `autonomous_work_exhausted` for that condition and `sprint_complete` for actual
+completion of all checkpointed tickets (including verified child bindings).

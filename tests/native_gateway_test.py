@@ -8,7 +8,9 @@ import os
 import signal
 import contextlib
 import io
-from unittest.mock import patch
+import socket
+import threading
+from unittest.mock import Mock, patch
 from pathlib import Path
 import sys
 import tempfile
@@ -18,7 +20,7 @@ import urllib.error
 from decimal import Decimal
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from api_agent import AgentError, BudgetError, ProviderAmbiguous, UsageLedger
+from api_agent import AgentError, BudgetError, ProviderAmbiguous, ProviderHTTPError, UsageLedger
 import native_gateway
 from native_gateway import NativeGateway, stream_events, claude_child_environment
 
@@ -69,10 +71,35 @@ class NativeGatewayTests(unittest.TestCase):
             self.assertIn(b"event: message_stop", response.read())
         with self.assertRaises(urllib.error.HTTPError) as blocked:
             urllib.request.urlopen(request(self.gateway.token), timeout=2)
-        self.assertEqual(blocked.exception.code, 429)
+        self.assertEqual(blocked.exception.code, 402)
         blocked.exception.close()
         self.assertTrue(self.gateway.stopped.is_set())
         self.assertEqual(self.transport.paid, 1)
+
+    def test_rejected_startup_is_distinct_from_paid_or_uncertain_work(self):
+        with patch.object(self.transport, "request", side_effect=ProviderHTTPError(429, "limited")):
+            with self.assertRaises(ProviderHTTPError):
+                self.gateway.model_request("anthropic", "/messages", {})
+        self.assertTrue(self.gateway.startup_retryable())
+        with patch.object(self.transport, "request", return_value={"id": "accepted"}):
+            self.gateway.model_request("anthropic", "/messages", {})
+        self.assertFalse(self.gateway.startup_retryable())
+
+    def test_token_count_rate_limit_is_an_unpaid_startup_failure(self):
+        with patch.object(self.transport, "request", side_effect=ProviderHTTPError(429, "limited")):
+            with self.assertRaises(ProviderHTTPError):
+                self.gateway.request("/v1/messages", self.payload)
+        self.assertTrue(self.gateway.startup_retryable())
+        self.assertEqual(self.gateway.ledger.snapshot(), [])
+
+    def test_uncertain_startup_never_receives_rejection_credit(self):
+        with patch.object(self.transport, "request", side_effect=ProviderAmbiguous("lost")):
+            with self.assertRaises(ProviderAmbiguous):
+                self.gateway.model_request("anthropic", "/messages", {})
+        with patch.object(self.transport, "request", side_effect=ProviderHTTPError(429, "limited")):
+            with self.assertRaises(ProviderHTTPError):
+                self.gateway.model_request("anthropic", "/messages", {})
+        self.assertFalse(self.gateway.startup_retryable())
 
     def test_claude_environment_removes_accidental_alternate_provider_routing(self):
         env = claude_child_environment(dict(ANTHROPIC_API_KEY="real", CLAUDE_CODE_USE_BEDROCK="1",
@@ -285,6 +312,126 @@ class NativeGatewayTests(unittest.TestCase):
         local.stop('ticket_budget_pause is active for T-1; operator reset required')
         self.run_supervisor(controller, args, cfg, local)
         self.assertEqual(controller.load(path)['tickets']['T-1']['state'], 'operator_decision')
+
+    def test_supervisor_retains_rate_limit_when_child_exits_first(self):
+        controller, args, cfg, path = self.supervisor_fixture(['claude'])
+        gateway = NativeGateway(self.root, self.config, 'T-1', '1', 'unit', self.transport)
+        with patch.object(self.transport, 'request', side_effect=ProviderHTTPError(429, 'limited')):
+            with self.assertRaises(ProviderHTTPError):
+                gateway.model_request('anthropic', '/messages', {})
+        gateway.stop('provider_rate_limited')
+        child = Mock(pid=987654, poll=Mock(return_value=1), wait=Mock(return_value=1))
+        with patch.object(controller.subprocess, 'Popen', return_value=child), patch.object(controller.os, 'killpg'):
+            self.run_supervisor(controller, args, cfg, gateway)
+        child.poll.assert_called_once_with()
+        terminal = json.loads(Path(args.tombstone).read_text())
+        self.assertEqual(terminal['stop_reason'], 'provider_rate_limited')
+        self.assertTrue(terminal['startup_retryable'])
+        ticket = controller.load(path)['tickets']['T-1']
+        self.assertEqual(ticket['state'], 'recoverable')
+        self.assertEqual(ticket['reason'], 'provider_rate_limited')
+        with patch.object(controller, 'execution_unit_status', return_value='absent'):
+            self.assertIsNotNone(controller.current_startup_failure(ticket, cfg))
+            self.assertEqual(controller.startup_credits(ticket, cfg), 1)
+
+    def test_close_waits_for_inflight_provider_settlement(self):
+        for ambiguous in (False, True):
+            with self.subTest(ambiguous=ambiguous):
+                entered, release, published, closing = (threading.Event() for _ in range(4))
+                original = self.transport.request
+                def provider(provider, path, payload, **kwargs):
+                    if path.endswith('count_tokens'):
+                        return {'input_tokens': 100}
+                    if payload['messages'] == ['reject']:
+                        raise ProviderHTTPError(429, 'limited')
+                    entered.set()
+                    if not release.wait(5):
+                        raise AssertionError('test did not release provider')
+                    if ambiguous:
+                        raise ProviderAmbiguous('accepted response lost')
+                    return original(provider, path, payload, **kwargs)
+                gateway = NativeGateway(self.root / str(ambiguous), self.config, 'T-1', '1', 'concurrent', self.transport)
+                endpoint = gateway.start()
+                observations, errors = {}, []
+                def request(messages):
+                    req = urllib.request.Request(endpoint + '/v1/messages',
+                        data=json.dumps({**self.payload, 'messages': messages}).encode(),
+                        headers={'x-api-key': gateway.token})
+                    try:
+                        with urllib.request.urlopen(req, timeout=5) as response:
+                            return response.status
+                    except urllib.error.HTTPError as exc:
+                        exc.close()
+                        return exc.code
+                def held_request():
+                    try:
+                        observations['status'] = request(['held'])
+                    except Exception as exc:
+                        errors.append(exc)
+                # Observe server_close entry, after shutdown stops accepting
+                # clients, so a premature publication is deterministic.
+                original_close = gateway.server.server_close
+                def server_close():
+                    closing.set()
+                    original_close()
+                def publish_terminal():
+                    gateway.close()
+                    observations['retryable'] = gateway.startup_retryable()
+                    observations['events'] = gateway.ledger.snapshot()
+                    published.set()
+                worker = threading.Thread(target=held_request)
+                closer = threading.Thread(target=publish_terminal)
+                with patch.object(self.transport, 'request', side_effect=provider), patch.object(
+                        gateway.server, 'server_close', side_effect=server_close):
+                    try:
+                        worker.start()
+                        self.assertTrue(entered.wait(3))
+                        self.assertEqual(request(['reject']), 429)
+                        self.assertEqual(gateway.provider_inflight, 1)
+                        closer.start()
+                        self.assertTrue(closing.wait(3))
+                        self.assertFalse(published.wait(.2), 'terminal published before handler settlement')
+                    finally:
+                        release.set()
+                        worker.join(5)
+                        if closer.ident is not None:
+                            closer.join(5)
+                        else:
+                            gateway.close()
+                self.assertFalse(worker.is_alive())
+                self.assertFalse(closer.is_alive())
+                self.assertFalse(errors)
+                self.assertTrue(published.is_set())
+                self.assertFalse(observations['retryable'])
+                events = observations['events']
+                self.assertEqual(len(UsageLedger._totals(events)[1]), 1 if ambiguous else 0)
+                self.assertEqual(sum(e['kind'] == 'usage' for e in events), 0 if ambiguous else 1)
+
+    def test_close_bounds_abandoned_client(self):
+        gateway = self.gateway
+        gateway.start()
+        accepted = threading.Event()
+        original_setup = gateway.server.RequestHandlerClass.setup
+        def setup(handler):
+            original_setup(handler)
+            accepted.set()
+        closed = threading.Event()
+        def close():
+            gateway.close()
+            closed.set()
+        with patch.object(gateway.server.RequestHandlerClass, 'setup', setup):
+            client = socket.create_connection(gateway.server.server_address, timeout=2)
+            closer = threading.Thread(target=close)
+            try:
+                client.sendall(b'POST /v1/messages HTTP/1.1\r\n')
+                self.assertTrue(accepted.wait(2))
+                closer.start()
+                self.assertTrue(closed.wait(12), 'abandoned request prevented bounded shutdown')
+            finally:
+                client.close()
+                if closer.ident is not None:
+                    closer.join(3)
+        self.assertFalse(closer.is_alive())
 
     def test_supervisor_claude_settings_cannot_bypass_gateway(self):
         executable = shutil.which('claude')

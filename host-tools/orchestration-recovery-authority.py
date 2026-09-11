@@ -205,6 +205,58 @@ def locked(root: Path):
     return Lock()
 
 
+RESTART_COUNTS = {"attempts", "model_runs", "review_runs", "design_rounds", "code_rounds", "security_rounds", "repair_cycles"}
+RESTART_DOLLARS = {"ticket_usd", "design_usd", "implementation_usd", "code_review_usd", "security_review_usd", "progress_baseline_usd"}
+
+
+def restart_allowances(value):
+    if not isinstance(value, dict) or set(value) != RESTART_COUNTS | RESTART_DOLLARS:
+        raise ValueError("restart requires exactly the documented count and dollar ceilings")
+    for key in RESTART_COUNTS:
+        if type(value[key]) is not int or not 0 < value[key] <= 10000:
+            raise ValueError(f"invalid restart count: {key}")
+    result = dict(value)
+    for key in RESTART_DOLLARS:
+        amount = Decimal(str(value[key]))
+        if not amount.is_finite() or amount < 0 or (amount == 0 and key != "progress_baseline_usd"):
+            raise ValueError(f"invalid restart amount: {key}")
+        result[key] = str(amount)
+    if Decimal(result["progress_baseline_usd"]) >= Decimal(result["ticket_usd"]):
+        raise ValueError("restart baseline must be below the ticket ceiling")
+    return result
+
+
+def restart_grant(args, activate=False):
+    scope = canonical_scope(args.scope, "restart")
+    root = state_root()
+    require_layout(root)
+    target = root / "active" / (hashlib.sha256(scope.encode()).hexdigest() + ".json")
+    token = read_token() if activate else None
+    with locked(root):
+        source = root / "pending" / f"{token}.json" if activate else target
+        if not source.is_file():
+            return fail("restart capability missing or consumed") if activate else 3
+        record = load_record(source)
+        if record.get("kind") != "restart" or not live(record) or not hmac.compare_digest(record.get("scope", ""), scope):
+            return fail("restart capability invalid, expired or scope mismatch") if activate else 3
+        restart_allowances(record["allowances"])
+        if activate:
+            atomic_json(target, record)
+            os.replace(source, root / "consumed" / f"{token}.json")
+    print(json.dumps({key: record[key] for key in ("grant_id", "allowances", "reason", "expires_at")}))
+    return 0
+
+
+def revoke_restart(args):
+    require_real_root()
+    scope = build_scope("restart", args.repository, args.ticket, None)
+    root = state_root()
+    ensure_layout(root)
+    with locked(root):
+        (root / "active" / (hashlib.sha256(scope.encode()).hexdigest() + ".json")).unlink(missing_ok=True)
+    return 0
+
+
 def issue(args: argparse.Namespace, kind: str) -> int:
     require_real_root()
     if not 0 < args.expires_hours <= 168:
@@ -223,6 +275,11 @@ def issue(args: argparse.Namespace, kind: str) -> int:
         attempt_ceiling = args.ceiling_attempts
         if attempt_ceiling <= 0:
             raise ValueError("attempt ceiling must be positive")
+    allowances = None
+    if kind == "restart":
+        allowances = restart_allowances(json.loads(Path(args.allowances).read_text()))
+        if not args.reason.strip() or len(args.reason) > 2000:
+            raise ValueError("restart requires a bounded operator reason")
     token = secrets.token_hex(32)
     root = state_root()
     ensure_layout(root)
@@ -232,6 +289,8 @@ def issue(args: argparse.Namespace, kind: str) -> int:
         "issued_at": time.time(),
         "expires_at": time.time() + args.expires_hours * 3600,
     }
+    if allowances is not None:
+        record.update(allowances=allowances, reason=args.reason.strip(), grant_id=secrets.token_hex(16))
     if ceiling is not None:
         record["ceiling_usd"] = str(ceiling)
     if attempt_ceiling is not None:
@@ -390,6 +449,8 @@ def parser() -> argparse.ArgumentParser:
         "budget-ceiling",
         "activate-relaunch",
         "relaunch-ceiling",
+        "activate-restart",
+        "restart-grant",
     ):
         command = commands.add_parser(name)
         command.add_argument("--scope", required=True)
@@ -414,12 +475,29 @@ def parser() -> argparse.ArgumentParser:
     revoke_relaunch_parser = commands.add_parser("revoke-relaunch")
     revoke_relaunch_parser.add_argument("--repository", required=True)
     revoke_relaunch_parser.add_argument("--ticket", required=True)
+    restart = commands.add_parser("issue-restart")
+    restart.add_argument("--repository", required=True)
+    restart.add_argument("--ticket", required=True)
+    restart.add_argument("--allowances", required=True, help="JSON file with absolute ceilings and progress baseline")
+    restart.add_argument("--reason", required=True)
+    restart.add_argument("--expires-hours", type=float, default=24)
+    revoke_restart_parser = commands.add_parser("revoke-restart")
+    revoke_restart_parser.add_argument("--repository", required=True)
+    revoke_restart_parser.add_argument("--ticket", required=True)
     return result
 
 
 def main() -> int:
     args = parser().parse_args()
     try:
+        if args.command == "issue-restart":
+            return issue(args, "restart")
+        if args.command == "activate-restart":
+            return restart_grant(args, activate=True)
+        if args.command == "restart-grant":
+            return restart_grant(args)
+        if args.command == "revoke-restart":
+            return revoke_restart(args)
         if args.command == "issue-recovery":
             return issue(args, "recovery")
         if args.command == "issue-budget":
@@ -440,7 +518,7 @@ def main() -> int:
             return revoke_budget(args)
         if args.command == "revoke-relaunch":
             return revoke_relaunch(args)
-    except (OSError, ValueError, PermissionError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, PermissionError, InvalidOperation, json.JSONDecodeError) as exc:
         return fail(str(exc))
     return fail("unsupported command")
 

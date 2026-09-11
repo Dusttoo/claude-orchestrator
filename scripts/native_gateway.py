@@ -112,10 +112,41 @@ class NativeGateway:
         self.stopped = threading.Event()
         self.reason = ""
         self.server = None
+        self.provider_accepted = False
+        self.provider_uncertain = False
+        self.provider_rejected = False
+        self.provider_inflight = 0
+        self.provider_lock = threading.Lock()
 
     def stop(self, reason):
         self.reason = reason
         self.stopped.set()
+
+    def model_request(self, *args, count_only=False, **kwargs):
+        with self.provider_lock:
+            self.provider_inflight += 1
+        try:
+            response = self.transport.request(*args, **kwargs)
+            if not count_only:
+                self.provider_accepted = True  # Includes malformed/unsettled responses.
+            return response
+        except ProviderHTTPError as exc:
+            if exc.status in {429, 529}:
+                self.provider_rejected = True
+            else:
+                self.provider_uncertain = True
+            raise
+        except Exception:
+            self.provider_uncertain = True
+            raise
+        finally:
+            with self.provider_lock:
+                self.provider_inflight -= 1
+
+    def startup_retryable(self):
+        with self.provider_lock:
+            return (self.provider_rejected and not self.provider_accepted
+                    and not self.provider_uncertain and self.provider_inflight == 0)
 
     def request(self, path, payload):
         if self.stopped.is_set():
@@ -132,7 +163,7 @@ class NativeGateway:
             raise AgentError("native gateway supports custom client tools and standard token pricing only")
         count_payload = {k: v for k, v in payload.items()
                          if k in {"model", "messages", "system", "tools", "tool_choice", "thinking"}}
-        counted = self.transport.request("anthropic", "/messages/count_tokens", count_payload)
+        counted = self.model_request("anthropic", "/messages/count_tokens", count_payload, count_only=True)
         count = counted.get("input_tokens")
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             raise AgentError("provider omitted valid input token count")
@@ -153,7 +184,7 @@ class NativeGateway:
             projected=pricing.worst_case(count, maximum), limits=self.limits,
             model=model, **self.context)
         try:
-            response = self.transport.request("anthropic", "/messages",
+            response = self.model_request("anthropic", "/messages",
                 body,
                 idempotency_key=reservation)
         except ProviderHTTPError as exc:
@@ -182,10 +213,14 @@ class NativeGateway:
         gateway = self
 
         class Handler(BaseHTTPRequestHandler):
+            def setup(self):
+                super().setup()
+                self.connection.settimeout(10)  # An abandoned client must not prevent shutdown.
+
             def handle(self):
                 try:
                     super().handle()
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, TimeoutError):
                     pass  # Native clients may abandon discovery/error responses.
 
             def log_message(self, *_args):
@@ -213,8 +248,10 @@ class NativeGateway:
                     status = 200
                     content_type = "text/event-stream" if streaming else "application/json"
                 except (AgentError, ValueError, TypeError, KeyError) as exc:
-                    gateway.stop(str(exc))
-                    status, content_type = 429 if isinstance(exc, BudgetError) else 502, "application/json"
+                    rate_limited = isinstance(exc, ProviderHTTPError) and exc.status in {429, 529}
+                    gateway.stop("provider_rate_limited" if rate_limited else str(exc))
+                    # A local budget refusal is not an upstream rate limit.
+                    status, content_type = (429 if rate_limited else 402 if isinstance(exc, BudgetError) else 502), "application/json"
                     body = json.dumps({"type": "error", "error": {
                         "type": "budget_error" if isinstance(exc, BudgetError) else "api_error",
                         "message": "Native gateway stopped this lane; inspect its supervisor record."}}).encode()
@@ -228,7 +265,8 @@ class NativeGateway:
                     pass
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
+        # Join in-flight handlers before emitting a terminal startup receipt.
+        self.server.daemon_threads = False
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         return f"http://127.0.0.1:{self.server.server_port}"
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import time
 import stat
 import subprocess
 from decimal import Decimal, InvalidOperation
@@ -83,7 +85,7 @@ def _call(
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise AuthorityError(f"host operator authority failed: {exc}") from exc
-    if result.returncode == 3 and command in {"budget-ceiling", "relaunch-ceiling"}:
+    if result.returncode == 3 and command in {"budget-ceiling", "relaunch-ceiling", "restart-grant"}:
         return None
     if result.returncode != 0:
         detail = result.stderr.strip() or "request denied"
@@ -169,3 +171,33 @@ def consume_recovery(
         _scope("recovery", repository, ticket, attempt),
         token=token.strip(),
     )
+
+
+def restart_grant(repository: Path, ticket: str, token: str = "") -> dict[str, Any] | None:
+    """Only a live host-owned grant can relax restart ceilings."""
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*-[0-9]+", ticket):
+        return None
+    raw = _call("activate-restart" if token else "restart-grant",
+                _scope("restart", repository, ticket), token=token, no_authority_ok=not token)
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+        counts = {"attempts", "model_runs", "review_runs", "design_rounds", "code_rounds", "security_rounds", "repair_cycles"}
+        dollars = {"ticket_usd", "design_usd", "implementation_usd", "code_review_usd", "security_review_usd", "progress_baseline_usd"}
+        limits = value["allowances"]
+        if not (set(limits) == counts | dollars):
+            raise ValueError("invalid restart allowance")
+        if not (all(type(limits[k]) is int and 0 < limits[k] <= 10000 for k in counts)):
+            raise ValueError("invalid restart allowance")
+        if not (all(Decimal(str(limits[k])).is_finite() and Decimal(str(limits[k])) >= 0 for k in dollars)):
+            raise ValueError("invalid restart allowance")
+        if not (all(Decimal(str(limits[k])) > 0 for k in dollars - {"progress_baseline_usd"})):
+            raise ValueError("invalid restart allowance")
+        if not (Decimal(str(limits["progress_baseline_usd"])) < Decimal(str(limits["ticket_usd"]))):
+            raise ValueError("invalid restart allowance")
+        if not (value["grant_id"] and value["reason"] and float(value["expires_at"]) > time.time()):
+            raise ValueError("invalid restart allowance")
+    except (ValueError, KeyError, TypeError, AssertionError, InvalidOperation) as exc:
+        raise AuthorityError("host authority returned an invalid restart grant") from exc
+    return value

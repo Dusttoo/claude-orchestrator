@@ -109,14 +109,14 @@ class CodexGateway(NativeGateway):
         count_body = {key: value for key, value in body.items() if key in {
             "model", "input", "instructions", "tools", "tool_choice", "text", "reasoning",
             "parallel_tool_calls", "personality", "truncation"}}
-        counted = self.transport.request("openai", "responses/input_tokens", count_body)
+        counted = self.model_request("openai", "responses/input_tokens", count_body, count_only=True)
         count = counted.get("input_tokens")
         if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
             raise AgentError("provider omitted a valid input token count")
         reservation = self.ledger.reserve(projected=pricing.worst_case(count, maximum),
             limits=self.limits, model=model, **self.context)
         try:
-            response = self.transport.request("openai", "responses", body, idempotency_key=reservation)
+            response = self.model_request("openai", "responses", body, idempotency_key=reservation)
         except ProviderHTTPError as exc:
             if exc.status in {400, 401, 403, 404, 413, 422, 429}:
                 self.ledger.release(reservation, self.context["run_id"], "native Codex request rejected")

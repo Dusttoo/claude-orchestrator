@@ -27,6 +27,7 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -38,6 +39,7 @@ from operator_authority import (
     AuthorityError,
     activate_budget,
     activate_relaunch,
+    restart_grant as host_restart_grant,
     budget_ceiling as authorized_budget_ceiling,
     consume_recovery,
     relaunch_ceiling as authorized_relaunch_ceiling,
@@ -965,12 +967,54 @@ def blockers(state: dict[str, Any], key: str, cfg: dict[str, Any], cycles: dict[
     return sorted(set(reasons))
 
 
+def authorized_restart_grant(repository, ticket, token=""):
+    try:
+        return host_restart_grant(repository, ticket, token)
+    except AuthorityError as exc:
+        raise SprintError(str(exc)) from exc
+
+
+def current_startup_failure(ticket, cfg):
+    """Credit only a fenced stopped launch with explicit rejection and no paid/uncertain work."""
+    identity = ticket.get("worker_identity")
+    if not isinstance(identity, dict) or identity.get("kind") != "execution_unit":
+        return None
+    if execution_unit_status(identity) != "absent":
+        return None
+    try:
+        terminal = read_json(Path(identity.get("tombstone_path", "")), label="startup terminal")
+    except (SprintError, OSError):
+        return None
+    invocation = identity.get("invocation_id")
+    if (not invocation or terminal.get("invocation_id") != invocation
+            or terminal.get("startup_retryable") is not True
+            or terminal.get("stop_reason") != "provider_rate_limited"):
+        return None
+    events = UsageLedger(cfg["shared_root"]).snapshot()
+    reservations = {e.get("reservation_id") for e in events if e.get("kind") == "reservation" and e.get("run_id") == invocation}
+    released = {e.get("reservation_id") for e in events if e.get("kind") == "release"}
+    if not reservations <= released or any(e.get("kind") == "usage" and e.get("run_id") == invocation for e in events):
+        return None
+    return {"invocation_id": invocation, "finished_at": terminal.get("finished_at", "")}
+
+
+def startup_credits(ticket, cfg):
+    receipts = {item["invocation_id"] for item in ticket.get("startup_retry_receipts", [])}
+    current = current_startup_failure(ticket, cfg)
+    if current:
+        receipts.add(current["invocation_id"])
+    return min(2, len(receipts))
+
+
 def attempt_limit_reason(
     ticket: dict[str, Any], cfg: dict[str, Any]
 ) -> str | None:
     """Return a launch blocker when this ticket has used every authorized attempt."""
     attempts = int(ticket.get("attempts") or 0)
-    base_ceiling = cfg["max_lane_relaunches"] + 1
+    restart = authorized_restart_grant(cfg["shared_root"], str(ticket["key"]))
+    base_ceiling = cfg["max_lane_relaunches"] + 1 + startup_credits(ticket, cfg)
+    if restart:
+        base_ceiling = max(base_ceiling, restart["allowances"]["attempts"])
     if attempts < base_ceiling:
         return None
     try:
@@ -1079,9 +1123,11 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                     item["reviewer_run_ids"].add(str(event.get("logical_review_id") or event["run_id"]))
     phase_limits = budgets_from_config(load_yaml(cfg["config"]) if cfg.get("config") else {})
     for ticket, item in result.items():
+        restart = authorized_restart_grant(cfg["shared_root"], ticket)
+        allowances = restart["allowances"] if restart else {}
         item["phase_budgets"] = {}
         for phase, totals in UsageLedger.phase_totals(events, ticket).items():
-            limit = UsageLedger.phase_limits(events, ticket, phase_limits)[phase]
+            limit = max(UsageLedger.phase_limits(events, ticket, phase_limits)[phase], Decimal(allowances.get(phase + "_usd", "0")))
             total = totals["spent_usd"] + totals["reserved_usd"]
             item["phase_budgets"][phase] = {
                 **{name: float(value) for name, value in totals.items()},
@@ -1104,6 +1150,8 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 grant_ceiling = authorized_budget_ceiling(cfg["shared_root"], ticket)
             except AuthorityError as exc:
                 raise SprintError(str(exc)) from exc
+        if restart:
+            grant_ceiling = max(float(grant_ceiling or 0), float(allowances["ticket_usd"]))
         if grant_ceiling is not None:
             pause = max(pause, float(grant_ceiling))
         warning = cfg["warn_usd_per_ticket"]
@@ -1115,8 +1163,8 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                     and grant_ceiling is None
                 )
                 or (pause and total > pause)
-                or item["run_count"] >= cfg["max_model_runs_per_ticket"]
-                or item["reviewer_run_count"] >= cfg["max_reviewer_runs_per_ticket"]
+                or item["run_count"] >= max(cfg["max_model_runs_per_ticket"], allowances.get("model_runs", 0))
+                or item["reviewer_run_count"] >= max(cfg["max_reviewer_runs_per_ticket"], allowances.get("review_runs", 0))
             )
             else "warning"
             if warning and total > warning
@@ -1177,15 +1225,29 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                 previous = current["tickets"].get(key)
                 if previous:
                     # Only Jira-owned, never-started readiness follows Jira.
-                    # Scoping decisions, removed inventory and worker outcomes
-                    # remain durable until their explicit recovery transition.
+                    # A temporary inventory exclusion can clear when the
+                    # authenticated fetch includes the untouched ticket again.
+                    # Worker and scoping decisions still require recovery.
                     previous_initial = initial_state(previous.get("raw_status", ""), cfg)
+                    returned_to_query = (
+                        previous["state"] == "user_action"
+                        and previous.get("reason") == "ticket disappeared from the refreshed Jira sprint query"
+                        and any(event.get("event") == "removed-from-query" for event in previous.get("history", []))
+                        and not any(previous.get(field) for field in (
+                            "attempts", "attempt_token", "attempt_capability",
+                            "run_ref", "branch", "pr", "worker_identity",
+                            "attach_capability", "attached_at", "launch_evidence",
+                            "legacy_recovery_pending", "scope_assessment",
+                            "decomposition_children", "progress", "verified_commits",
+                            "ci_progress", "test_progress",
+                        ))
+                    )
                     refresh_readiness = (
                         not previous.get("attempts")
                         and previous["state"] in {"pending", "blocked", "user_action"}
                         and not previous.get("scope_assessment")
-                        and (previous["state"], previous.get("reason", "")) == previous_initial
-                        and all(event.get("event") == "jira-status-refreshed" for event in previous.get("history", []))
+                        and (returned_to_query or (previous["state"], previous.get("reason", "")) == previous_initial)
+                        and all(event.get("event") in {"jira-status-refreshed", "removed-from-query", "returned-to-query"} for event in previous.get("history", []))
                     )
                     for field in (
                         "state",
@@ -1203,6 +1265,8 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                         "attached_at",
                         "launch_evidence",
                         "scope_assessment",
+                        "restart_grant_id",
+                        "startup_retry_receipts",
                         "decomposition_children",
                         "progress",
                         "verified_commits",
@@ -1213,7 +1277,9 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                             continue
                         if field in previous:
                             fresh[field] = previous[field]
-                    if refresh_readiness and fresh["raw_status"] != previous.get("raw_status"):
+                    if refresh_readiness and returned_to_query:
+                        fresh["history"].append({"at": now(), "event": "returned-to-query", "status": fresh["raw_status"]})
+                    elif refresh_readiness and fresh["raw_status"] != previous.get("raw_status"):
                         fresh["history"].append({"at": now(), "event": "jira-status-refreshed", "status": fresh["raw_status"]})
                 current["tickets"][key] = fresh
             current["project"] = incoming["project"]
@@ -1576,6 +1642,69 @@ def record_progress(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     emit({"ticket": key, "state": ticket["state"], "progress": event})
 
 
+def legacy_reconciliation(state):
+    """Expose mechanical next steps without interpreting old free-text holds as permission."""
+    result = []
+    for key, ticket in sorted(state["tickets"].items()):
+        if ticket["state"] not in {"blocked", "user_action"}:
+            continue
+        reason = ticket.get("reason", "")
+        if reason == "ticket disappeared from the refreshed Jira sprint query":
+            action = "refresh_inventory"
+        elif ticket.get("subtasks"):
+            action = "reconcile_existing_children"
+        elif ticket.get("pr"):
+            action = "inspect_preserved_pr"
+        elif ticket.get("attempts"):
+            action = "classify_preserved_outcome"
+        else:
+            action = "verify_jira_readiness"
+        result.append({"key": key, "state": ticket["state"], "reason": reason,
+                       "next_action": action, "pr": ticket.get("pr"),
+                       "children": ticket.get("subtasks", []), "dependencies": ticket.get("dependencies", [])})
+    return result
+
+
+def reconcile_legacy(args, cfg):
+    """Replace an opaque label without discarding the original decision or execution fence."""
+    path = state_path(cfg["state_dir"], str(args.sprint))
+    key = normalize_key(args.ticket)
+    with locked(path):
+        state = load(path)
+        ticket = state["tickets"].get(key)
+        if not ticket or ticket["state"] not in {"blocked", "user_action"}:
+            raise SprintError("legacy reconciliation requires a blocked or user_action ticket")
+        if args.classification not in {"operator_decision", "external_blocked"}:
+            raise SprintError("legacy classification cannot authorize launches")
+        if not args.reason.strip():
+            raise SprintError("legacy reconciliation requires an evidence-based reason")
+        # Only non-launching classifications are accepted here. Restart/recovery
+        # or authenticated decomposition bindings remain separate transitions.
+        ticket.setdefault("history", []).append({"at": now(), "event": "legacy-classified",
+            "previous_state": ticket["state"], "previous_reason": ticket.get("reason", ""),
+            "state": args.classification, "reason": args.reason})
+        ticket["state"], ticket["reason"] = args.classification, args.reason
+        save(path, state)
+    emit({"ticket": key, "state": ticket["state"]})
+
+
+def progress_spending(ticket, cfg, spent):
+    milestones = [item for item in ticket.get("progress", []) if item.get("verified")]
+    baseline = max((float(item.get("spent_usd", 0)) for item in milestones), default=0.0)
+    grant = authorized_restart_grant(cfg["shared_root"], ticket["key"])
+    if grant and ticket.get("restart_grant_id") == grant["grant_id"]:
+        baseline = max(baseline, float(grant["allowances"]["progress_baseline_usd"]))
+    return max(0.0, float(spent) - baseline)
+
+
+def spending_admission_reason(ticket, cfg, spend):
+    if spend.get("state") == "operator_action":
+        return "ticket spending or execution-count ceiling requires operator action"
+    if progress_spending(ticket, cfg, spend.get("spent_usd", 0)) >= cfg["max_usd_without_progress"]:
+        return "max_usd_without_progress: verified progress or a root-issued restart allowance is required"
+    return None
+
+
 def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     spend = usage_snapshots(cfg)
     cycles = find_cycles(state["tickets"])
@@ -1588,6 +1717,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
             set(
                 blockers(state, ticket["key"], cfg, cycles)
                 + ([reason] if (reason := attempt_limit_reason(ticket, cfg)) else [])
+                + ([reason] if (reason := spending_admission_reason(ticket, cfg, spend.get(ticket["key"], {}))) else [])
             )
         )
         for ticket in ordered
@@ -1624,14 +1754,24 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     ]
     decomposition, repair, recovery = [], [], []
     recovery_waiting = []
+    retry_waiting = []
     decisions = []
     for ticket in ordered:
         key, status = ticket["key"], ticket["state"]
+        failure = current_startup_failure(ticket, cfg) if status == "recoverable" else None
+        if failure:
+            try:
+                retry_at = datetime.fromisoformat(failure["finished_at"].replace("Z", "+00:00")).timestamp() + 30
+            except (ValueError, TypeError):
+                retry_at = 0
+            if time.time() < retry_at and attempt_limit_reason(ticket, cfg) is None:
+                retry_waiting.append({"key": key, "retry_at": retry_at, "reason": "provider startup cooldown"})
+                continue
         if status in {"completed", "decomposed", "running"}:
             continue
         reasons = []
-        if spend.get(key, {}).get("state") == "operator_action":
-            reasons.append("ticket spending or execution-count ceiling requires operator action")
+        if reason := spending_admission_reason(ticket, cfg, spend.get(key, {})):
+            reasons.append(reason)
         if status in {"pending", "recoverable", "needs_repair"}:
             if reason := attempt_limit_reason(ticket, cfg):
                 reasons.append(reason)
@@ -1672,9 +1812,8 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     for key in running:
         ticket = state["tickets"][key]
         progress = [item for item in ticket.get("progress", []) if item.get("verified")]
-        baseline = float(progress[-1].get("spent_usd", 0)) if progress else 0.0
         current = float(spend.get(key, {}).get("spent_usd", 0))
-        delta = max(0.0, current - baseline)
+        delta = progress_spending(ticket, cfg, current)
         if delta >= cfg["max_usd_without_progress"]:
             stalled.append(
                 {
@@ -1695,11 +1834,13 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         "repair": repair,
         "recovery": recovery,
         "recovery_waiting": recovery_waiting,
+        "retry_waiting": retry_waiting,
+        "legacy_reconciliation": legacy_reconciliation(state),
         "decision_queue": decisions,
         "stalled": stalled,
         "waiting": waiting,
         "autonomous_work_remaining": bool(
-            running or launch or scope or decomposition or repair or recovery or recovery_waiting
+            running or launch or scope or decomposition or repair or recovery or recovery_waiting or retry_waiting
         ),
         "over_capacity": max(0, occupied - cfg["concurrency_max"]),
         "spend": spend,
@@ -2359,6 +2500,8 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         limit_reason = attempt_limit_reason(ticket, cfg)
         if limit_reason:
             raise SprintError(f"ticket {key} is blocked: {limit_reason}")
+        if reason := spending_admission_reason(ticket, cfg, usage_snapshots(cfg).get(key, {})):
+            raise SprintError(f"ticket {key} is blocked: {reason}")
         ticket["state"] = "running"
         ticket["reason"] = ""
         ticket["run_ref"] = args.run_ref
@@ -2461,6 +2604,13 @@ def wait_for_runtime_record(
     raise SprintError(f"controller timed out waiting for {label}{detail}")
 
 
+def lane_invocation_matches(ticket, invocation):
+    return bool(invocation) and any(
+        isinstance(value, dict) and value.get("invocation_id") == invocation
+        for value in (ticket.get("launch_evidence"), ticket.get("worker_identity"))
+    )
+
+
 def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
     """Internal shim: establish identity before spawn and retain a tombstone."""
     command = list(args.command)
@@ -2546,11 +2696,9 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
                 elif checkpoint.is_file():
                     snapshot = load(checkpoint)
                     lane = snapshot.get("tickets", {}).get(args.ticket, {})
-                    if (lane.get("launch_evidence") or {}).get("invocation_id") == args.invocation_id:
+                    if lane_invocation_matches(lane, args.invocation_id):
                         spend = usage_snapshots(_cfg).get(args.ticket, {})
-                        milestones = [item for item in lane.get("progress", []) if item.get("verified")]
-                        baseline = float(milestones[-1].get("spent_usd", 0)) if milestones else 0.0
-                        if float(spend.get("spent_usd", 0)) - baseline >= _cfg["max_usd_without_progress"]:
+                        if progress_spending(lane, _cfg, spend.get("spent_usd", 0)) >= _cfg["max_usd_without_progress"]:
                             stop_reason = "max_usd_without_progress"
                 if time.monotonic() - started >= max_seconds:
                     stop_reason = "max_worker_seconds"
@@ -2598,12 +2746,17 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
             gateway.close()
         if args.stdin_file and input_handle is not subprocess.DEVNULL:
             input_handle.close()
+    # A native client can exit before the polling loop observes its gateway.
+    # Read the final reason only after all handlers have settled in close().
+    if not stop_reason and gateway and gateway.stopped.is_set():
+        stop_reason = gateway.reason
     terminal = {
         "invocation_id": args.invocation_id,
         "phase": "terminal",
         "spawned": True,
         "returncode": returncode,
         "stop_reason": stop_reason,
+        "startup_retryable": bool(gateway and gateway.startup_retryable()),
         "finished_at": now(),
         "cooperative_cleanup": {"worker_pgid": child.pid, "gateway_closed": True},
     }
@@ -2616,7 +2769,7 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
         with locked(checkpoint):
             state = load(checkpoint)
             lane = state.get("tickets", {}).get(args.ticket, {})
-            if ((lane.get("launch_evidence") or {}).get("invocation_id") == args.invocation_id
+            if (lane_invocation_matches(lane, args.invocation_id)
                     and lane.get("state") == "running"):
                 # Shared admission pressure can disappear when another lane's
                 # reservation is released. Keep it in automatic recovery; the
@@ -2919,6 +3072,9 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["state"] = "pending"
         ticket["reason"] = args.reason.strip()
         ticket["run_ref"] = ""
+        receipt = current_startup_failure(ticket, cfg)
+        if receipt and receipt not in ticket.get("startup_retry_receipts", []):
+            ticket.setdefault("startup_retry_receipts", []).append(receipt)
         # Preserve the resumable work identity across execution attempts.
         ticket["attempt_token"] = ""
         ticket["attempt_capability"] = {}
@@ -2931,6 +3087,61 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         )
         save(path, state)
     emit({"ticket": key, "state": "pending"})
+
+
+def restart_ticket(args, cfg):
+    """Activate an operator allowance without deleting work or counters."""
+    path = state_path(cfg["state_dir"], str(args.sprint))
+    key = normalize_key(args.ticket)
+    with locked(path):
+        state = load(path)
+        ticket = state["tickets"].get(key)
+        if not ticket or ticket["state"] in {"running", "completed", "decomposed"}:
+            raise SprintError("restart requires an existing stopped, incomplete ticket")
+        identity = ticket.get("worker_identity")
+        if identity and not automatic_recovery_available(ticket, cfg):
+            raise SprintError("restart requires verified stopped execution evidence; recover legacy identity first")
+        if not identity and ticket.get("attempts"):
+            events = [item.get("event") for item in ticket.get("history", [])]
+            recoveries = [i for i, event in enumerate(events) if event in {"requeued", "terminal-recovered", "legacy-recovered"}]
+            launches = [i for i, event in enumerate(events) if event in {"reserved", "worker-launched"}]
+            if not recoveries or max(recoveries) <= max(launches, default=-1):
+                raise SprintError("restart requires recovery of the previous unverified attempt")
+        usage = usage_snapshots(cfg).get(key, {})
+        if usage.get("reserved_usd", 0):
+            raise SprintError("restart requires reconciliation of outstanding provider reservations")
+        try:
+            token = operator_capability(args)
+            grant = authorized_restart_grant(cfg["shared_root"], key, token) if token else authorized_restart_grant(cfg["shared_root"], key)
+        except AuthorityError as exc:
+            raise SprintError(str(exc)) from exc
+        if not grant:
+            raise SprintError("restart requires an active root-issued allowance")
+        if ticket.get("restart_grant_id") == grant["grant_id"]:
+            emit({"ticket": key, "already_applied": True, "state": ticket["state"]})
+            return
+        if float(grant["allowances"]["progress_baseline_usd"]) > float(usage.get("spent_usd", 0)):
+            raise SprintError("restart baseline exceeds recorded spending")
+        old_state, old_reason = ticket["state"], ticket.get("reason", "")
+        ticket["state"], ticket["reason"] = initial_state(ticket.get("raw_status", ""), cfg)
+        if ticket["state"] == "pending" and ticket.get("scope_assessment", {}).get("verdict") == "decompose":
+            ticket["state"] = "needs_decomposition"
+        legacy_classification = next((item for item in reversed(ticket.get("history", []))
+            if item.get("event") == "legacy-classified"), {})
+        if (old_state == "operator_decision"
+                and legacy_classification.get("state") == "operator_decision"):
+            ticket["state"], ticket["reason"] = old_state, old_reason
+        elif ticket.get("scope_assessment", {}).get("verdict") == "operator_decision":
+            ticket["state"] = "operator_decision"
+            ticket["reason"] = "restart allowance does not resolve the preserved product/scoping decision"
+        if ticket["state"] == "pending" and ticket.get("pr"):
+            ticket["state"] = "needs_repair"
+        ticket["restart_grant_id"] = grant["grant_id"]
+        ticket.setdefault("history", []).append({"at": now(), "event": "operator-restart", "grant_id": grant["grant_id"],
+            "previous_state": old_state, "previous_reason": old_reason, "reason": grant["reason"], "allowances": grant["allowances"]})
+        # Execution fences, prior work, scope decisions and findings remain intact.
+        save(path, state)
+    emit({"ticket": key, "state": ticket["state"], "grant_id": grant["grant_id"]})
 
 
 def grant_budget(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
@@ -3316,8 +3527,12 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
                     item["reason"] = "ready but not launched"
                 result["user_action"].append(item)
     plan = plan_value(state, cfg)
-    result["finished"] = not plan["autonomous_work_remaining"]
+    result["finished"] = not plan["autonomous_work_remaining"]  # compatibility: controller drained
+    result["autonomous_work_exhausted"] = result["finished"]
+    result["sprint_complete"] = bool(state["tickets"]) and all(dependency_complete(state, key, cfg) for key in state["tickets"])
     result["decision_queue"] = plan["decision_queue"]
+    result["legacy_reconciliation"] = plan["legacy_reconciliation"]
+    result["retry_waiting"] = plan["retry_waiting"]
     result["spend"] = spend
     from sprint_metrics import summarize
     result["outcome_metrics"] = summarize(state, spend)
@@ -3490,6 +3705,18 @@ def parser() -> argparse.ArgumentParser:
         "--worker-stopped", action="store_true", help=argparse.SUPPRESS
     )
     requeue_parser.set_defaults(func=requeue)
+    legacy_parser = commands.add_parser("reconcile-legacy", help="classify an opaque legacy hold without launching work")
+    legacy_parser.add_argument("--sprint", required=True)
+    legacy_parser.add_argument("--ticket", required=True)
+    legacy_parser.add_argument("--classification", choices=("operator_decision", "external_blocked"), required=True)
+    legacy_parser.add_argument("--reason", required=True)
+    legacy_parser.set_defaults(func=reconcile_legacy)
+    restart_parser = commands.add_parser("restart-ticket", help="apply a bounded root-issued restart allowance")
+    restart_parser.add_argument("--sprint", required=True)
+    restart_parser.add_argument("--ticket", required=True)
+    restart_parser.add_argument("--operator-capability", default="")
+    restart_parser.add_argument("--operator-capability-stdin", action="store_true")
+    restart_parser.set_defaults(func=restart_ticket)
     budget_parser = commands.add_parser("grant-budget")
     budget_parser.add_argument("--sprint", required=True)
     budget_parser.add_argument("--ticket", required=True)
