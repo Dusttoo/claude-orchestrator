@@ -86,6 +86,9 @@ class ApprovedOriginRedirectHandler(HTTPRedirectHandler):
         return redirected
 
 
+from ticket_dependencies import declared_dependencies
+
+
 def required_fields(
     sprint_field: str, configured: list[str] | None = None
 ) -> list[str]:
@@ -496,7 +499,7 @@ def build_inventory(
         combined["key"] = key
         issue_by_key[key] = combined
     dependencies = {
-        key: dependency_keys(issue, dependency_links)
+        key: sorted(set(dependency_keys(issue, dependency_links)) | set(declared_dependencies(jira_text((issue.get("fields") or {}).get("description")))))
         for key, issue in issue_by_key.items()
     }
     external = sorted(
@@ -668,12 +671,7 @@ def run_adapter(
             "ticket.project and sprint_id are required canonical Jira policy"
         )
     sprint_field = scalar_config(config, "jira_sprint_field", "sprint")
-    decomposition_enabled = scalar_config(
-        config, "auto_decompose_large_tickets", "false"
-    ).casefold() in {"true", "yes", "1", "on"}
-    fields = required_fields(
-        sprint_field, ["description"] if decomposition_enabled else None
-    )
+    fields = required_fields(sprint_field, ["description"])
     links = dependency_links_from_config(config)
     priority_order = list_config(config, "jira_priority_order", DEFAULT_PRIORITY_ORDER)
     raw_dir = Path(args.artifact).resolve().parent / "jira-raw"

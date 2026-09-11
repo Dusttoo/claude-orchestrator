@@ -56,12 +56,17 @@ llm:
 ''')
         with patch.object(controller, 'project_root', return_value=self.root):
             self.cfg = controller.settings(argparse.Namespace(config=str(config), state_dir=None))
+        from provider_health import ProviderHealth, route_identity
+        from context_pipeline import llm_route_from_config
+        route=llm_route_from_config(config, 'sprint-worker')
+        health=ProviderHealth(self.root); probe_token=health.claim_probe(route['provider'])
+        health.complete_probe(route['provider'],probe_token,'healthy',route_identity(route))
         self.path = controller.state_path(self.cfg['state_dir'], '1')
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.state = dict(schema_version=2, sprint=dict(id='1'), dependency_status={}, tickets={})
         for key, dependencies in [('PROJ-1', []), ('PROJ-2', ['PROJ-1']), ('PROJ-3', [])]:
             self.state['tickets'][key] = dict(key=key, state='pending', attempts=0, dependencies=dependencies,
-                summary=key, reason='', branch='', pr='', run_ref='', history=[], progress=[])
+                scope_assessment={"verdict":"ready"}, summary=key, reason='', branch='', pr='', run_ref='', history=[], progress=[])
         controller.save(self.path, self.state)
 
     def git(self, *args):
@@ -92,7 +97,7 @@ llm:
 
     def test_sprint_continues_through_design_invalid_review_repair_ci_and_dependency(self):
         scope = self.root / 'scope.json'
-        scope.write_text(json.dumps(dict(schema_version=1,ticket='PROJ-1',verdict='ready',
+        scope.write_text(json.dumps(dict(schema_version=1,ticket='PROJ-1',verdict='ready',prerequisites=[],
             complexity_score=10,reasons=['bounded fixture'],slices=[])))
         with contextlib.redirect_stdout(io.StringIO()):
             controller.record_scope(argparse.Namespace(sprint='1',ticket='PROJ-1',assessment=str(scope)), self.cfg)

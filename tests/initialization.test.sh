@@ -100,8 +100,16 @@ check "plugin conformance runner owns worktree-cleanup suite" \
   rg -q 'worktree\.test\.sh' "$ROOT/scripts/run-plugin-conformance.sh"
 check "plugin conformance runner owns host-parity suite" \
   rg -q 'plugin-parity\.test\.sh' "$ROOT/scripts/run-plugin-conformance.sh"
-check "captain preflight accepts this exact plugin and configured repo" \
-  python3 "$ROOT/scripts/captain-preflight.py" --plugin-root "$ROOT" --repo "$PREFLIGHT_REPO" --host codex
+check_runtime_unverified() {
+  python3 "$ROOT/scripts/captain-preflight.py" --plugin-root "$ROOT" --repo "$PREFLIGHT_REPO" --host codex > "$PREFLIGHT_REPO/preflight.json"
+  local result=$?
+  python3 - "$PREFLIGHT_REPO/preflight.json" "$result" <<'CHECK'
+import json,sys
+v=json.load(open(sys.argv[1]))
+assert sys.argv[2]=='2' and v['installation_status']=='ready' and not v['execution_ready']
+CHECK
+}
+check "captain separates installed plugin from unverified provider readiness" check_runtime_unverified
 check "captain preflight fails when the active plugin is incomplete" \
   sh -c '! python3 "$1/scripts/captain-preflight.py" --plugin-root "$2" --repo "$3" --host claude' sh "$ROOT" "$INCOMPLETE_PLUGIN" "$PREFLIGHT_REPO"
 

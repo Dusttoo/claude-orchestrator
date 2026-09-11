@@ -327,10 +327,11 @@ provider-routing overrides are rejected. Supply a configured model explicitly.
 
 The Codex adapter supports stateless standard-tier Responses with local function
 and custom tools, namespaces, and client-executed tool search. It rejects hosted
-paid tools, compaction, stateful continuation, background responses, premium
-tiers, and unpriced models. Model discovery is not provided. Offline integration
-with Codex CLI 0.147.0 covers the inherited launcher and a local-tool round trip;
-live provider compatibility remains unverified. Launch separate metered API
+paid tools, remote compaction endpoints, stateful continuation, background responses,
+premium tiers, and unpriced models. Local compaction uses ordinary metered
+Responses requests. Model discovery is not provided. Installed-client checks
+exercise a local-tool round trip and forced local compaction; authenticated
+readiness probes verify the connection without claiming a live generation test. Launch separate metered API
 reviewers from the credential-owning controller, not from this worker's temporary
 credential environment. Native children share the implementation phase allowance.
 
@@ -593,3 +594,60 @@ are still enforced on every paid request.
 Summary `finished` retains its old controller-drained meaning for compatibility.
 Use `autonomous_work_exhausted` for that condition and `sprint_complete` for actual
 completion of all checkpointed tickets (including verified child bindings).
+
+## Provider-aware admission (1.3.0)
+
+The production controller requires a recently verified resolved worker route
+before `reserve` and batch preparation, and binds that route into the reservation. `launch-local`
+rechecks health and rejects a different provider, model, profile, or route.
+Batch submission also rechecks the prepared provider/model route.
+A local settings mistake therefore does not create an execution unit. Old
+reservation-only records without a route require reconciliation; they are not
+silently upgraded into launch authority.
+
+Run `captain-preflight.py --plugin-root <installation> --repo <repository>
+--host codex|claude --verify-runtime`. `installation_status: ready` only proves
+files/config exist. `execution_ready: true` requires bounded installed-client
+checks and authenticated token-count probes for the resolved ticket roles.
+Probe credentials use the same environment precedence as the runtime; an invalid
+process-environment key will still override a corrected repository `.env`.
+Never print credential values. No credential is changed by these commands.
+
+`health-check --role sprint-worker` probes the configured route without a ticket
+reservation. Native OpenAI/Anthropic clients first run against a loopback mock;
+Codex must execute a tool, compact, and finish with every request metered. Then
+an authenticated token-count request checks the provider/model connection.
+Other provider adapters report unsupported probe capability rather than claiming
+unverified readiness. No real model generation occurs in these health checks.
+
+Provider state is shared across worktrees in `.orchestration/.provider-health`.
+A 401/403 is a persistent authentication hold. A 429/529 immediately blocks new
+admissions to that provider across tickets; independent healthy providers remain
+available. Existing API requests may finish their already-bounded retry sequence
+with the same idempotency key, but cannot clear the shared hold on success.
+Native startup credits do not authorize an unhealthy provider.
+
+`plan.health_probes` includes deadlines. Only one probe per provider can run at a
+time; leases expire after 60 seconds and results cannot overwrite a newer
+incident. Transient incidents allow at most three failed automatic probes.
+Authentication/client holds need actual repair and an explicit
+`health-check --role <role> --after-repair`. Successful probes expire after five
+minutes. `plan.provider_holds` keeps these issues distinct from ticket decisions.
+
+Admission scoping is mandatory even when automatic decomposition is disabled.
+The authenticated inventory now includes sanitized descriptions and extracts
+explicit `Prerequisites:`, `Dependencies:`, `Depends on:`, and `Blocked by:`
+sections, including following bullet lists. Unrelated ticket references do not
+create edges. External prerequisite statuses are fetched through the existing
+Jira adapter. Arbitrary prose still requires the bounded scoper to enumerate
+`prerequisites`; a `ready` assessment missing scheduler relationships becomes a
+dependency-reconciliation decision. An authenticated sync that supplies those
+missing edges automatically returns this specific decision to scoping; unrelated
+operator decisions remain fenced. Configuration does not authorize automatic
+Jira link edits. Do not guess direction or delete existing dependency edges.
+
+A `tracking_parent` scope result with `children` exactly matching authenticated
+subtasks binds the existing chain as `decomposed`, without implementation attempts
+or new Jira children. Use this only when children own all parent acceptance
+criteria. Changed description, summary, dependencies, or subtasks invalidate a
+pending scope assessment on the next sync.
