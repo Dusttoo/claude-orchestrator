@@ -138,12 +138,42 @@ places an oversized ticket in `plan.decomposition`, or records a genuine
 `complexity_threshold` is rejected. The idempotent Jira decomposition adapter creates a bounded
 set of linked subtasks with deterministic labels; after authoritative Jira sync,
 `record-decomposition` binds the exact child inventory and leaves the parent as
-a tracking record.
+a tracking record. Children inherit that parent's prerequisites and wait until
+the decomposition binding is recorded. A downstream dependency on the parent
+is satisfied only when its exact bound child set and prerequisites complete;
+missing or changed children keep it blocked. The parent remains `decomposed`,
+and summary reports its derived `dependency_complete` value rather than inventing
+a parent PR or marking unimplemented work merged.
+
+The Jira adapter transitions untouched children in Jira's new status category
+to a configured ready status, in configured preference order. It requires an
+available transition without missing required fields and verifies the resulting
+status. Active, blocked, and completed work is preserved. Per-child
+`readiness_blockers` do not discard successful creation/linking results; sync and
+record the returned children, then continue independent work around those blockers.
+Untouched Jira-owned readiness follows subsequent authoritative syncs in both
+directions. Scoping decisions and started worker outcomes remain durable.
+
+Transition and issue-link response handling follow the
+[Jira transition API](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-transitions-post)
+and [issue linking model](https://developer.atlassian.com/cloud/jira/platform/issue-linking-model/).
 
 Recoverable execution, review repair, and decomposition are autonomous queues,
 not generic user-action stops. `autonomous_work_remaining` remains true while
 any of those queues, a live lane, or a launchable ticket exists. External
-blockers remain visible without stopping independent lanes.
+blockers remain visible without stopping independent lanes. `plan.repair` and
+`plan.recovery` include only tickets with remaining admission capacity and a
+mechanically stopped execution unit. `plan.recovery_waiting` units still occupy
+lanes until exit. Ineligible work appears in `decision_queue` (also included in
+`summary`); it does not by itself keep `autonomous_work_remaining` true. Requeue
+preserves branch/PR identity for continuation on the existing work.
+
+Temporary sprint reservation pressure is recomputed at each API admission; it
+does not latch a permanent pause on the requesting ticket. An actually exhausted
+sprint allowance still blocks paid requests. Ticket-local dollar pauses retain
+their authority requirements. Completely released nonexecuted requests free
+reviewer capacity, but the total execution-attempt cap still bounds repeated
+operational failures. Accepted and unresolved reviewer runs continue to count.
 
 Workers record durable milestones through attempt-fenced `record-progress`.
 `plan.stalled`
@@ -258,3 +288,214 @@ creates a fresh fenced attempt.
 `concurrency_max` is a ticket-lane limit. The host separately admits local
 builds, full test suites, and browser runs under `max_heavy_processes`; model
 lanes waiting on providers do not justify oversubscribing those local commands.
+
+### Native worker spending and supervision
+
+A direct `launch-local -- .../claude ...` launch now runs through a controller-owned
+loopback Messages gateway. It requires `ANTHROPIC_API_KEY` in the controller's
+environment or the configuration directory's `.env`, and explicit pricing for
+**every requested model**, including nested workers and fallback models. The
+child receives a temporary gateway credential; nested Claude processes inherit
+that endpoint. Each message reserves counted input plus capped output against
+the same run, ticket, and sprint ledger used by API workers. Ambiguous submissions
+retain their reservations. Responses are buffered until usage has been settled,
+then returned as JSON or Messages SSE.
+
+For direct Claude launches, the supervisor merges inline or file-based
+`--settings` with controller-owned routing environment values. These final values
+override user/project endpoints, credentials, and alternate-provider selectors;
+unrelated settings and configured setting sources remain enabled. Invalid JSON
+settings are rejected before launch. Optional cache usage counters must be
+nonnegative integers before settlement; malformed responses retain their request
+reservation without writing invalid usage to the shared ledger.
+
+The gateway supports standard Anthropic Messages and custom client tools.
+Provider-hosted paid tools, premium tiers, and models without configured pricing
+are rejected. Configure cache-write rates to cover the cache lifetimes in use.
+This adapter has offline contract coverage; a live Claude compatibility smoke test
+is still required before production rollout.
+
+A direct `launch-local -- .../codex exec ...` launch uses a controller-owned
+Responses gateway with `OPENAI_API_KEY` and explicit model pricing. Each request
+counts input and reserves capped output against the shared budgets before
+submission; terminal usage is settled before the buffered response is returned
+as Responses SSE. Missing usage or uncertain submissions retain reservations.
+The worker receives a temporary credential and per-command provider settings;
+no persistent Codex configuration is changed. A PATH launcher keeps ordinary
+nested `codex exec` calls on the same gateway and ticket allowance. Caller
+provider-routing overrides are rejected. Supply a configured model explicitly.
+
+The Codex adapter supports stateless standard-tier Responses with local function
+and custom tools, namespaces, and client-executed tool search. It rejects hosted
+paid tools, compaction, stateful continuation, background responses, premium
+tiers, and unpriced models. Model discovery is not provided. Offline integration
+with Codex CLI 0.147.0 covers the inherited launcher and a local-tool round trip;
+live provider compatibility remains unverified. Launch separate metered API
+reviewers from the credential-owning controller, not from this worker's temporary
+credential environment. Native children share the implementation phase allowance.
+
+Neither adapter meters subscription sessions, shell-wrapped initial launches,
+absolute nested commands that bypass the launcher/configuration, or arbitrary
+programs using another endpoint. These gateways enforce spending for cooperative
+clients; they are not an OS sandbox. Use the API runner for unsupported workflows.
+
+Every local supervisor applies `max_worker_seconds` (default 1800, maximum 3600)
+and checks settled spending since verified progress against
+`max_usd_without_progress`. It sends TERM, then KILL to the worker's process group
+when a guard trips, preserves its terminal record, and moves only the matching
+running attempt to recovery or the decision queue. A supervisor exception also
+cleans up its process group. Existing containment requirements for automatic
+requeue still apply.
+
+`record-progress --milestone implementation_commit --evidence <full-sha>` verifies that
+the commit descends from launch HEAD and changes its tree. Replaying a milestone
+and evidence pair is idempotent. `design_passed` accepts the canonical review ledger file and requires a consumed
+PASS receipt bound to this ticket. Only verified events reset the spending baseline;
+other milestone reports remain informational until their receipt validators are
+implemented. No progress event grants a review or merge approval.
+
+
+`record-progress --milestone review_finding_closed --evidence
+'{"ledger":".orchestration/.review-ledger/<ledger>.json","finding":"<stable-id>"}'`
+verifies a finalized independent repair review for this ticket. Every gate claim
+on the finding must be resolved, and no repair review may still be pending. A
+self-reported repair or one gate's approval cannot reset the watchdog while
+another gate still has an open claim. Closing the same finding again does not
+create a second progress credit. Failing-test reports remain informational until
+a controller-executed test receipt is available.
+
+
+### Verified PR and CI progress
+
+Record a verified implementation commit before reporting its PR:
+
+```sh
+python3 /absolute/plugin/scripts/sprint-controller.py record-progress \
+  --sprint 65 --ticket PROJ-123 --attempt-token "$ATTEMPT_TOKEN" \
+  --milestone implementation_commit --evidence "$HEAD_SHA"
+python3 /absolute/plugin/scripts/sprint-controller.py record-progress \
+  --sprint 65 --ticket PROJ-123 --attempt-token "$ATTEMPT_TOKEN" \
+  --milestone pr_opened --evidence 123
+python3 /absolute/plugin/scripts/sprint-controller.py record-progress \
+  --sprint 65 --ticket PROJ-123 --attempt-token "$ATTEMPT_TOKEN" \
+  --milestone ci_advanced --evidence 123
+```
+
+PR and CI evidence accepts a positive PR number or its canonical HTTPS URL.
+The controller uses authenticated, read-only `gh api` requests against the
+repository's `origin`. GitHub resolves renamed repositories; the immutable
+repository ID binds the PR. Its head must match a verified implementation commit
+for this ticket. The first PR receipt also records the branch and canonical PR
+URL for recovery. Existing bindings cannot silently switch to another PR or branch.
+
+CI observations exhaust both check-run and commit-status pagination for that
+exact head, then recheck the PR head. Waiting alone earns no credit. A check can
+advance through running, terminal, and successful states; each forward step earns
+at most one credit for the code tree and check identity. A terminal failure counts
+as an observed CI transition, not a passing gate. Repeated failures, backwards
+transitions, reordered responses, and reruns with new execution IDs do not reset
+the spending baseline. Commit-message-only amendments preserve the same tree's
+CI progress while retaining the newly verified commit SHA for PR binding.
+
+Lookups run outside the sprint checkpoint lock. Before writing a receipt, the
+controller rechecks the ticket and attempt; a concurrent change invalidates the
+observation. API errors, incomplete evidence, or a changing PR grant no credit.
+These receipts never grant review approval or bypass exact-head merge checks.
+
+Provider contracts: [GitHub pull requests](https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request),
+[check runs](https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference),
+and [commit statuses](https://docs.github.com/en/rest/commits/statuses#list-commit-statuses-for-a-reference).
+
+### Controller-executed test progress
+
+Configure named test commands in the shared orchestration configuration:
+
+```yaml
+progress_tests:
+  unit:
+    command: ["python3", "scripts/run-unit-junit.py"]
+    timeout_seconds: 120
+```
+
+The command must write fresh JUnit XML to the absolute path in
+`ORKA_TEST_REPORT`. The example script name is a repository-owned runner, not a
+bundled script. Commands are argument arrays and run without an implicit shell.
+Each run uses a temporary detached Git worktree at the requested full commit,
+which must descend from the ticket's launch baseline. Dependencies must already
+be available to the command; this runner does not install them. Uncommitted edits
+in the agent's worktree are excluded. The timeout defaults to 120 seconds and may
+be configured from 1 through 600 seconds. Descendant processes are killed when
+the command exits or times out, and the temporary worktree is removed.
+
+Invoke `record-progress` with the current attempt token, milestone `failing_test`
+or `tests_repaired`, and evidence such as:
+
+```json
+{"check":"unit","commit":"<full-commit-sha>"}
+```
+
+The controller runs the configured command itself. An exit code of 1 must match
+explicit JUnit failures; an exit code of 0 must have none. Empty reports, duplicate
+class/name identities, runner errors, missing reports, tracked-file mutations,
+and timeouts grant no progress. Reports are limited to 8 MiB. Each class/name
+identity can advance once from unobserved to failed, then once to repaired on a
+later descendant commit with a different tree. Deleted or skipped tests cannot
+claim repair. Repeating runs, reopening a repaired failure, and amending only a
+commit message do not reset the watchdog. The receipt retains the command
+identity, commit/tree, report hash, case outcomes, and credited transitions.
+Temporary report and console files are discarded after observation.
+
+Test execution holds no sprint lock. The controller rechecks ticket state and
+attempt identity before accepting the result. These receipts establish observed
+test progress for configured, cooperative repository runners; they do not prove
+that a test is well designed or that its assertions were preserved. They grant
+no design, review, CI, or merge approval. The runner is not an OS sandbox and
+inherits the controller environment; configure local test commands accordingly.
+
+### Cooperative recovery and unused design capacity
+
+`cooperative_auto_recovery: true` opts a repository into automatic requeue of
+cooperative workers on macOS or Linux without a systemd scope. The setting must
+have been enabled at launch and remain enabled at recovery. The controller
+requires the matching normal supervisor terminal receipt, completed gateway
+shutdown, an absent supervisor, and an absent worker process group. Missing or
+ambiguous cleanup, supervisor crashes, live descendants, and legacy identities
+still require external recovery authority. This contract assumes workers do not
+daemonize or escape their session; it does not weaken isolated-worker checks.
+The starter configuration leaves this explicit cooperation contract disabled.
+Branch and PR identities survive requeue.
+
+A verified `design_passed` receipt now transfers unused design allowance to
+implementation atomically. Open design reservations defer the transfer; replay
+the same verified receipt after reconciliation to retry. A ticket transfers once,
+and cannot spend the transferred allowance on further design. Code/security
+allowances, the total phase allocation, and run/ticket/sprint ceilings remain
+unchanged. Later configuration reductions cannot create extra capacity. A design
+change after approval must be rescoped rather than repeatedly borrowing budget.
+Phase summaries show the effective transferred limits.
+
+### Outcome reporting
+
+`summary` includes `outcome_metrics`: attempted tickets, reported completion rate,
+settled spend per reported completion, recorded state durations, and entries into
+operator-decision states. These are checkpoint observations, not GitHub merge
+proof or a count of UI notifications. Missing history remains unknown.
+
+`report-outcomes --sprint <id> --verify-merges` additionally queries GitHub for
+completed tickets, verifies repository/PR/branch identity and merged status,
+and reports confirmed merge receipts and spend per unique merged PR. Multiple
+tickets sharing a PR do not duplicate the merge denominator. Lookup errors are
+reported separately. Without `--verify-merges`, merge metrics remain unknown.
+The command also lists repeated findings from matching canonical review ledgers.
+Use these metrics to compare sprint outcomes before raising limits.
+
+Decomposition slices now require `migration_owner` (a slice ID or `none`) and a
+nonempty `test_plan`; both are included in generated Jira descriptions. Older
+assessments without these fields must be rescoped before creating children.
+
+Installed native CLI compatibility has now also been exercised offline with
+Claude Code 2.0.30 (including its auxiliary Haiku request) and Codex 0.147.0.
+These tests use local mock providers and temporary credentials; they do not
+establish live billing accuracy. Native Claude children discard inherited OAuth
+and alternate-provider selectors. Manual thinking budgets are capped below the
+output envelope. Configure prices for auxiliary models as well as the main model.

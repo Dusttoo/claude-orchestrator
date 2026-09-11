@@ -535,7 +535,7 @@ json_check "opted-in tickets enter autonomous scope before launch" "$TMP/scope-p
 "$CONTROLLER" scope-context --sprint 50 --ticket PROJ-72 > "$TMP/scope-context.json"
 json_check "scope context exposes only the requested sanitized Jira body" "$TMP/scope-context.json" 'data["ticket"] == "PROJ-72" and data["description"] == "two independently releasable boundaries"'
 cat > "$TMP/repo/.orchestration/proj-72-scope.json" <<'JSON'
-{"schema_version":1,"ticket":"PROJ-72","verdict":"decompose","complexity_score":88,"reasons":["crosses two independently releasable boundaries"],"slices":[{"id":"foundation","summary":"Foundation","behavior":"add the independent foundation","acceptance_criteria":["foundation test passes"],"depends_on":[]},{"id":"cutover","summary":"Cutover","behavior":"activate the new foundation","acceptance_criteria":["cutover test passes"],"depends_on":["foundation"]}]}
+{"schema_version":1,"ticket":"PROJ-72","verdict":"decompose","complexity_score":88,"reasons":["crosses two independently releasable boundaries"],"slices":[{"id":"foundation","summary":"Foundation","behavior":"add the independent foundation","acceptance_criteria":["foundation test passes"],"migration_owner":"none","test_plan":["foundation regression"],"depends_on":[]},{"id":"cutover","summary":"Cutover","behavior":"activate the new foundation","acceptance_criteria":["cutover test passes"],"migration_owner":"none","test_plan":["cutover regression"],"depends_on":["foundation"]}]}
 JSON
 run_ok "structured scope result enters decomposition queue" "$CONTROLLER" record-scope --sprint 50 --ticket PROJ-72 --assessment .orchestration/proj-72-scope.json
 "$CONTROLLER" plan --sprint 50 > "$TMP/decomposition-plan.json"

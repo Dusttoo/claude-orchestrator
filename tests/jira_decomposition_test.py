@@ -1,5 +1,10 @@
 import sys
+import contextlib
+import io
+import json
+import tempfile
 import unittest
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +37,8 @@ class JiraDecompositionTests(unittest.TestCase):
                     "id": "foundation",
                     "summary": "Foundation",
                     "behavior": "create the additive foundation",
+                    "migration_owner": "foundation",
+                    "test_plan": ["run the slice regression test"],
                     "acceptance_criteria": ["foundation is independently testable"],
                     "depends_on": [],
                 },
@@ -39,11 +46,20 @@ class JiraDecompositionTests(unittest.TestCase):
                     "id": "cutover",
                     "summary": "Cutover",
                     "behavior": "activate the foundation",
+                    "migration_owner": "foundation",
+                    "test_plan": ["run the slice regression test"],
                     "acceptance_criteria": ["cutover preserves compatibility"],
                     "depends_on": ["foundation"],
                 },
             ],
         }
+
+    def test_delivery_fields_are_required_and_owner_must_exist(self):
+        for field in ("migration_owner", "test_plan"):
+            value = self.assessment()
+            del value["slices"][0][field]
+            with self.assertRaises(decomposition.DecompositionError):
+                decomposition.validated_input(self.config(), value)
 
     def test_accepts_bounded_acyclic_slices(self):
         project, parent, slices, feature = decomposition.validated_input(
@@ -101,6 +117,99 @@ class JiraDecompositionTests(unittest.TestCase):
             )
         )
         self.assertEqual(calls[0][0:2], ("POST", "rest/api/3/issueLink"))
+
+    def test_dependency_lookup_accepts_jira_counterpart_only_records(self):
+        jira = object.__new__(decomposition.Jira)
+        jira.issue_links = lambda _key: [{"type": {"name": "Blocks"}, "outwardIssue": {"key": "PROJ-2"}}]
+        jira.request = Mock()
+        self.assertFalse(jira.ensure_dependency(blocked="PROJ-1", prerequisite="PROJ-2", link_type="Blocks", blocked_side="inward"))
+        jira.request.assert_not_called()
+
+    @staticmethod
+    def status(name, category="new"):
+        return {"fields": {"status": {"name": name, "statusCategory": {"key": category}}}}
+
+    def ready_jira(self, *responses):
+        jira = object.__new__(decomposition.Jira)
+        jira.request = Mock(side_effect=responses)
+        return jira
+
+    def test_child_transitions_from_backlog_to_configured_ready_status(self):
+        jira = self.ready_jira(
+            self.status("Backlog"),
+            {"transitions": [{"id": "21", "to": {"name": "Ready"}, "fields": {}}]},
+            {}, self.status("Ready"),
+        )
+        result = jira.ensure_ready("PROJ-2", self.config())
+        self.assertTrue(result["transitioned"])
+        self.assertEqual(jira.request.call_args_list[2].args, ("POST", "rest/api/3/issue/PROJ-2/transitions", {"transition": {"id": "21"}}))
+
+    def test_readiness_retry_never_reopens_done_or_moves_active_work(self):
+        for name, category in (("Ready", "new"), ("Done", "done"), ("In Progress", "indeterminate"), ("Blocked", "new")):
+            with self.subTest(name=name):
+                jira = self.ready_jira(self.status(name, category))
+                if name in {"Ready", "Done"}:
+                    self.assertFalse(jira.ensure_ready("PROJ-2", self.config())["transitioned"])
+                else:
+                    with self.assertRaisesRegex(decomposition.DecompositionError, "preserving"):
+                        jira.ensure_ready("PROJ-2", self.config())
+                self.assertEqual(jira.request.call_count, 1)
+
+    def test_transition_timeout_reconciles_status_without_duplicate_post(self):
+        jira = self.ready_jira(
+            self.status("Backlog"), {"transitions": [{"id": "21", "to": {"name": "Ready"}}]},
+            decomposition.DecompositionError("timeout"), self.status("Ready"), self.status("Ready"),
+        )
+        self.assertTrue(jira.ensure_ready("PROJ-2", self.config())["transitioned"])
+        self.assertEqual(sum(call.args[0] == "POST" for call in jira.request.call_args_list), 1)
+
+    def test_ready_transition_does_not_invent_required_fields(self):
+        jira = self.ready_jira(self.status("Backlog"), {"transitions": [{
+            "id": "21", "to": {"name": "Ready"}, "fields": {"customfield_1": {"required": True, "hasDefaultValue": False}},
+        }]})
+        with self.assertRaisesRegex(decomposition.DecompositionError, "missing required fields"):
+            jira.ensure_ready("PROJ-2", self.config())
+        self.assertEqual(jira.request.call_count, 2)
+
+    def test_successful_post_requires_observed_ready_status(self):
+        jira = self.ready_jira(
+            self.status("Backlog"), {"transitions": [{"id": "21", "to": {"name": "Ready"}}]},
+            {}, self.status("Backlog"),
+        )
+        with self.assertRaisesRegex(decomposition.DecompositionError, "did not reach"):
+            jira.ensure_ready("PROJ-2", self.config())
+
+    def test_transition_selection_obeys_configured_status_order(self):
+        config = self.config()
+        config["sprint_ready_statuses"] = ["Selected", "Ready"]
+        jira = self.ready_jira(self.status("Backlog"), {"transitions": [
+            {"id": "21", "to": {"name": "Ready"}}, {"id": "31", "to": {"name": "Selected"}},
+        ]}, {}, self.status("Selected"))
+        jira.ensure_ready("PROJ-2", config)
+        self.assertEqual(jira.request.call_args_list[2].args[2]["transition"]["id"], "31")
+
+    def test_one_readiness_blocker_preserves_created_children_and_other_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assessment = root / "assessment.json"
+            assessment.write_text(json.dumps(self.assessment()))
+            output = root / "output.json"
+            jira = Mock()
+            jira.find_child.return_value = None
+            jira.create_child.side_effect = ["PROJ-2", "PROJ-3"]
+            jira.ensure_dependency.return_value = True
+            jira.ensure_ready.side_effect = [
+                decomposition.DecompositionError("required field needs operator decision"),
+                {"key": "PROJ-3", "status": "Ready", "transitioned": True},
+            ]
+            with patch.object(sys, "argv", ["decompose", "--config", str(root / "config.yaml"), "--assessment", str(assessment), "--output", str(output), "--apply"]), \
+                 patch.object(decomposition, "load_yaml", return_value=self.config()), \
+                 patch.object(decomposition, "Jira", return_value=jira), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(decomposition.main(), 0)
+            result = json.loads(output.read_text())
+            self.assertEqual(result["children"], ["PROJ-2", "PROJ-3"])
+            self.assertEqual(result["readiness"][0]["key"], "PROJ-3")
+            self.assertEqual(result["readiness_blockers"][0]["key"], "PROJ-2")
 
 
 if __name__ == "__main__":

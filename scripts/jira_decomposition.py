@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from slice_delivery import validate_delivery, validate_owner
+
 import argparse
 import base64
 import json
@@ -28,6 +30,13 @@ class DecompositionError(RuntimeError):
     pass
 
 
+def status_names(config: dict[str, Any], key: str, default: list[str]) -> list[str]:
+    values = config.get(key, default)
+    if not isinstance(values, list) or not values or any(not isinstance(value, str) or not value.strip() for value in values):
+        raise DecompositionError(f"{key} must be a nonempty list of status names")
+    return [value.strip().casefold() for value in values]
+
+
 def auth_headers() -> dict[str, str]:
     token = os.environ.get("JIRA_API_TOKEN", "")
     if not token:
@@ -49,6 +58,9 @@ def adf(slice_: dict[str, Any], parent: str) -> dict[str, Any]:
     paragraphs = [
         f"Automatically decomposed from {parent}.",
         "Behavior: " + str(slice_["behavior"]).strip(),
+        "Migration owner: " + slice_["migration_owner"],
+        "Test plan:",
+        *[f"- {value.strip()}" for value in slice_["test_plan"]],
         "Acceptance criteria:",
         *[f"- {value.strip()}" for value in slice_["acceptance_criteria"]],
     ]
@@ -151,17 +163,23 @@ class Jira:
     def ensure_dependency(
         self, *, blocked: str, prerequisite: str, link_type: str, blocked_side: str
     ) -> bool:
-        for link in self.issue_links(blocked):
-            type_name = str((link.get("type") or {}).get("name") or "")
-            inward = str((link.get("inwardIssue") or {}).get("key") or "").upper()
-            outward = str((link.get("outwardIssue") or {}).get("key") or "").upper()
-            correct_direction = (
-                inward == blocked and outward == prerequisite
-                if blocked_side == "inward"
-                else outward == blocked and inward == prerequisite
-            )
-            if type_name.casefold() == link_type.casefold() and correct_direction:
-                return False
+        if blocked_side not in {"inward", "outward"}:
+            raise DecompositionError("dependency blocked_side must be inward or outward")
+
+        def exists() -> bool:
+            other_side = "outward" if blocked_side == "inward" else "inward"
+            for link in self.issue_links(blocked):
+                type_name = str((link.get("type") or {}).get("name") or "")
+                other = str((link.get(f"{other_side}Issue") or {}).get("key") or "").upper()
+                own = str((link.get(f"{blocked_side}Issue") or {}).get("key") or "").upper()
+                # GET issue returns the counterpart only; full link records
+                # may also include the current issue. Match canonical policy.
+                if type_name.casefold() == link_type.casefold() and other == prerequisite and own in {"", blocked}:
+                    return True
+            return False
+
+        if exists():
+            return False
         body: dict[str, Any] = {"type": {"name": link_type}}
         if blocked_side == "inward":
             body.update({"inwardIssue": {"key": blocked}, "outwardIssue": {"key": prerequisite}})
@@ -170,19 +188,63 @@ class Jira:
         try:
             self.request("POST", "rest/api/3/issueLink", body)
         except DecompositionError as exc:
-            for link in self.issue_links(blocked):
-                type_name = str((link.get("type") or {}).get("name") or "")
-                inward = str((link.get("inwardIssue") or {}).get("key") or "").upper()
-                outward = str((link.get("outwardIssue") or {}).get("key") or "").upper()
-                correct_direction = (
-                    inward == blocked and outward == prerequisite
-                    if blocked_side == "inward"
-                    else outward == blocked and inward == prerequisite
-                )
-                if type_name.casefold() == link_type.casefold() and correct_direction:
-                    return False
+            if exists():
+                return False
             raise exc
         return True
+
+
+    def ensure_ready(self, key: str, config: dict[str, Any]) -> dict[str, Any]:
+        """Move an untouched child to a permitted ready status, verifying the result."""
+        ready = status_names(config, "sprint_ready_statuses", ["Ready", "To Do", "Open", "Selected for Development"])
+        done = status_names(config, "sprint_done_statuses", ["Done", "Closed", "Resolved"])
+        blocked = status_names(config, "sprint_blocked_statuses", ["Blocked"])
+
+        def status() -> dict[str, Any]:
+            value = (self.request("GET", f"rest/api/3/issue/{key}?fields=status").get("fields") or {}).get("status")
+            if not isinstance(value, dict) or not isinstance(value.get("name"), str) or not value["name"]:
+                raise DecompositionError(f"Jira issue {key} has no verified status")
+            return value
+
+        current = status()
+        name = current["name"].casefold()
+        if name in ready or name in done:
+            return {"key": key, "status": current["name"], "transitioned": False}
+        if name in blocked or (current.get("statusCategory") or {}).get("key") != "new":
+            raise DecompositionError(f"child {key} is {current['name']}; preserving its existing workflow state")
+        result = self.request("GET", f"rest/api/3/issue/{key}/transitions?expand=transitions.fields")
+        transitions = result.get("transitions")
+        if not isinstance(transitions, list):
+            raise DecompositionError(f"child {key} has no verified transition list")
+        candidates = []
+        for transition in transitions:
+            if not isinstance(transition, dict) or not isinstance(transition.get("to"), dict):
+                raise DecompositionError(f"child {key} has malformed transition metadata")
+            target = str((transition.get("to") or {}).get("name") or "").casefold()
+            fields = transition.get("fields", {})
+            if target not in ready or not isinstance(fields, dict):
+                continue
+            if any(not isinstance(field, dict) for field in fields.values()):
+                raise DecompositionError(f"child {key} has malformed transition field metadata")
+            if any(field.get("required") and field.get("hasDefaultValue") is not True for field in fields.values()):
+                continue
+            identifier = str(transition.get("id") or "")
+            if re.fullmatch(r"[0-9]+", identifier):
+                candidates.append((ready.index(target), identifier))
+        if not candidates:
+            raise DecompositionError(f"child {key} has no ready transition without missing required fields")
+        _, identifier = min(candidates)
+        try:
+            self.request("POST", f"rest/api/3/issue/{key}/transitions", {"transition": {"id": identifier}})
+        except DecompositionError:
+            # A timed-out POST may already have transitioned. Do not repeat it
+            # without an authoritative status check.
+            if status()["name"].casefold() not in ready:
+                raise
+        final = status()
+        if final["name"].casefold() not in ready:
+            raise DecompositionError(f"child {key} did not reach a configured ready status")
+        return {"key": key, "status": final["name"], "transitioned": True}
 
 
 def validated_input(config: dict[str, Any], assessment: dict[str, Any]) -> tuple[str, str, list[dict[str, Any]], dict[str, Any]]:
@@ -191,6 +253,12 @@ def validated_input(config: dict[str, Any], assessment: dict[str, Any]) -> tuple
         raise DecompositionError("sprint_decomposition must be a map")
     if feature.get("auto_decompose_large_tickets") is not True:
         raise DecompositionError("automatic decomposition is not enabled by repository policy")
+    for key, default in (
+        ("sprint_ready_statuses", ["Ready", "To Do", "Open", "Selected for Development"]),
+        ("sprint_done_statuses", ["Done", "Closed", "Resolved"]),
+        ("sprint_blocked_statuses", ["Blocked"]),
+    ):
+        status_names(config, key, default)
     if assessment.get("schema_version") != 1 or assessment.get("verdict") != "decompose":
         raise DecompositionError("assessment must be a schema-v1 decompose verdict")
     ticket_policy = config.get("ticket") or {}
@@ -226,6 +294,7 @@ def validated_input(config: dict[str, Any], assessment: dict[str, Any]) -> tuple
             raise DecompositionError(f"slice {identifier} requires summary and behavior")
         if len(str(item["summary"])) > 255 or len(str(item["behavior"])) > 8000:
             raise DecompositionError(f"slice {identifier} exceeds Jira field limits")
+        validate_delivery(item, DecompositionError)
         criteria = item.get("acceptance_criteria")
         if not isinstance(criteria, list) or not criteria or any(
             not isinstance(value, str) or not value.strip() for value in criteria
@@ -234,6 +303,7 @@ def validated_input(config: dict[str, Any], assessment: dict[str, Any]) -> tuple
         if len(criteria) > 30 or any(len(value) > 2000 for value in criteria):
             raise DecompositionError(f"slice {identifier} acceptance criteria exceed limits")
     for item in slices:
+        validate_owner(item, identifiers, DecompositionError)
         dependencies = item.get("depends_on", [])
         if not isinstance(dependencies, list) or item["id"] in dependencies:
             raise DecompositionError(f"slice {item['id']} has invalid dependencies")
@@ -313,6 +383,15 @@ def main() -> int:
                 linked.append({"blocked": keys[item["id"]], "prerequisite": keys[dependency], "created": created})
         output["children"] = [keys[item["id"]] for item in slices]
         output["links"] = linked
+        output["readiness"] = []
+        output["readiness_blockers"] = []
+        for key in output["children"]:
+            try:
+                output["readiness"].append(jira.ensure_ready(key, config))
+            except DecompositionError as exc:
+                # Creation/linking succeeded. Preserve those results and let
+                # authoritative sync expose this child's blocker independently.
+                output["readiness_blockers"].append({"key": key, "reason": str(exc)})
     destination = Path(args.output)
     write_json(destination, output)
     print(json.dumps(output, sort_keys=True, separators=(",", ":")))

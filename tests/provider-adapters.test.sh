@@ -8,6 +8,14 @@ ok() { printf 'ok   %s\n' "$1"; }
 bad() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }
 
 if python3 -m unittest \
+  "$ROOT/tests/github_progress_test.py" \
+  "$ROOT/tests/test_progress_test.py" \
+  "$ROOT/tests/sprint_metrics_test.py" \
+  "$ROOT/tests/sprint_completion_scenario_test.py" \
+  "$ROOT/tests/phase_budget_test.py" \
+  "$ROOT/tests/native_gateway_test.py" \
+  "$ROOT/tests/codex_gateway_test.py" \
+  "$ROOT/tests/sprint_controller_resilience_test.py" \
   "$ROOT/tests/jira_decomposition_test.py" \
   "$ROOT/tests/provider_batch_adapter_test.py" \
   "$ROOT/tests/sprint_controller_batch_test.py"; then

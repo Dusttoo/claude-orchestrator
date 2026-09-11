@@ -38,6 +38,8 @@ Return exactly one JSON object and no prose:
       "summary": "independently releasable slice",
       "behavior": "user-visible or system behavior",
       "acceptance_criteria": ["testable outcome"],
+      "migration_owner": "none",
+      "test_plan": ["specific regression test and expected result"],
       "depends_on": []
     }
   ]
@@ -49,3 +51,7 @@ Use an empty `slices` array for `ready` and `operator_decision`. For
 Dependencies must refer only to slice IDs in the same response and must be
 acyclic. Never invent missing business behavior; classify that gap as
 `operator_decision`.
+
+Each slice must include `migration_owner` (the owning slice ID, or `none` when
+no migration is needed) and a nonempty `test_plan`. These fields are validated
+and copied into the Jira child description.

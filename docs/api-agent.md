@@ -114,7 +114,7 @@ It atomically reserves the counted input at the most expensive configured input
 rate plus the request's full output allowance. The reservation lock is held on
 the shared ledger, so lanes running in separate worktrees serialize against each
 other rather than against private copies of the limit. Reservations are included in
-run, ticket, and sprint checks, preventing concurrent workers from racing past a
+run, phase, ticket, and sprint checks, preventing concurrent workers from racing past a
 shared limit. A request that could exceed any configured ceiling is not sent.
 
 Ticket controls are layered: `warn_usd_per_ticket` records an event without
@@ -132,7 +132,7 @@ A host operator may authorize one ticket to continue to an exact absolute
 ceiling with the separately installed root authority. This raises only that
 ticket's cost pause and hard ticket-cost ceiling; model-run and
 post-implementation-reviewer-run,
-per-run, sprint, and provider breakers remain unchanged. The grant expires and
+per-run, phase, sprint, and provider breakers remain unchanged. The grant expires and
 cannot be created from repository configuration or by the runtime user. The
 sprint controller activates it with `grant-budget`; API reservations query the
 active grant before every request and stop again at the granted ceiling.
@@ -239,3 +239,46 @@ If the provider completed the request, use `--outcome completed`, its response
 id, and the provider-reported token counts. This settles actual cost, but the
 controller must still inspect the recovered result before advancing workflow
 state. Never release an uncertain reservation merely to make budget available.
+
+### Logical review retries
+
+API reviewers derive their logical review identity from the consumed permit's
+subject, role, exact HEAD, generation, and design round. A replacement execution
+for that identity shares its review capacity and can make at most three reserved
+execution attempts. Actual usage and uncertain reservations always remain billed.
+Code and security each have a ceiling of three logical rounds, within the existing
+combined reviewer ceiling. Design review attempts no longer consume the general
+12-attempt execution ceiling; design remains subject to its ledger round gate,
+logical retry ceiling, and all dollar limits. The general execution ceiling still
+bounds non-design attempts, including operational retries. Historical usage without
+a logical identity is counted conservatively by execution ID.
+
+
+### Phase spending envelopes
+
+`llm.budgets` accepts four positive dollar limits. The defaults and compiled
+maximums are $5 for `max_usd_per_design_phase` (scoping plus design review), $12
+for `max_usd_per_implementation_phase`, and $5 each for
+`max_usd_per_code_review_phase` and `max_usd_per_security_review_phase`.
+The starter configuration retains its stricter $2 overall ticket limit.
+Repository configuration can tighten the phase ceilings. A ticket budget grant does
+not expand a phase envelope.
+
+Each envelope counts settled usage plus unresolved reservations across all runs
+for that ticket. Rejection or reconciliation can restore unused reserved capacity;
+actual spending is never erased. Phase exhaustion does not latch a ticket pause
+or consume another phase's allowance. Ticket and sprint ceilings still apply to
+the combined cost. Envelopes are limits, not prepaid allocations. After a
+controller-verified design approval, unused design allowance transfers to
+implementation once, provided no design reservations remain unresolved. The
+transfer removes that allowance from design and leaves review allowances and
+aggregate ticket/sprint ceilings unchanged. If uncertain design work still has
+a reservation, a later verified progress replay can retry the transfer after
+reconciliation.
+
+The phase is derived from the runner role, including after reconciliation.
+Legacy events without roles count as implementation unless their reservation
+identifies the original role. Direct native Claude launches currently charge their
+entire process tree to implementation; they do not self-declare review phases.
+Sprint summaries expose spent, reserved, remaining, and exhausted capacity for
+each phase using a consistent locked ledger snapshot.
