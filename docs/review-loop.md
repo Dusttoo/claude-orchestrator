@@ -114,6 +114,13 @@ configured cap.
 And the ledger's `effective_verdict` governs, not the reviewer's claimed one --
 a round whose findings were all demoted is a PASS with advisories attached.
 
+Known terminal API failures (invalid structured output, truncation, or exhausted
+tool rounds) release their started phase permit without creating a PASS receipt.
+The next attempt requires a fresh permit and retains all billable usage and
+execution-attempt accounting. Token-count failures before submission also allow
+a fresh permit. Uncertain submissions and nonterminal provider responses remain
+fenced for reconciliation; they cannot authorize another reviewer.
+
 ## The security gate is exempt
 
 The scope freeze narrows what the *code* reviewer may block on. It does not apply

@@ -9,6 +9,8 @@ and exact summaries.
 
 from __future__ import annotations
 
+from slice_delivery import validate_delivery, validate_owner
+
 import argparse
 import contextlib
 import ctypes
@@ -28,7 +30,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from api_agent import AgentError, Pricing, UsageLedger, budgets_from_config, load_yaml
+from api_agent import (
+    AgentError, Pricing, UsageLedger, budgets_from_config, load_yaml,
+    TRANSIENT_PAUSE_REASONS, load_orchestration_env, PHASE_BUDGETS,
+)
 from operator_authority import (
     AuthorityError,
     activate_budget,
@@ -61,6 +66,7 @@ OUTCOMES = TERMINAL | AUTONOMOUS_INTERVENTIONS
 PROGRESS_MILESTONES = {
     "design_passed",
     "failing_test",
+    "tests_repaired",
     "implementation_commit",
     "pr_opened",
     "ci_advanced",
@@ -245,6 +251,7 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
         "max_auto_slices": max_auto_slices,
         "decomposition_threshold": decomposition_threshold,
         "max_usd_without_progress": max_usd_without_progress,
+        "cooperative_auto_recovery": config_bool_any_depth(config, "cooperative_auto_recovery", False),
         "auto_decompose_large_tickets": config_bool_any_depth(
             config, "auto_decompose_large_tickets", False
         ),
@@ -844,6 +851,45 @@ def normalized_inventory(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, 
     }
 
 
+def effective_dependencies(tickets: dict[str, dict[str, Any]], key: str) -> list[str]:
+    """Children inherit tracking-parent prerequisites without depending on the parent."""
+    dependencies: set[str] = set()
+    pending, visited = [key], set()
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        dependencies.update(tickets[current]["dependencies"])
+        for parent in tickets.values():
+            if parent["state"] == "decomposed" and current in parent.get("decomposition_children", []):
+                pending.append(parent["key"])
+    return sorted(dependencies)
+
+
+def dependency_complete(state: dict[str, Any], key: str, cfg: dict[str, Any], visiting: frozenset[str] = frozenset()) -> bool:
+    """Resolve a tracking parent only through its bound, completed child set."""
+    if key in visiting:
+        return False
+    ticket = state["tickets"].get(key)
+    if ticket is None:
+        return str(state["dependency_status"].get(key, "")).casefold() in cfg["done"]
+    if ticket["state"] == "completed":
+        return True
+    if ticket["state"] != "decomposed":
+        return False
+    children = ticket.get("decomposition_children", [])
+    if len(children) < 2 or set(children) != set(ticket.get("subtasks", [])):
+        return False
+    # Missing children must not be substituted with unrelated external status.
+    if any(child not in state["tickets"] for child in children):
+        return False
+    return all(
+        dependency_complete(state, dependency, cfg, visiting | {key})
+        for dependency in children + effective_dependencies(state["tickets"], key)
+    )
+
+
 def find_cycles(tickets: dict[str, dict[str, Any]]) -> dict[str, str]:
     visiting: list[str] = []
     visited: set[str] = set()
@@ -860,7 +906,10 @@ def find_cycles(tickets: dict[str, dict[str, Any]]) -> dict[str, str]:
                 cycle_reason[member] = reason
             return
         visiting.append(key)
-        for dependency in tickets[key]["dependencies"]:
+        dependencies = effective_dependencies(tickets, key)
+        if tickets[key]["state"] == "decomposed":
+            dependencies += tickets[key].get("decomposition_children", [])
+        for dependency in dependencies:
             if dependency in tickets:
                 visit(dependency)
         visiting.pop()
@@ -871,24 +920,33 @@ def find_cycles(tickets: dict[str, dict[str, Any]]) -> dict[str, str]:
     return cycle_reason
 
 
-def blockers(state: dict[str, Any], key: str, cfg: dict[str, Any]) -> list[str]:
+def blockers(state: dict[str, Any], key: str, cfg: dict[str, Any], cycles: dict[str, str] | None = None) -> list[str]:
     ticket = state["tickets"][key]
     reasons: list[str] = []
-    cycles = find_cycles(state["tickets"])
+    if cycles is None:
+        cycles = find_cycles(state["tickets"])
     if key in cycles:
         reasons.append(cycles[key])
-    for dependency in ticket["dependencies"]:
+    for parent in state["tickets"].values():
+        if key in parent.get("subtasks", []) and parent["state"] == "needs_decomposition":
+            reasons.append(f"parent {parent['key']} awaits decomposition binding")
+        elif parent["state"] == "decomposed" and key in parent.get("subtasks", []):
+            if set(parent.get("subtasks", [])) != set(parent.get("decomposition_children", [])):
+                reasons.append(f"parent {parent['key']} child inventory changed after decomposition")
+    for dependency in effective_dependencies(state["tickets"], key):
         if dependency == key:
             reasons.append(f"self dependency: {key}")
             continue
         internal = state["tickets"].get(dependency)
         if internal:
             dep_state = internal["state"]
-            if dep_state == "completed":
+            if dependency_complete(state, dependency, cfg):
+                continue
+            if dep_state == "decomposed":
+                reasons.append(f"dependency {dependency} awaits completion of its bound children and prerequisites")
                 continue
             if dep_state in {
                 "blocked",
-                "decomposed",
                 "external_blocked",
                 "operator_decision",
                 "user_action",
@@ -943,10 +1001,8 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
         return result
     open_reservations: dict[str, dict[str, Any]] = {}
     pause_events: dict[str, dict[str, Any]] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        event = json.loads(line)
+    events = UsageLedger(cfg["shared_root"]).snapshot()
+    for event in events:
         ticket = str(event.get("ticket") or "")
         kind = event.get("kind")
         if kind == "reservation":
@@ -966,17 +1022,23 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                     item["run_ids"].add(str(event["run_id"]))
                     if event.get("role") in DESIGN_REVIEWER_ROLES:
                         item["design_review_run_ids"].add(str(event["run_id"]))
-                    if event.get("role") in POST_IMPLEMENTATION_REVIEWER_ROLES:
-                        item["reviewer_run_ids"].add(str(event["run_id"]))
         elif kind in {"usage", "release"}:
             open_reservations.pop(str(event.get("reservation_id") or ""), None)
         if (
             kind == "ticket_budget_pause"
             and ticket
             and str(event.get("reason") or "")
-            not in {"max_model_runs_per_ticket", "max_reviewer_runs_per_ticket"}
+            not in TRANSIENT_PAUSE_REASONS
         ):
             pause_events[ticket] = event
+            # The first request can exceed a ticket ceiling before any
+            # reservation exists. Its pause must still block planner admission.
+            result.setdefault(ticket, {
+                "spent_usd": 0.0, "reserved_usd": 0.0,
+                "run_ids": set(), "design_review_run_ids": set(), "reviewer_run_ids": set(),
+            })
+        elif kind == "ticket_budget_reset" and ticket:
+            pause_events.pop(ticket, None)
         if kind == "usage" and ticket:
             item = result.setdefault(
                 ticket,
@@ -994,7 +1056,7 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 if event.get("role") in DESIGN_REVIEWER_ROLES:
                     item["design_review_run_ids"].add(str(event["run_id"]))
                 if event.get("role") in POST_IMPLEMENTATION_REVIEWER_ROLES:
-                    item["reviewer_run_ids"].add(str(event["run_id"]))
+                    item["reviewer_run_ids"].add(str(event.get("logical_review_id") or event["run_id"]))
     for event in open_reservations.values():
         ticket = str(event.get("ticket") or "")
         if ticket:
@@ -1014,9 +1076,20 @@ def usage_snapshots(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 if event.get("role") in DESIGN_REVIEWER_ROLES:
                     item["design_review_run_ids"].add(str(event["run_id"]))
                 if event.get("role") in POST_IMPLEMENTATION_REVIEWER_ROLES:
-                    item["reviewer_run_ids"].add(str(event["run_id"]))
+                    item["reviewer_run_ids"].add(str(event.get("logical_review_id") or event["run_id"]))
+    phase_limits = budgets_from_config(load_yaml(cfg["config"]) if cfg.get("config") else {})
     for ticket, item in result.items():
-        item["run_count"] = len(item.pop("run_ids"))
+        item["phase_budgets"] = {}
+        for phase, totals in UsageLedger.phase_totals(events, ticket).items():
+            limit = UsageLedger.phase_limits(events, ticket, phase_limits)[phase]
+            total = totals["spent_usd"] + totals["reserved_usd"]
+            item["phase_budgets"][phase] = {
+                **{name: float(value) for name, value in totals.items()},
+                "limit_usd": float(limit), "remaining_usd": float(max(0, limit - total)),
+                "state": "exhausted" if totals["spent_usd"] >= limit else
+                         "fully_reserved" if total >= limit else "available",
+            }
+        item["run_count"] = len(item.pop("run_ids") - item["design_review_run_ids"])
         item["design_review_run_count"] = len(item.pop("design_review_run_ids"))
         item["reviewer_run_count"] = len(item.pop("reviewer_run_ids"))
         total = item["spent_usd"] + item["reserved_usd"]
@@ -1103,6 +1176,17 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             for key, fresh in incoming["tickets"].items():
                 previous = current["tickets"].get(key)
                 if previous:
+                    # Only Jira-owned, never-started readiness follows Jira.
+                    # Scoping decisions, removed inventory and worker outcomes
+                    # remain durable until their explicit recovery transition.
+                    previous_initial = initial_state(previous.get("raw_status", ""), cfg)
+                    refresh_readiness = (
+                        not previous.get("attempts")
+                        and previous["state"] in {"pending", "blocked", "user_action"}
+                        and not previous.get("scope_assessment")
+                        and (previous["state"], previous.get("reason", "")) == previous_initial
+                        and all(event.get("event") == "jira-status-refreshed" for event in previous.get("history", []))
+                    )
                     for field in (
                         "state",
                         "reason",
@@ -1121,9 +1205,16 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                         "scope_assessment",
                         "decomposition_children",
                         "progress",
+                        "verified_commits",
+                        "ci_progress",
+                        "test_progress",
                     ):
+                        if refresh_readiness and field in {"state", "reason"}:
+                            continue
                         if field in previous:
                             fresh[field] = previous[field]
+                    if refresh_readiness and fresh["raw_status"] != previous.get("raw_status"):
+                        fresh["history"].append({"at": now(), "event": "jira-status-refreshed", "status": fresh["raw_status"]})
                 current["tickets"][key] = fresh
             current["project"] = incoming["project"]
             current["sprint"] = incoming["sprint"]
@@ -1201,6 +1292,7 @@ def validated_scope_assessment(
                     raise SprintError(f"slice {identifier} requires {field}")
             if len(str(item["summary"])) > 255 or len(str(item["behavior"])) > 8000:
                 raise SprintError(f"slice {identifier} exceeds Jira field limits")
+            validate_delivery(item, SprintError)
             criteria = item.get("acceptance_criteria")
             if (
                 not isinstance(criteria, list)
@@ -1218,6 +1310,7 @@ def validated_scope_assessment(
             ):
                 raise SprintError(f"slice {identifier} depends_on must be an array")
         for item in slices:
+            validate_owner(item, identifiers, SprintError)
             unknown = sorted(set(item.get("depends_on", [])) - identifiers)
             if unknown or item["id"] in item.get("depends_on", []):
                 raise SprintError(
@@ -1341,6 +1434,21 @@ def record_decomposition(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     emit({"ticket": key, "state": "decomposed", "children": requested})
 
 
+def progress_review_ledger(cfg: dict[str, Any], key: str, evidence: str) -> dict[str, Any]:
+    directory = (cfg["shared_root"] / str(load_yaml(cfg["config"]).get(
+        "review_ledger_dir", ".orchestration/.review-ledger"))).resolve()
+    evidence_path = (cfg["shared_root"] / evidence).resolve()
+    if evidence_path.parent != directory or evidence_path.suffix != ".json":
+        raise SprintError("progress requires this ticket's canonical review ledger file")
+    with locked(evidence_path):
+        review = read_json(evidence_path, label="progress review ledger")
+    subject = review.get("work_subject") or {}
+    if (subject.get("id") != key
+            or subject.get("repository") != str(cfg["shared_root"].resolve())):
+        raise SprintError("progress receipt belongs to another ticket or repository")
+    return review
+
+
 def record_progress(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     path = state_path(cfg["state_dir"], str(args.sprint))
     key = normalize_key(args.ticket)
@@ -1348,6 +1456,30 @@ def record_progress(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         raise SprintError("unsupported progress milestone")
     if not args.evidence.strip():
         raise SprintError("progress evidence must not be empty")
+    github_observation = None
+    test_observation = None
+    initial_ticket = None
+    if args.milestone in {"pr_opened", "ci_advanced", "failing_test", "tests_repaired"}:
+        # Network requests and test processes never hold the sprint-wide checkpoint lock.
+        with locked(path):
+            snapshot = load(path)
+            initial_ticket = snapshot["tickets"].get(key)
+            if not initial_ticket or initial_ticket["state"] not in {"running", "needs_repair", "recoverable"}:
+                raise SprintError("ticket is not eligible for progress verification")
+            require_attempt(initial_ticket, args.attempt_token)
+        if args.milestone in {"failing_test", "tests_repaired"}:
+            from test_progress import observe, TestProgressError
+            try:
+                test_observation = observe(cfg["shared_root"], initial_ticket, load_yaml(cfg["config"]),
+                                           args.milestone, args.evidence)
+            except TestProgressError as exc:
+                raise SprintError(str(exc)) from exc
+        else:
+            from github_progress import observe, ProgressError
+            try:
+                github_observation = observe(cfg["shared_root"], initial_ticket, args.milestone, args.evidence)
+            except ProgressError as exc:
+                raise SprintError(str(exc)) from exc
     with locked(path):
         state = load(path)
         ticket = state["tickets"].get(key)
@@ -1355,13 +1487,89 @@ def record_progress(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             current = ticket["state"] if ticket else "missing"
             raise SprintError(f"ticket {key} cannot record progress from state {current}")
         require_attempt(ticket, args.attempt_token)
+        if initial_ticket is not None and ticket != initial_ticket:
+            raise SprintError("ticket changed during progress verification; retry with the current attempt")
+        verified = False
+        fingerprint = args.evidence.strip()
+        if args.milestone == "implementation_commit":
+            evidence = args.evidence.strip()
+            baseline = (ticket.get("launch_evidence") or {}).get("base_commit", "")
+            if not re.fullmatch(r"[0-9a-f]{40,64}", evidence) or not baseline or evidence == baseline:
+                raise SprintError("implementation progress requires a new full commit SHA after launch")
+            ancestor = subprocess.run(["git", "merge-base", "--is-ancestor", baseline, evidence],
+                                      cwd=cfg["shared_root"], capture_output=True)
+            changed = subprocess.run(["git", "diff", "--quiet", baseline, evidence, "--"],
+                                     cwd=cfg["shared_root"], capture_output=True)
+            if ancestor.returncode != 0 or changed.returncode != 1:
+                raise SprintError("progress commit must descend from launch HEAD and change its tree")
+            fingerprint = subprocess.check_output(["git", "rev-parse", evidence + "^{tree}"],
+                                                  cwd=cfg["shared_root"], text=True).strip()
+            ticket.setdefault("verified_commits", {})[evidence] = fingerprint
+            verified = True
+        if args.milestone == "design_passed":
+            review = progress_review_ledger(cfg, key, args.evidence.strip())
+            rounds = (review.get("design") or {}).get("rounds", [])
+            result = rounds[-1].get("result", {}) if rounds else {}
+            if (not rounds or rounds[-1].get("verdict") != "PASS"
+                    or not result.get("phase_permit")
+                    or not any(permit.get("token") == result["phase_permit"]
+                               and permit.get("receipt_consumed_at")
+                               for permit in review.get("review_permits", []))):
+                raise SprintError("design progress requires a consumed PASS receipt for this ticket")
+            fingerprint = str(result["phase_permit"])
+            UsageLedger(cfg["shared_root"]).transfer_design_budget(
+                key, budgets_from_config(load_yaml(cfg["config"])), fingerprint)
+            verified = True
+        if args.milestone == "review_finding_closed":
+            try:
+                evidence = json.loads(args.evidence)
+                ledger_file, finding = evidence["ledger"], evidence["finding"]
+                if not isinstance(ledger_file, str) or not isinstance(finding, str) or not finding:
+                    raise ValueError()
+            except (ValueError, TypeError, KeyError) as exc:
+                raise SprintError('finding progress requires JSON with "ledger" and "finding"') from exc
+            review = progress_review_ledger(cfg, key, ledger_file)
+            component = review.get("components", {}).get(finding, {})
+            finalized = any(attempt.get("claims_finalized_at") and attempt.get("completed_at")
+                            and finding in attempt.get("closed", [])
+                            for attempt in review.get("repair_attempts", []))
+            claims = component.get("claims") or {}
+            if (not finalized or component.get("status") != "resolved" or not claims
+                    or any(claim.get("status") != "resolved" for claim in claims.values())
+                    or review.get("repair_pending_review")):
+                raise SprintError("finding must be closed by finalized independent review, with no open gate claims")
+            fingerprint = finding
+            verified = True
+        if github_observation is not None:
+            verified = github_observation["verified"]
+            fingerprint = github_observation["fingerprint"]
+            receipt = github_observation["receipt"]
+            ticket["pr"], ticket["branch"] = receipt["url"], receipt["branch"]
+            if "ci_highest" in github_observation:
+                ticket.setdefault("ci_progress", {})[receipt["tree"]] = github_observation["ci_highest"]
+        if test_observation is not None:
+            verified = test_observation["verified"]
+            fingerprint = test_observation["fingerprint"]
+            ticket.setdefault("test_progress", {})[test_observation["definition"]] = test_observation["cases"]
         spent = usage_snapshots(cfg).get(key, {}).get("spent_usd", 0.0)
-        event = {
+        event = {"verified": verified, "fingerprint": fingerprint,
             "at": now(),
             "milestone": args.milestone,
             "evidence": args.evidence.strip(),
             "spent_usd": spent,
         }
+        if github_observation is not None:
+            event["receipt"] = github_observation["receipt"]
+        if test_observation is not None:
+            event["receipt"] = test_observation["receipt"]
+        previous = next((item for item in ticket.get("progress", [])
+                         if item.get("milestone") == event["milestone"]
+                         and item.get("fingerprint", item.get("evidence")) == fingerprint), None)
+        if previous:
+            save(path, state)
+            emit({"ticket": key, "state": ticket["state"], "progress": previous,
+                  "duplicate": True})
+            return
         ticket.setdefault("progress", []).append(event)
         ticket["history"].append({"at": event["at"], "event": "progress", **event})
         save(path, state)
@@ -1370,6 +1578,7 @@ def record_progress(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
 
 def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     spend = usage_snapshots(cfg)
+    cycles = find_cycles(state["tickets"])
     running = sorted(
         key for key, ticket in state["tickets"].items() if ticket["state"] == "running"
     )
@@ -1377,7 +1586,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     admission_reasons = {
         ticket["key"]: sorted(
             set(
-                blockers(state, ticket["key"], cfg)
+                blockers(state, ticket["key"], cfg, cycles)
                 + ([reason] if (reason := attempt_limit_reason(ticket, cfg)) else [])
             )
         )
@@ -1391,6 +1600,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         and not admission_reasons[ticket["key"]]
         and not ticket.get("scope_assessment")
         and cfg["auto_decompose_large_tickets"]
+        and spend.get(ticket["key"], {}).get("state") != "operator_action"
     )
     ready = [
         ticket["key"]
@@ -1403,7 +1613,6 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         )
         and spend.get(ticket["key"], {}).get("state") != "operator_action"
     ]
-    available = max(0, cfg["concurrency_max"] - len(running))
     waiting = [
         {
             "key": ticket["key"],
@@ -1413,26 +1622,56 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         for ticket in ordered
         if ticket["state"] == "pending" and admission_reasons[ticket["key"]]
     ]
-    launch = ready[:available]
-    decomposition = sorted(
-        key
-        for key, ticket in state["tickets"].items()
-        if ticket["state"] == "needs_decomposition"
-    )
-    repair = sorted(
-        key
-        for key, ticket in state["tickets"].items()
-        if ticket["state"] == "needs_repair"
-    )
-    recovery = sorted(
-        key
-        for key, ticket in state["tickets"].items()
-        if ticket["state"] == "recoverable"
-    )
+    decomposition, repair, recovery = [], [], []
+    recovery_waiting = []
+    decisions = []
+    for ticket in ordered:
+        key, status = ticket["key"], ticket["state"]
+        if status in {"completed", "decomposed", "running"}:
+            continue
+        reasons = []
+        if spend.get(key, {}).get("state") == "operator_action":
+            reasons.append("ticket spending or execution-count ceiling requires operator action")
+        if status in {"pending", "recoverable", "needs_repair"}:
+            if reason := attempt_limit_reason(ticket, cfg):
+                reasons.append(reason)
+        if status in {"operator_decision", "user_action", "blocked", "external_blocked"}:
+            reasons.append(ticket.get("reason") or status)
+        if status == "needs_decomposition" and not cfg["auto_decompose_large_tickets"]:
+            reasons.append("automatic decomposition is disabled by repository policy")
+        if status in {"recoverable", "needs_repair"}:
+            reasons.extend(blockers(state, key, cfg, cycles))
+            identity = ticket.get("worker_identity")
+            unit_status = (
+                execution_unit_status(identity)
+                if isinstance(identity, dict) and identity.get("kind") == "execution_unit"
+                else "unknown"
+            )
+            if unit_status == "live":
+                recovery_waiting.append(key)
+            if not ticket.get("attempt_token"):
+                reasons.append("recovery requires the current attempt token")
+            elif unit_status == "live":
+                if not reasons:
+                    continue
+            elif not automatic_recovery_available(ticket, cfg, unit_status):
+                reasons.append("recovery requires external execution-unit authority")
+        if reasons:
+            decisions.append({"key": key, "state": status, "reasons": sorted(set(reasons))})
+        elif status == "needs_decomposition":
+            decomposition.append(key)
+        elif status == "needs_repair":
+            repair.append(key)
+        elif status == "recoverable":
+            recovery.append(key)
+    # A terminal report can precede process exit. Do not reuse its lane while
+    # the previous execution unit is still alive, even when admission is paused.
+    occupied = len(running) + len(recovery_waiting)
+    launch = ready[:max(0, cfg["concurrency_max"] - occupied)]
     stalled = []
     for key in running:
         ticket = state["tickets"][key]
-        progress = ticket.get("progress") or []
+        progress = [item for item in ticket.get("progress", []) if item.get("verified")]
         baseline = float(progress[-1].get("spent_usd", 0)) if progress else 0.0
         current = float(spend.get(key, {}).get("spent_usd", 0))
         delta = max(0.0, current - baseline)
@@ -1449,18 +1688,20 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         "sprint": state["sprint"],
         "concurrency_max": cfg["concurrency_max"],
         "running": running,
-        "needs_reconcile": running,
+        "needs_reconcile": sorted(running + recovery_waiting),
         "launch": launch,
         "scope": scope,
         "decomposition": decomposition,
         "repair": repair,
         "recovery": recovery,
+        "recovery_waiting": recovery_waiting,
+        "decision_queue": decisions,
         "stalled": stalled,
         "waiting": waiting,
         "autonomous_work_remaining": bool(
-            running or launch or scope or decomposition or repair or recovery
+            running or launch or scope or decomposition or repair or recovery or recovery_waiting
         ),
-        "over_capacity": max(0, len(running) - cfg["concurrency_max"]),
+        "over_capacity": max(0, occupied - cfg["concurrency_max"]),
         "spend": spend,
     }
 
@@ -2103,7 +2344,13 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         if reasons:
             raise SprintError(f"ticket {key} is blocked: {'; '.join(reasons)}")
         running = sum(
-            1 for value in state["tickets"].values() if value["state"] == "running"
+            1 for value in state["tickets"].values()
+            if value["state"] == "running" or (
+                value["state"] in {"recoverable", "needs_repair"}
+                and isinstance(value.get("worker_identity"), dict)
+                and value["worker_identity"].get("kind") == "execution_unit"
+                and execution_unit_status(value["worker_identity"]) == "live"
+            )
         )
         if running >= cfg["concurrency_max"]:
             raise SprintError(
@@ -2240,14 +2487,44 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
         return
     input_handle: Any = subprocess.DEVNULL
     child: subprocess.Popen[Any] | None = None
+    gateway = None
+    stop_reason = ""
+    child_env = dict(os.environ)
+    started = time.monotonic()
+    checkpoint = state_path(_cfg["state_dir"], args.sprint)
+    max_seconds = min(3600, max(1, int(config_scalar_any_depth(_cfg["config"], "max_worker_seconds", "1800"))))
 
     def forward(signum: int, _frame: Any) -> None:
         if child is not None and child.poll() is None:
-            child.send_signal(signum)
+            os.killpg(child.pid, signum)
 
     signal.signal(signal.SIGTERM, forward)
     signal.signal(signal.SIGINT, forward)
     try:
+        if Path(command[0]).name == "claude":
+            from native_gateway import NativeGateway, claude_child_environment, claude_launch_arguments
+            load_orchestration_env(_cfg["config"])
+            if not os.environ.get("ANTHROPIC_API_KEY"):
+                raise SprintError("native Claude budget enforcement requires ANTHROPIC_API_KEY")
+            gateway = NativeGateway(_cfg["shared_root"], load_yaml(_cfg["config"]),
+                                    args.ticket, args.sprint, args.invocation_id)
+            endpoint = gateway.start()
+            child_env = claude_child_environment(child_env, gateway.token, endpoint)
+            command = claude_launch_arguments(command, gateway.token, endpoint)
+        elif Path(command[0]).name == "codex":
+            from codex_gateway import CodexGateway, child_environment, install_launcher, launch_arguments
+            load_orchestration_env(_cfg["config"])
+            if not os.environ.get("OPENAI_API_KEY"):
+                raise SprintError("native Codex budget enforcement requires OPENAI_API_KEY")
+            executable = shutil.which(command[0])
+            if not executable:
+                raise SprintError("native Codex executable was not found")
+            gateway = CodexGateway(_cfg["shared_root"], load_yaml(_cfg["config"]),
+                                   args.ticket, args.sprint, args.invocation_id)
+            endpoint = gateway.start()
+            child_env = child_environment(child_env, gateway.token, endpoint)
+            install_launcher(ready_path.parent / (args.invocation_id + ".bin"), executable, child_env)
+            command = launch_arguments([executable, *command[1:]], endpoint)
         if args.stdin_file:
             input_handle = Path(args.stdin_file).open("rb")
         with output_path.open("ab") as output_handle:
@@ -2256,13 +2533,42 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
                 stdin=input_handle,
                 stdout=output_handle,
                 stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=child_env,
             )
             write_json(
                 ready_path,
                 {"phase": "launched", "identity": identity, "worker_pid": child.pid},
             )
+            while child.poll() is None:
+                if gateway and gateway.stopped.is_set():
+                    stop_reason = gateway.reason
+                elif checkpoint.is_file():
+                    snapshot = load(checkpoint)
+                    lane = snapshot.get("tickets", {}).get(args.ticket, {})
+                    if (lane.get("launch_evidence") or {}).get("invocation_id") == args.invocation_id:
+                        spend = usage_snapshots(_cfg).get(args.ticket, {})
+                        milestones = [item for item in lane.get("progress", []) if item.get("verified")]
+                        baseline = float(milestones[-1].get("spent_usd", 0)) if milestones else 0.0
+                        if float(spend.get("spent_usd", 0)) - baseline >= _cfg["max_usd_without_progress"]:
+                            stop_reason = "max_usd_without_progress"
+                if time.monotonic() - started >= max_seconds:
+                    stop_reason = "max_worker_seconds"
+                if stop_reason:
+                    os.killpg(child.pid, signal.SIGTERM)
+                    try:
+                        child.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    # Descendants can outlive their parent or ignore TERM.
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    break
+                time.sleep(0.1)
             returncode = child.wait()
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, AgentError, SprintError) as exc:
         terminal = {
             "invocation_id": args.invocation_id,
             "phase": "terminal",
@@ -2276,6 +2582,20 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
         )
         return
     finally:
+        # A supervisor exception must never leave an unmonitored paid worker.
+        # Also collect children that outlived a normally exiting parent.
+        if child is not None:
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+                try:
+                    child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if gateway:
+            gateway.close()
         if args.stdin_file and input_handle is not subprocess.DEVNULL:
             input_handle.close()
     terminal = {
@@ -2283,13 +2603,29 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
         "phase": "terminal",
         "spawned": True,
         "returncode": returncode,
+        "stop_reason": stop_reason,
         "finished_at": now(),
+        "cooperative_cleanup": {"worker_pgid": child.pid, "gateway_closed": True},
     }
     write_json(tombstone_path, terminal)
     write_json(
         ready_path,
         {**terminal, "identity": identity, "worker_pid": child.pid if child else 0},
     )
+    if stop_reason and checkpoint.is_file():
+        with locked(checkpoint):
+            state = load(checkpoint)
+            lane = state.get("tickets", {}).get(args.ticket, {})
+            if ((lane.get("launch_evidence") or {}).get("invocation_id") == args.invocation_id
+                    and lane.get("state") == "running"):
+                # Shared admission pressure can disappear when another lane's
+                # reservation is released. Keep it in automatic recovery; the
+                # ledger rechecks capacity before any subsequent paid request.
+                shared_pressure = stop_reason.startswith("max_usd_per_sprint would be exceeded:")
+                lane["state"] = "operator_decision" if not shared_pressure and ("budget" in stop_reason or "usd" in stop_reason) else "recoverable"
+                lane["reason"] = stop_reason
+                lane.setdefault("history", []).append({"at": now(), "event": "supervisor-stopped", "state": lane["state"], "reason": stop_reason})
+                save(checkpoint, state)
 
 
 def execution_unit_status(identity: dict[str, Any]) -> str:
@@ -2378,6 +2714,8 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             "ack_path": str(ack_path),
             "tombstone_path": str(tombstone_path),
             "created_at": now(),
+            "base_commit": subprocess.run(["git", "rev-parse", "--verify", "HEAD"],
+                                           cwd=cfg["shared_root"], capture_output=True, text=True).stdout.strip(),
         }
         # Persist the launch intent first. A controller crash can then fence the
         # lane for reconciliation instead of allowing a duplicate launch.
@@ -2387,7 +2725,11 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         supervisor = [
             sys.executable,
             str(Path(__file__).resolve()),
+            "--config",
+            str(cfg["config"]),
             "supervise-local",
+            "--ticket", key,
+            "--sprint", str(args.sprint),
             "--invocation-id",
             invocation_id,
             "--ready",
@@ -2418,6 +2760,7 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             ]
         elif os.environ.get("ORCHESTRATION_TEST_MODE") == "1":
             containment = "test-supervisor"
+        evidence["cooperative_auto_recovery"] = cfg.get("cooperative_auto_recovery", False)
         evidence["containment"] = containment
         evidence["unit_name"] = unit_name
         ticket["launch_evidence"] = evidence
@@ -2576,8 +2919,7 @@ def requeue(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ticket["state"] = "pending"
         ticket["reason"] = args.reason.strip()
         ticket["run_ref"] = ""
-        ticket["branch"] = ""
-        ticket["pr"] = ""
+        # Preserve the resumable work identity across execution attempts.
         ticket["attempt_token"] = ""
         ticket["attempt_capability"] = {}
         ticket["worker_identity"] = ""
@@ -2728,20 +3070,44 @@ def recover_legacy(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     emit({"ticket": key, "state": "pending", "recovered": True})
 
 
+def automatic_recovery_available(ticket, cfg, status=None):
+    """Honor strict containment or an explicitly configured cooperative contract."""
+    identity = ticket.get("worker_identity")
+    if not isinstance(identity, dict) or identity.get("kind") != "execution_unit":
+        return False
+    if (status or execution_unit_status(identity)) != "absent":
+        return False
+    if identity.get("containment") in {"cgroup-v2-systemd-scope", "test-supervisor"}:
+        return True
+    launch = ticket.get("launch_evidence") or {}
+    if (identity.get("containment") != "cooperative-session"
+            or not cfg.get("cooperative_auto_recovery") or not launch.get("cooperative_auto_recovery")
+            or launch.get("invocation_id") != identity.get("invocation_id")):
+        return False
+    try:
+        receipt = read_json(Path(identity["tombstone_path"]), label="cooperative cleanup receipt")
+        cleanup = receipt.get("cooperative_cleanup", {})
+        pgid = cleanup.get("worker_pgid")
+        if (receipt.get("phase") != "terminal" or receipt.get("error")
+                or receipt.get("invocation_id") != identity["invocation_id"]
+                or cleanup.get("gateway_closed") is not True
+                or not isinstance(pgid, int) or isinstance(pgid, bool) or pgid <= 1):
+            return False
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except (KeyError, OSError, SprintError):
+        return False
+    return False
+
+
 def require_worker_stopped(
     ticket: dict[str, Any], operator_token: str, cfg: dict[str, Any]
 ) -> None:
-    """Prove the complete execution unit absent or use external authority."""
-    identity = ticket.get("worker_identity")
-    if isinstance(identity, dict) and identity.get("kind") == "execution_unit":
-        status = execution_unit_status(identity)
-        if status == "absent" and identity.get("containment") in {
-            "cgroup-v2-systemd-scope",
-            "test-supervisor",
-        }:
-            return
-    # Old process identities and cooperative sessions cannot prove that a
-    # descendant did not escape. They therefore require the host authority.
+    """Prove containment or the configured cooperative cleanup contract."""
+    if automatic_recovery_available(ticket, cfg):
+        return
+    # Missing cleanup receipts and legacy identities require host authority.
     if not consume_operator_recovery(operator_token, ticket, cfg):
         raise SprintError(
             "worker-unit absence is not mechanically verifiable; external operator recovery authority is unavailable or denied"
@@ -2882,6 +3248,7 @@ def process_identity(raw_pid: str) -> dict[str, Any]:
 
 def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     spend = usage_snapshots(cfg)
+    cycles = find_cycles(state["tickets"])
     result: dict[str, Any] = {
         "sprint": state["sprint"],
         "completed": [],
@@ -2913,6 +3280,8 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         if ticket["state"] == "completed":
             result["completed"].append(item)
         elif ticket["state"] == "decomposed":
+            item["children"] = ticket.get("decomposition_children", [])
+            item["dependency_complete"] = dependency_complete(state, key, cfg)
             result["decomposed"].append(item)
         elif ticket["state"] == "needs_decomposition":
             result["decomposition"].append(item)
@@ -2931,7 +3300,7 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         elif ticket["state"] == "running":
             result["running"].append(item)
         else:
-            reasons = blockers(state, key, cfg)
+            reasons = blockers(state, key, cfg, cycles)
             if reasons:
                 item["reason"] = "; ".join(reasons)
                 result["blocked"].append(item)
@@ -2946,8 +3315,12 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
                 else:
                     item["reason"] = "ready but not launched"
                 result["user_action"].append(item)
-    result["finished"] = not plan_value(state, cfg)["autonomous_work_remaining"]
+    plan = plan_value(state, cfg)
+    result["finished"] = not plan["autonomous_work_remaining"]
+    result["decision_queue"] = plan["decision_queue"]
     result["spend"] = spend
+    from sprint_metrics import summarize
+    result["outcome_metrics"] = summarize(state, spend)
     return result
 
 
@@ -2955,6 +3328,33 @@ def summary(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     path = state_path(cfg["state_dir"], str(args.sprint))
     with locked(path):
         emit(summary_value(load(path), cfg))
+
+
+def report_outcomes(args, cfg):
+    from sprint_metrics import summarize, verify_merges
+    path = state_path(cfg["state_dir"], str(args.sprint))
+    with locked(path):
+        state = load(path)
+    metrics = summarize(state, usage_snapshots(cfg))
+    if args.verify_merges:
+        from github_progress import ProgressError
+        try:
+            metrics = verify_merges(cfg["shared_root"], state, metrics)
+        except ProgressError as exc:
+            raise SprintError(str(exc)) from exc
+    repeated = {}
+    directory = cfg["shared_root"] / str(load_yaml(cfg["config"]).get("review_ledger_dir", ".orchestration/.review-ledger"))
+    for ledger in directory.glob("*.json"):
+        with locked(ledger):
+            review = read_json(ledger, label="review outcome ledger")
+        subject = review.get("work_subject") or {}
+        key = subject.get("id")
+        if key in state["tickets"] and subject.get("repository") == str(cfg["shared_root"].resolve()):
+            repeated.setdefault(key, []).extend(dict(finding=name, strikes=item.get("strikes", 0))
+                for name, item in review.get("components", {}).items() if item.get("strikes", 0) > 1)
+    metrics["repeated_findings"] = repeated
+    metrics["review_coverage"] = "Only matching canonical review ledgers are included; absent tickets have unknown coverage."
+    emit(metrics)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -2965,6 +3365,10 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--state-dir", help="checkpoint directory override")
     commands = result.add_subparsers(dest="command", required=True)
+    outcomes = commands.add_parser("report-outcomes", help="report completion, blocking, and verified merge metrics")
+    outcomes.add_argument("--sprint", required=True)
+    outcomes.add_argument("--verify-merges", action="store_true")
+    outcomes.set_defaults(func=report_outcomes)
     sync_parser = commands.add_parser(
         "sync", help="normalize Jira inventory into a durable checkpoint"
     )
@@ -3026,6 +3430,8 @@ def parser() -> argparse.ArgumentParser:
     launch_parser.add_argument("command", nargs=argparse.REMAINDER)
     launch_parser.set_defaults(func=launch_local)
     supervisor_parser = commands.add_parser("supervise-local", help=argparse.SUPPRESS)
+    supervisor_parser.add_argument("--ticket", required=True)
+    supervisor_parser.add_argument("--sprint", required=True)
     supervisor_parser.add_argument("--invocation-id", required=True)
     supervisor_parser.add_argument("--ready", required=True)
     supervisor_parser.add_argument("--ack", required=True)
@@ -3070,7 +3476,8 @@ def parser() -> argparse.ArgumentParser:
     progress_parser.add_argument("--sprint", required=True)
     progress_parser.add_argument("--ticket", required=True)
     progress_parser.add_argument("--milestone", required=True, choices=sorted(PROGRESS_MILESTONES))
-    progress_parser.add_argument("--evidence", required=True)
+    progress_parser.add_argument("--evidence", required=True,
+        help="PR/CI: positive PR number or canonical URL; other milestones: documented artifact/receipt")
     progress_parser.add_argument("--attempt-token", required=True)
     progress_parser.set_defaults(func=record_progress)
     requeue_parser = commands.add_parser("requeue")
@@ -3120,7 +3527,7 @@ def main() -> int:
         cfg = settings(args)
         args.func(args, cfg)
         return 0
-    except SprintError as exc:
+    except (SprintError, AgentError) as exc:
         print(f"sprint-controller: {exc}", file=sys.stderr)
         return 2
 

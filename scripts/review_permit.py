@@ -84,7 +84,7 @@ def consume(
     role: str,
     head: str,
     timestamp: str,
-) -> None:
+) -> str:
     path = ledger_path(shared_root, ledger_dir, pr)
     lock_path = path.with_suffix(path.suffix + ".lock")
     if not path.is_file():
@@ -122,6 +122,8 @@ def consume(
             raise ReviewPermitError("review phase changed after this permit was issued")
         permit["started_at"] = timestamp
         _save(path, state)
+        return canonical_digest({key: permit.get(key) for key in (
+            "work_subject", "role", "head", "review_generation", "design_round_count")})
 
 
 def canonical_digest(value: Any) -> str:
@@ -221,7 +223,11 @@ def cancel_started(
     head: str,
     timestamp: str,
 ) -> None:
-    """Release a started permit only after a known pre-ack rejection."""
+    """Release a started permit after a known nonexecuted or terminal failed run.
+
+    The runner owns outcome classification. Uncertain or live provider work
+    must never use this transition; no PASS receipt is created by cancellation.
+    """
     path = ledger_path(shared_root, ledger_dir, pr)
     lock_path = path.with_suffix(path.suffix + ".lock")
     with lock_path.open("a+", encoding="utf-8") as lock:

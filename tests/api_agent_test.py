@@ -1313,6 +1313,111 @@ self_check:
         with self.assertRaisesRegex(api_agent.AgentError, "invalid structured output"):
             agent.run({"model": "test-model", "max_tokens": 100, "system": [], "messages": [{"role": "user", "content": "review"}]})
         self.assertEqual(agent.state["status"], "invalid_output")
+        failed_cost = api_agent.Decimal(agent.state["cost_usd"])
+        self.assertGreater(failed_cost, 0)
+        retry = self.agent(self._completed_transport(), run_id="valid-review-retry")
+        result = retry.run({"model": "test-model", "max_tokens": 100, "messages": [{"role": "user", "content": "review"}]})
+        self.assertEqual(result["status"], "completed")
+        self.assertGreater(api_agent.Decimal(result["usage"]["cost_usd"]), failed_cost)
+
+    def test_incomplete_review_releases_permit_but_not_spend(self):
+        transport = self._completed_transport()
+        transport.responses[0]["stop_reason"] = "max_tokens"
+        agent = self.agent(transport, run_id="truncated-review")
+        self.assertEqual(agent.run({"model": "test-model", "max_tokens": 100})["status"], "incomplete")
+        self.assertTrue(self.phase_permit())
+        self.assertGreater(api_agent.Decimal(agent.ledger.summary()["cost_usd"]), 0)
+
+    def test_tool_exhaustion_releases_review_permit(self):
+        transport = FakeTransport([{
+            "id": "msg_tools", "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+            "content": [{"type": "tool_use", "id": "tool_1", "name": "git_status", "input": {}}],
+        }])
+        agent = self.agent(transport)
+        agent.state["tool_rounds"] = agent.budgets["max_tool_rounds"]
+        with self.assertRaisesRegex(api_agent.BudgetError, "max_tool_rounds"):
+            agent.run({"model": "test-model", "max_tokens": 100})
+        self.assertTrue(self.phase_permit())
+
+    def test_token_count_failure_can_retry_without_outstanding_permit(self):
+        transport = FakeTransport([], count=0)
+        agent = self.agent(transport)
+        with self.assertRaisesRegex(api_agent.AgentError, "no input token count"):
+            agent.run({"model": "test-model", "max_tokens": 100})
+        self.assertTrue(self.phase_permit())
+
+    def test_nonterminal_openai_response_keeps_review_fenced(self):
+        transport = FakeTransport([{
+            "id": "resp_live", "status": "in_progress",
+            "usage": {"input_tokens": 10, "output_tokens": 2}, "output": [],
+        }])
+        agent = self.agent(transport, provider="openai")
+        self.assertEqual(agent.run({"model": "test-model", "max_output_tokens": 100})["status"], "needs_reconcile")
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.phase_permit()
+
+    def test_token_counter_failure_after_tool_turn_allows_review_retry(self):
+        transport = FakeTransport([{
+            "id": "msg_tools", "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+            "content": [{"type": "tool_use", "id": "tool_1", "name": "git_status", "input": {}}],
+        }])
+        agent = self.agent(transport)
+        with mock.patch.object(agent, "_count", side_effect=[10, api_agent.AgentError("counter unavailable")]):
+            with self.assertRaisesRegex(api_agent.AgentError, "counter unavailable"):
+                agent.run({"model": "test-model", "max_tokens": 100})
+        self.assertTrue(self.phase_permit())
+        self.assertGreater(api_agent.Decimal(agent.ledger.summary()["cost_usd"]), 0)
+
+    def test_released_requests_free_reviewer_slots_but_attempts_stay_bounded(self):
+        ledger = api_agent.UsageLedger(self.root)
+        limits = dict(api_agent.DEFAULT_BUDGETS)
+        limits["max_reviewer_runs_per_ticket"] = 1
+        limits["max_model_runs_per_ticket"] = 3
+        common = dict(projected=api_agent.Decimal(".01"), limits=limits,
+                      ticket="PROJ-1", sprint="1", provider="anthropic", model="m", role="code-reviewer")
+        for run in ("rejected-1", "rejected-2"):
+            reservation = ledger.reserve(run_id=run, **common)
+            ledger.release(reservation, run, "known rejection")
+        ledger.reserve(run_id="accepted", **common)
+        with self.assertRaisesRegex(api_agent.BudgetError, "max_model_runs_per_ticket"):
+            ledger.reserve(run_id="unbounded-retry", **common)
+
+    def test_rejected_final_request_does_not_erase_accepted_review_work(self):
+        ledger = api_agent.UsageLedger(self.root)
+        limits = dict(api_agent.DEFAULT_BUDGETS, max_reviewer_runs_per_ticket=1)
+        common = dict(projected=api_agent.Decimal(".01"), limits=limits,
+                      ticket="PROJ-1", sprint="1", provider="anthropic", model="m", role="code-reviewer")
+        reservation = ledger.reserve(run_id="partial", **common)
+        ledger.settle(reservation, run_id="partial", ticket="PROJ-1", sprint="1", provider="anthropic",
+                      model="m", response_id="msg_partial", usage={}, cost=api_agent.Decimal(".005"), role="code-reviewer")
+        rejected = ledger.reserve(run_id="partial", **common)
+        ledger.release(rejected, "partial", "known rejection")
+        with self.assertRaisesRegex(api_agent.BudgetError, "max_reviewer_runs_per_ticket"):
+            ledger.reserve(run_id="replacement", **common)
+
+    def test_sprint_reservation_pressure_is_not_a_ticket_pause(self):
+        ledger = api_agent.UsageLedger(self.root)
+        limits = dict(api_agent.DEFAULT_BUDGETS, max_usd_per_sprint=api_agent.Decimal("1"))
+        common = dict(limits=limits, sprint="1", provider="anthropic", model="m")
+        reservation = ledger.reserve(projected=api_agent.Decimal(".8"), run_id="a", ticket="PROJ-1", **common)
+        with self.assertRaisesRegex(api_agent.BudgetError, "max_usd_per_sprint"):
+            ledger.reserve(projected=api_agent.Decimal(".3"), run_id="b", ticket="PROJ-2", **common)
+        ledger.release(reservation, "a", "known rejection")
+        # Historical v1.0.1 pressure events must also stop latching ticket pauses.
+        ledger.append({"kind": "ticket_budget_pause", "ticket": "PROJ-2", "reason": "max_usd_per_sprint"})
+        ledger.reserve(projected=api_agent.Decimal(".3"), run_id="b-retry", ticket="PROJ-2", **common)
+
+    def test_settled_sprint_exhaustion_still_blocks_other_tickets(self):
+        ledger = api_agent.UsageLedger(self.root)
+        limits = dict(api_agent.DEFAULT_BUDGETS, max_usd_per_sprint=api_agent.Decimal("1"))
+        common = dict(limits=limits, sprint="1", provider="anthropic", model="m")
+        reservation = ledger.reserve(projected=api_agent.Decimal("1"), run_id="a", ticket="PROJ-1", **common)
+        ledger.settle(reservation, run_id="a", ticket="PROJ-1", sprint="1", provider="anthropic",
+                      model="m", response_id="msg_a", usage={}, cost=api_agent.Decimal("1"))
+        with self.assertRaisesRegex(api_agent.BudgetError, "max_usd_per_sprint"):
+            ledger.reserve(projected=api_agent.Decimal(".01"), run_id="b", ticket="PROJ-2", **common)
 
     def test_ambiguous_submission_keeps_reservation_for_reconciliation(self):
         transport = FakeTransport([api_agent.ProviderAmbiguous("timeout")])
@@ -1323,6 +1428,8 @@ self_check:
             )
         self.assertEqual(agent.state["status"], "needs_reconcile")
         self.assertEqual(len(agent.ledger.summary()["open_reservations"]), 1)
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.phase_permit()
 
         args = type(
             "Args",

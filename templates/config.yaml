@@ -65,10 +65,16 @@ llm:
     pause_usd_per_ticket: 1.50    # hard operator-action stop; no same-user CLI bypass
     max_usd_per_ticket: 2.00
     max_usd_per_sprint: 20.00
-    max_model_runs_per_ticket: 12 # unique run ids, not provider tool-round calls
+    # Independent phase envelopes; all remain subject to the ticket/sprint caps.
+    max_usd_per_design_phase: 5.00 # includes ticket scoping
+    max_usd_per_implementation_phase: 12.00
+    max_usd_per_code_review_phase: 5.00
+    max_usd_per_security_review_phase: 5.00
+    max_model_runs_per_ticket: 12 # non-design attempts, including rejected runs
     max_reviewer_runs_per_ticket: 6
     # Design reviews use max_design_rounds and do not consume this independent
-    # code/security-review allowance.
+    # code/security-review allowance. Completely released, nonexecuted requests
+    # do not consume reviewer capacity; accepted or uncertain work still does.
     max_output_tokens_per_turn: 4096
     max_tool_rounds: 8
     max_tool_output_chars: 12000
@@ -343,9 +349,9 @@ sprint_decomposition:
   complexity_threshold: 70
   max_auto_slices: 6
   jira_child_issue_type: Sub-task
-# A running lane that spends this much without recording a durable milestone is
-# surfaced as stalled. The captain stops/recoveries that execution unit; it does
-# not silently grant more budget or weaken a gate.
+# The independent local supervisor stops a lane that spends this much without
+# verified progress. Repeated evidence does not reset this spending baseline.
+# Other tickets continue within their own budgets.
 max_usd_without_progress: 5.00
 # Captain messages are event-driven so an interactive control session does not
 # spend model tokens narrating unchanged polls. A compact heartbeat preserves
@@ -507,3 +513,7 @@ rules_docs:
 #         - qa_evidence
 #       candidate_identity_required: true
 #       artifact_identity_required: true
+
+# Opt in only for cooperative workers that do not daemonize or escape sessions.
+# Requires a normal supervisor cleanup receipt and an absent worker process group.
+cooperative_auto_recovery: false

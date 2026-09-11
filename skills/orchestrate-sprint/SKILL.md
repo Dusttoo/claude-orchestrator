@@ -137,7 +137,14 @@ repository config. Caller environment and CLI values cannot replace that policy.
    launchable. A `decompose` result enters `plan.decomposition`; when repository
    policy opted in, run `jira_decomposition.py --apply` with that exact artifact,
    perform a fresh controller-owned Jira sync, then call `record-decomposition`
-   with the exact returned child keys. The adapter uses deterministic labels to
+   with the exact returned child keys. The adapter transitions untouched children to configured ready
+   statuses, and returns any per-child `readiness_blockers`. Preserve that result:
+   sync and record the child binding even when a ready transition was blocked,
+   then continue independent work and include the blocker in the final report.
+   Do not repeatedly re-create children to solve missing transition fields.
+   Parent prerequisites still govern child launch, and downstream parent
+   dependencies release only after the exact bound children complete.
+   The adapter uses deterministic labels to
    recover accepted-but-timed-out creates and checks dependency links
    idempotently. Never auto-decompose a product decision or exceed the configured
    slice cap. An `operator_decision` result is the only scoping outcome that
@@ -288,7 +295,14 @@ Before launching, resolve the executable because non-interactive SSH shells may 
 
    Drain `plan.recovery`, `plan.repair`, and `plan.decomposition`, and continue
    independent `plan.launch` work around external blockers before asking the
-   user. Treat controller `spend` as authoritative. Stop admission when a ticket
+   user. Recovery/repair queues contain only mechanically eligible actions:
+   requeue them with the current attempt token, then obey the next plan. Resume
+   their preserved branch, PR, and review ledger instead of starting design over.
+   `plan.recovery_waiting` retains a lane until its execution unit exits; reconcile
+   those units before reusing their slots. Collect `plan.decision_queue` for the
+   final report, continue independent work, and do not repeatedly retry an item
+   that the controller has classified as requiring a decision.
+   Treat controller `spend` as authoritative. Stop admission when a ticket
    is `operator_action`; never relaunch to evade a model or post-implementation
    reviewer run-count breaker. Design rounds use their own durable ledger and do
    not consume code/security reviewer capacity. Provider continuations retain a

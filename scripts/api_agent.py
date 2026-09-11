@@ -80,6 +80,26 @@ ROLE_TOOL_CEILINGS = {
     "sprint-worker": TOOL_NAMES,
 }
 POST_IMPLEMENTATION_REVIEWER_ROLES = {"code-reviewer", "security-reviewer"}
+PHASE_BUDGETS = {
+    "design": ("max_usd_per_design_phase", Decimal("5")),
+    "implementation": ("max_usd_per_implementation_phase", Decimal("12")),
+    "code_review": ("max_usd_per_code_review_phase", Decimal("5")),
+    "security_review": ("max_usd_per_security_review_phase", Decimal("5")),
+}
+
+
+def spending_phase(role: str | None) -> str:
+    # Unknown/legacy roles consume implementation capacity rather than escaping
+    # phase accounting. Phase selection is never accepted from model output.
+    return {"ticket-scoper": "design", "design-reviewer": "design",
+            "code-reviewer": "code_review", "security-reviewer": "security_review"}.get(
+                role, "implementation")
+
+# Admission pressure is recomputed; only ticket-local dollar incidents latch.
+TRANSIENT_PAUSE_REASONS = {
+    "max_model_runs_per_ticket", "max_reviewer_runs_per_ticket",
+    "max_usd_per_sprint",
+}
 DEFAULT_BUDGETS = {
     "max_usd_per_run": Decimal("10.00"),
     "max_usd_per_ticket": Decimal("30.00"),
@@ -98,6 +118,7 @@ DEFAULT_BUDGETS = {
     "retry_backoff_seconds": 2,
     "retry_max_backoff_seconds": 60,
 }
+DEFAULT_BUDGETS.update({key: maximum for key, maximum in PHASE_BUDGETS.values()})
 NON_OVERRIDABLE_MAXIMA = {
     "max_usd_per_run": Decimal("10.00"),
     "max_usd_per_ticket": Decimal("30.00"),
@@ -106,6 +127,7 @@ NON_OVERRIDABLE_MAXIMA = {
     "max_model_runs_per_ticket": 12,
     "max_reviewer_runs_per_ticket": 6,
 }
+NON_OVERRIDABLE_MAXIMA.update({key: maximum for key, maximum in PHASE_BUDGETS.values()})
 CREDENTIAL_ENV_KEYS = {
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
@@ -415,6 +437,7 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
     for key in (
         "max_usd_per_run", "max_usd_per_ticket", "max_usd_per_sprint",
         "warn_usd_per_ticket", "pause_usd_per_ticket",
+        *(key for key, _ in PHASE_BUDGETS.values()),
     ):
         if key in raw:
             result[key] = decimal_value(raw[key], f"llm.budgets.{key}")
@@ -437,6 +460,9 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
                 "max_model_runs_per_ticket", "max_reviewer_runs_per_ticket",
             } else 1
             result[key] = int_value(raw[key], f"llm.budgets.{key}", minimum=minimum)
+    for key, _ in PHASE_BUDGETS.values():
+        if result[key] <= 0:
+            raise AgentError(f"llm.budgets.{key} must be greater than zero")
     # Repository configuration may tighten incident breakers, never relax them.
     # Raising these ceilings requires shipping reviewed plugin code, not editing
     # the worktree a worker already controls.
@@ -514,6 +540,29 @@ class UsageLedger:
                 events.append(json.loads(line))
         return events
 
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Read a complete ledger between appends, including concurrent workers."""
+        if not self.path.is_file():
+            return []
+        with self.lock_path.open("a+", encoding="utf-8") as lock:
+            os.chmod(self.lock_path, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+            return self._events()
+
+    @staticmethod
+    def counted_runs(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """Runs with accepted usage or unresolved reservations, never pure rejections.
+
+        A release closes a request, not its whole run: an earlier accepted tool
+        turn must continue to count even if the final request was rejected.
+        """
+        _, pending = UsageLedger._totals(events)
+        runs: dict[str, dict[str, Any]] = {}
+        for event in [*pending.values(), *(e for e in events if e.get("kind") == "usage")]:
+            if event.get("run_id"):
+                runs[str(event.get("logical_review_id") or event["run_id"])] = event
+        return runs
+
     @staticmethod
     def _totals(events: list[dict[str, Any]]) -> tuple[Decimal, dict[str, dict[str, Any]]]:
         spent = Decimal("0")
@@ -533,6 +582,58 @@ class UsageLedger:
     def _matches(event: dict[str, Any], field: str, value: str | None) -> bool:
         return value is not None and str(event.get(field) or "") == value
 
+    @staticmethod
+    def phase_totals(events: list[dict[str, Any]], ticket: str) -> dict[str, dict[str, Decimal]]:
+        totals = {phase: {"spent_usd": Decimal("0"), "reserved_usd": Decimal("0")}
+                  for phase in PHASE_BUDGETS}
+        _, pending = UsageLedger._totals(events)
+        reservations = {e.get("reservation_id"): e for e in events if e.get("kind") == "reservation"}
+        for event in events:
+            if event.get("kind") == "usage" and UsageLedger._matches(event, "ticket", ticket):
+                role = reservations.get(event.get("reservation_id"), {}).get("role") or event.get("role")
+                totals[spending_phase(role)]["spent_usd"] += decimal_value(
+                    event.get("cost_usd", 0), "phase cost")
+        for event in pending.values():
+            if UsageLedger._matches(event, "ticket", ticket):
+                totals[spending_phase(event.get("role"))]["reserved_usd"] += decimal_value(
+                    event.get("projected_cost_usd", 0), "phase reservation")
+        return totals
+
+    @staticmethod
+    def phase_limits(events, ticket, limits):
+        result = {phase: min(decimal_value(limits.get(key, maximum), key), maximum)
+                  for phase, (key, maximum) in PHASE_BUDGETS.items()}
+        transfer = next((e for e in events if e.get("kind") == "design_budget_transferred"
+                         and e.get("ticket") == ticket), None)
+        if transfer:
+            # Reconfiguration may tighten envelopes; never manufacture capacity.
+            amount = min(decimal_value(transfer["amount_usd"], "transfer"),
+                         max(Decimal("0"), result["design"] - decimal_value(transfer["design_spent_usd"], "spent")))
+            result["design"] -= amount
+            result["implementation"] += amount
+        return result
+
+    def transfer_design_budget(self, ticket, limits, receipt):
+        """Close unused design capacity after a controller-verified PASS."""
+        self.directory.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+") as lock:
+            os.chmod(self.lock_path, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            events = self._events()
+            if any(e.get("kind") == "design_budget_transferred" and e.get("ticket") == ticket for e in events):
+                return False
+            totals = self.phase_totals(events, ticket)["design"]
+            if totals["reserved_usd"]:
+                return False  # Uncertain provider work keeps its full reservation.
+            maximum = self.phase_limits(events, ticket, limits)["design"]
+            amount = max(Decimal("0"), maximum - totals["spent_usd"])
+            if amount <= 0:
+                return False
+            self._append_locked(dict(kind="design_budget_transferred", timestamp=utc_now(),
+                ticket=ticket, amount_usd=str(amount), design_spent_usd=str(totals["spent_usd"]),
+                receipt=receipt))
+            return True
+
     def reserve(
         self,
         *,
@@ -544,6 +645,7 @@ class UsageLedger:
         provider: str,
         model: str,
         role: str | None = None,
+        logical_review_id: str | None = None,
     ) -> str:
         self.directory.mkdir(parents=True, exist_ok=True)
         with self.lock_path.open("a+", encoding="utf-8") as lock:
@@ -557,16 +659,12 @@ class UsageLedger:
                 except AuthorityError as exc:
                     raise BudgetError(str(exc)) from exc
             if ticket:
-                counter_pause_reasons = {
-                    "max_model_runs_per_ticket",
-                    "max_reviewer_runs_per_ticket",
-                }
                 cost_pause_indexes = [
                     index
                     for index, event in enumerate(events)
                     if event.get("kind") == "ticket_budget_pause"
                     and self._matches(event, "ticket", ticket)
-                    and str(event.get("reason") or "") not in counter_pause_reasons
+                    and str(event.get("reason") or "") not in TRANSIENT_PAUSE_REASONS
                 ]
                 last_cost_pause = max(cost_pause_indexes, default=-1)
                 last_reset = max(
@@ -584,16 +682,19 @@ class UsageLedger:
                     and authority_ceiling is None
                 ):
                     raise BudgetError(f"ticket_budget_pause is active for {ticket}; operator reset required")
+                # Preserve the independent total execution-attempt breaker:
+                # zero-cost failures must not enable an unbounded retry loop.
                 run_ids = {
                     str(event.get("run_id"))
                     for event in events
                     if event.get("kind") == "reservation"
                     and self._matches(event, "ticket", ticket)
                     and event.get("run_id")
+                    and event.get("role") != "design-reviewer"
                 }
                 is_new_run = run_id not in run_ids
                 max_runs = limits["max_model_runs_per_ticket"]
-                if is_new_run and max_runs and len(run_ids) >= max_runs:
+                if role != "design-reviewer" and is_new_run and max_runs and len(run_ids) >= max_runs:
                     self._append_locked({
                         "kind": "ticket_budget_pause", "timestamp": utc_now(), "ticket": ticket,
                         "run_id": run_id, "reason": "max_model_runs_per_ticket",
@@ -602,16 +703,13 @@ class UsageLedger:
                         f"max_model_runs_per_ticket={max_runs} reached for {ticket}; human action required"
                     )
                 reviewer_run_ids = {
-                    str(event.get("run_id"))
-                    for event in events
-                    if event.get("kind") == "reservation"
-                    and self._matches(event, "ticket", ticket)
+                    run for run, event in self.counted_runs(events).items()
+                    if self._matches(event, "ticket", ticket)
                     and event.get("role") in POST_IMPLEMENTATION_REVIEWER_ROLES
-                    and event.get("run_id")
                 }
                 max_reviewers = limits["max_reviewer_runs_per_ticket"]
                 if (
-                    is_new_run
+                    (logical_review_id or run_id) not in reviewer_run_ids
                     and role in POST_IMPLEMENTATION_REVIEWER_ROLES
                     and max_reviewers
                     and len(reviewer_run_ids) >= max_reviewers
@@ -625,6 +723,19 @@ class UsageLedger:
                         f"review runs reached for {ticket}; "
                         "human action required"
                     )
+            # Operational retries share a review round, but cannot loop forever.
+            if logical_review_id:
+                attempts = {e.get("run_id") for e in events
+                            if e.get("kind") == "reservation"
+                            and e.get("logical_review_id") == logical_review_id}
+                if run_id not in attempts and len(attempts) >= 3:
+                    raise BudgetError("review operational retry ceiling reached")
+                phase_rounds = {identity for identity, event in self.counted_runs(events).items()
+                                if self._matches(event, "ticket", ticket) and event.get("role") == role}
+                if (role in POST_IMPLEMENTATION_REVIEWER_ROLES
+                        and logical_review_id not in phase_rounds
+                        and len(phase_rounds) >= 3):
+                    raise BudgetError(f"{role} logical review round ceiling reached")
             scopes = [
                 ("run_id", run_id, "max_usd_per_run"),
                 ("ticket", ticket, "max_usd_per_ticket"),
@@ -654,7 +765,7 @@ class UsageLedger:
                     Decimal("0"),
                 )
                 if used + reserved + projected > limit:
-                    if ticket and field in {"ticket", "sprint"}:
+                    if ticket and field == "ticket":
                         self._append_locked({
                             "kind": "ticket_budget_pause", "timestamp": utc_now(), "ticket": ticket,
                             "run_id": run_id, "reason": limit_key,
@@ -665,6 +776,18 @@ class UsageLedger:
                         f"${reserved:.6f}, next request up to ${projected:.6f}, limit ${limit:.6f}"
                     )
             if ticket:
+                phase = spending_phase(role)
+                phase_key, default_limit = PHASE_BUDGETS[phase]
+                limit = self.phase_limits(events, ticket, limits)[phase]
+                totals = self.phase_totals(events, ticket)[phase]
+                if totals["spent_usd"] + totals["reserved_usd"] + projected > limit:
+                    # This is request admission pressure, not a sticky ticket
+                    # pause: release/reconciliation may restore capacity and
+                    # another phase can still proceed within its own envelope.
+                    raise BudgetError(
+                        f"{phase_key} would be exceeded for {ticket}: spent "
+                        f"${totals['spent_usd']:.6f}, reserved ${totals['reserved_usd']:.6f}, "
+                        f"next request up to ${projected:.6f}, limit ${limit:.6f}")
                 used = sum(
                     (decimal_value(event.get("cost_usd", 0), "ledger cost") for event in events
                      if event.get("kind") == "usage" and self._matches(event, "ticket", ticket)),
@@ -709,10 +832,12 @@ class UsageLedger:
             reservation_id = "resv_" + uuid.uuid4().hex
             event = {
                 "kind": "reservation",
+                "logical_review_id": logical_review_id,
                 "timestamp": utc_now(),
                 "reservation_id": reservation_id,
                 "run_id": run_id,
                 "role": role,
+                "phase": spending_phase(role),
                 "ticket": ticket,
                 "sprint": sprint,
                 "provider": provider,
@@ -766,6 +891,7 @@ class UsageLedger:
             "reservation_id": reservation_id,
             "run_id": run_id,
             "role": role,
+            "phase": spending_phase(role),
             "ticket": ticket,
             "sprint": sprint,
             "provider": provider,
@@ -780,6 +906,13 @@ class UsageLedger:
             os.chmod(self.lock_path, 0o600)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             events = self._events()
+            reserved = next((e for e in events if e.get("kind") == "reservation"
+                             and e.get("reservation_id") == reservation_id), {})
+            if reserved.get("role"):
+                event["role"] = reserved["role"]
+                event["phase"] = spending_phase(reserved["role"])
+            if reserved.get("logical_review_id"):
+                event["logical_review_id"] = reserved["logical_review_id"]
             existing = next(
                 (
                     item
@@ -1587,6 +1720,7 @@ class ApiAgent:
         reservation = self.ledger.reserve(
             projected=projected,
             limits=self.budgets,
+            logical_review_id=getattr(self, "logical_review_id", None),
             run_id=self.run_id,
             ticket=self.ticket,
             sprint=self.sprint,
@@ -1770,6 +1904,27 @@ class ApiAgent:
         return results
 
     def run(self, request: dict[str, Any]) -> dict[str, Any]:
+        self._active_review_head = ""
+        try:
+            return self._run(request)
+        finally:
+            # Only known terminal outcomes release the phase permit. Transport
+            # ambiguity and asynchronous provider responses remain fenced.
+            if (
+                self._active_review_head
+                and not self.state.get("pending_reservation")
+                and self.state.get("status") in {
+                    "ready", "tool_running", "rejected", "budget_blocked", "invalid_output", "incomplete",
+                }
+            ):
+                cancel_review_permit(
+                    shared_root=self.shared_root,
+                    ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
+                    pr=str(self.review_pr), token=str(self.review_authorization),
+                    role=self.role, head=self._active_review_head, timestamp=utc_now(),
+                )
+
+    def _run(self, request: dict[str, Any]) -> dict[str, Any]:
         if self.provider == "openai":
             strip_openai_cache_request_fields(request)
         request_model = request.get("modelId") if self.provider == "bedrock" else request.get("model")
@@ -1808,7 +1963,6 @@ class ApiAgent:
             request["tool_choice"] = "auto"
             request["parallel_tool_calls"] = False
         reviewer_roles = {"design-reviewer", "code-reviewer", "security-reviewer"}
-        review_head = ""
         if self.role in reviewer_roles:
             if not self.review_authorization or not self.review_pr:
                 raise AgentError("reviewer run requires --review-pr and a ledger-issued --review-authorization")
@@ -1820,7 +1974,7 @@ class ApiAgent:
             except (OSError, subprocess.CalledProcessError) as exc:
                 raise AgentError("cannot bind review authorization to repository HEAD") from exc
             try:
-                consume_review_permit(
+                self.logical_review_id = consume_review_permit(
                     shared_root=self.shared_root,
                     ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
                     pr=self.review_pr,
@@ -1829,7 +1983,7 @@ class ApiAgent:
                 )
             except ReviewPermitError as exc:
                 raise AgentError(str(exc)) from exc
-            review_head = head
+            self._active_review_head = head
         self._save(status="ready", request=request)
         body = request
         transcript: list[dict[str, Any]] = []
@@ -1837,23 +1991,7 @@ class ApiAgent:
             try:
                 response = self._submit(body)
             except BudgetError as exc:
-                if self.role in reviewer_roles:
-                    cancel_review_permit(
-                        shared_root=self.shared_root,
-                        ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
-                        pr=str(self.review_pr), token=str(self.review_authorization),
-                        role=self.role, head=review_head, timestamp=utc_now(),
-                    )
                 self._save(status="budget_blocked", error=str(exc))
-                raise
-            except ProviderHTTPError:
-                if self.role in reviewer_roles and self.state.get("status") == "rejected":
-                    cancel_review_permit(
-                        shared_root=self.shared_root,
-                        ledger_dir=str(self.config.get("review_ledger_dir") or ".orchestration/.review-ledger"),
-                        pr=str(self.review_pr), token=str(self.review_authorization),
-                        role=self.role, head=review_head, timestamp=utc_now(),
-                    )
                 raise
             calls = tool_calls(self.provider, response)
             text = response_text(self.provider, response)
@@ -1885,7 +2023,10 @@ class ApiAgent:
                 }:
                     status = "incomplete"
                 if self.provider == "openai" and response.get("status") != "completed":
-                    status = "incomplete"
+                    status = (
+                        "incomplete" if response.get("status") in {"incomplete", "failed", "cancelled"}
+                        else "needs_reconcile"
+                    )
                 if self.provider in {"azure_adm", "bedrock_mantle"}:
                     choices = response.get("choices") or []
                     if not choices or choices[0].get("finish_reason") != "stop":

@@ -157,3 +157,10 @@ The hook is an optional local guardrail around agent tool calls. The sanctioned
 scripted path enforces the same proof without it. Branch protection remains
 the required out-of-band backstop for direct pushes, GitHub UI merges, or any
 shell that does not run through trusted hooks.
+
+## Native CLI budget enforcement
+
+Controller-managed direct `codex exec` workers can use the shared admission ledger
+through the Responses gateway. This requires API credentials and explicit model
+pricing. See [native worker spending and supervision](sprint-controller.md#native-worker-spending-and-supervision)
+for supported requests, nested launcher behavior, and compatibility limits.

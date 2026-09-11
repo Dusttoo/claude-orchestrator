@@ -77,3 +77,11 @@ State this whenever reporting. The ledger records API-routed roles only. Roles
 left on `execution: desktop` run through the Claude Code or Codex CLI and never
 reach this ledger, so subscription usage is absent from these totals. Never
 present the report as total orchestration spend.
+
+## Sprint completion outcomes
+
+For a configured sprint, also run `../../scripts/sprint-controller.py
+report-outcomes --sprint <id> --verify-merges`. Compare verified unique merges,
+spend per merge, observed decision entries, blocked time, and repeated findings.
+Distinguish reported completion from GitHub-confirmed merging, and disclose missing
+history or failed lookups. These metrics do not grant merge authority.

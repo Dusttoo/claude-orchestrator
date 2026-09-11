@@ -197,6 +197,19 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    most one compact heartbeat per `sprint_status_heartbeat_minutes` (30 by
    default; 0 disables it). A direct status request always runs `summary`.
 
+   `plan.recovery` and `plan.repair` contain mechanically eligible work. Requeue
+   with the current attempt token, re-plan, and resume the preserved branch, PR,
+   and review ledger. Keep `plan.recovery_waiting` units reserved until they exit.
+   Collect `plan.decision_queue` for the final report and keep launching independent
+   tickets; do not repeatedly retry entries that require an operator decision.
+
+   When decomposition returns `readiness_blockers`, preserve the created child
+   keys, sync Jira, and record the decomposition binding before continuing
+   independent work. Include the per-child transition blockers in the final
+   report; do not repeatedly create children to resolve missing workflow fields.
+   The controller releases a downstream parent dependency only after its exact
+   bound child set and prerequisites complete.
+
 8. Run `summary --sprint <id>` and return separate completed, blocked, and
    user-action sections with their reasons, PR/branch, and run references. Report
    any still-running entries. Do not call the Jira sprint complete merely because
