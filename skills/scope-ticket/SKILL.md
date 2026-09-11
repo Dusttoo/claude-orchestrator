@@ -86,8 +86,10 @@ prose:
 {
   "schema_version": 1,
   "ticket": "PROJ-123",
-  "verdict": "ready | decompose | operator_decision",
+  "verdict": "ready | decompose | operator_decision | tracking_parent",
   "complexity_score": 0,
+  "prerequisites": [],
+  "children": [],
   "reasons": ["evidence-based reason"],
   "slices": [
     {
@@ -115,3 +117,14 @@ technical decomposition is not a human decision.
 Each slice must include `migration_owner` (the owning slice ID, or `none` when
 no migration is needed) and a nonempty `test_plan`. These fields are validated
 and copied into the Jira child description.
+
+Before returning `ready`, enumerate every prerequisite found in the ticket text in
+`prerequisites` (an array of ticket keys, empty only when none exist). Compare them
+with the supplied scheduler dependencies. A missing relationship requires dependency
+reconciliation before implementation, never speculative work.
+
+For a tracking parent whose work is entirely owned by its already-existing children,
+return `tracking_parent`, empty `slices`, and `children` containing exactly the
+authenticated child keys. Do not create another decomposition or reserve an
+implementation lane to discover the parent disposition. If the parent has independent
+acceptance criteria beyond those children, do not classify it as tracking-only.

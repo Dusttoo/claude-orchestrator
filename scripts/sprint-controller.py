@@ -35,6 +35,9 @@ from api_agent import (
     AgentError, Pricing, UsageLedger, budgets_from_config, load_yaml,
     TRANSIENT_PAUSE_REASONS, load_orchestration_env, PHASE_BUDGETS,
 )
+from provider_health import ProviderHealth, HealthError, route_identity, validate_native_command, probe
+from context_pipeline import llm_route_from_config
+
 from operator_authority import (
     AuthorityError,
     activate_budget,
@@ -270,6 +273,7 @@ def settings(args: argparse.Namespace) -> dict[str, Any]:
             for x in config_list(config, "sprint_blocked_statuses", DEFAULT_BLOCKED)
         },
         "allow_test_evidence": False,
+        "runtime_admission": True,
     }
 
 
@@ -1259,6 +1263,7 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                         "attempt_token",
                         "history",
                         "attempt_capability",
+                        "reserved_route",
                         "legacy_recovery_pending",
                         "worker_identity",
                         "attach_capability",
@@ -1281,6 +1286,19 @@ def sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
                         fresh["history"].append({"at": now(), "event": "returned-to-query", "status": fresh["raw_status"]})
                     elif refresh_readiness and fresh["raw_status"] != previous.get("raw_status"):
                         fresh["history"].append({"at": now(), "event": "jira-status-refreshed", "status": fresh["raw_status"]})
+                prior_scope = fresh.get("scope_assessment") or {}
+                if (cfg.get("runtime_admission") and fresh["state"] == "operator_decision"
+                        and prior_scope.get("decision_kind") == "dependency_reconciliation"
+                        and prior_scope.get("missing_dependencies")
+                        and set(prior_scope["missing_dependencies"]).issubset(fresh.get("dependencies", []))):
+                    fresh["state"] = "pending"
+                    fresh["reason"] = "authenticated prerequisite relationships reconciled; rescoping required"
+                    fresh["scope_assessment"] = {}
+                    fresh["history"].append({"at": now(), "event": "dependencies-reconciled"})
+                if cfg.get("runtime_admission") and fresh["state"] == "pending":
+                    assessment = fresh.get("scope_assessment") or {}
+                    if assessment.get("inventory_digest") != scope_digest(fresh):
+                        fresh["scope_assessment"] = {}
                 current["tickets"][key] = fresh
             current["project"] = incoming["project"]
             current["sprint"] = incoming["sprint"]
@@ -1317,9 +1335,9 @@ def validated_scope_assessment(
     if normalize_key(raw.get("ticket")) != ticket:
         raise SprintError("scope assessment belongs to a different ticket")
     verdict = str(raw.get("verdict") or "").strip().casefold()
-    if verdict not in {"ready", "decompose", "operator_decision"}:
+    if verdict not in {"ready", "decompose", "operator_decision", "tracking_parent"}:
         raise SprintError(
-            "scope assessment verdict must be ready, decompose, or operator_decision"
+            "scope assessment verdict must be ready, decompose, operator_decision, or tracking_parent"
         )
     score = raw.get("complexity_score")
     if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 100:
@@ -1408,7 +1426,13 @@ def validated_scope_assessment(
         "complexity_score": score,
         "reasons": [item.strip() for item in reasons],
         "slices": slices,
+        "children": raw.get("children", []),
     }
+
+
+def scope_digest(ticket):
+    return hashlib.sha256(json.dumps({k:ticket.get(k) for k in
+        ("description", "summary", "dependencies", "subtasks")},sort_keys=True).encode()).hexdigest()
 
 
 def record_scope(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
@@ -1430,9 +1454,30 @@ def record_scope(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         if not ticket or ticket["state"] not in {"pending", "needs_decomposition"}:
             current = ticket["state"] if ticket else "missing"
             raise SprintError(f"ticket {key} cannot be scoped from state {current}")
+        if cfg.get("runtime_admission") and assessment["verdict"] == "ready":
+            prerequisites = raw.get("prerequisites")
+            if not isinstance(prerequisites, list):
+                raise SprintError("ready scope must explicitly enumerate prerequisites, including an empty list")
+            prerequisites = sorted(set(normalize_key(key) for key in prerequisites))
+            missing = sorted(set(prerequisites) - set(ticket.get("dependencies", [])))
+            if missing:
+                assessment["verdict"] = "operator_decision"
+                assessment["decision_kind"] = "dependency_reconciliation"
+                assessment["missing_dependencies"] = missing
+                assessment["reasons"] = ["dependency reconciliation required before implementation: " + ", ".join(missing)]
+            assessment["prerequisites"] = prerequisites
+        assessment["inventory_digest"] = scope_digest(ticket)
+        if assessment["verdict"] == "tracking_parent":
+            children = assessment.get("children")
+            if not isinstance(children, list) or not children or not all(isinstance(child, str) for child in children) or sorted(children) != sorted(ticket.get("subtasks", [])):
+                raise SprintError("tracking parent assessment must bind every authenticated child exactly once")
         ticket["scope_assessment"] = assessment
         verdict = assessment["verdict"]
-        if verdict == "ready":
+        if verdict == "tracking_parent":
+            ticket["state"] = "decomposed"
+            ticket["decomposition_children"] = sorted(assessment["children"])
+            ticket["reason"] = "existing child chain reconciled by scope assessment"
+        elif verdict == "ready":
             ticket["state"] = "pending"
             ticket["reason"] = "scope assessment passed"
         elif verdict == "decompose":
@@ -1705,7 +1750,28 @@ def spending_admission_reason(ticket, cfg, spend):
     return None
 
 
+def runtime_admission(cfg, role="sprint-worker"):
+    if not cfg.get("runtime_admission"):
+        return None
+    route = llm_route_from_config(cfg["config"], role)
+    if not route.get("model"):
+        return {"provider": route["provider"], "state": "unconfigured", "reason": "explicit role model required"}
+    status = ProviderHealth(cfg["shared_root"]).status(route["provider"], route_identity(route))
+    return {"provider": route["provider"], "role": role, **status} if status["state"] != "healthy" else None
+
+
+def health_check(args, cfg):
+    emit(probe(cfg["shared_root"], cfg["config"], args.role, args.after_repair))
+
+
 def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    runtime_hold = runtime_admission(cfg)
+    scope_hold = runtime_admission(cfg, "ticket-scoper")
+    health_probes = [dict(provider=hold["provider"], role=hold.get("role", "sprint-worker"),
+                         retry_at=max(hold.get("retry_at",0),hold.get("probe_until",0)))
+                     for hold in (runtime_hold, scope_hold) if hold
+                     and hold["state"] in {"unverified", "rate_limited", "transport"}
+                     and hold.get("probe_count",0)<3]
     spend = usage_snapshots(cfg)
     cycles = find_cycles(state["tickets"])
     running = sorted(
@@ -1723,22 +1789,23 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         for ticket in ordered
         if ticket["state"] == "pending"
     }
-    scope = sorted(
+    scope_candidates = sorted(
         ticket["key"]
         for ticket in ordered
         if ticket["state"] == "pending"
         and not admission_reasons[ticket["key"]]
         and not ticket.get("scope_assessment")
-        and cfg["auto_decompose_large_tickets"]
+        and (cfg["auto_decompose_large_tickets"] or cfg.get("runtime_admission"))
         and spend.get(ticket["key"], {}).get("state") != "operator_action"
     )
+    scope = [] if scope_hold else scope_candidates
     ready = [
         ticket["key"]
         for ticket in ordered
         if ticket["state"] == "pending"
         and not admission_reasons[ticket["key"]]
         and (
-            not cfg["auto_decompose_large_tickets"]
+            not (cfg["auto_decompose_large_tickets"] or cfg.get("runtime_admission"))
             or (ticket.get("scope_assessment") or {}).get("verdict") == "ready"
         )
         and spend.get(ticket["key"], {}).get("state") != "operator_action"
@@ -1823,16 +1890,24 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
                     "last_milestone": progress[-1].get("milestone") if progress else None,
                 }
             )
+    needed_roles = set()
+    if ready or repair or recovery or running or retry_waiting:
+        needed_roles.add("sprint-worker")
+    if scope_candidates:
+        needed_roles.add("ticket-scoper")
+    health_probes = [item for item in health_probes if item["role"] in needed_roles]
     return {
         "sprint": state["sprint"],
         "concurrency_max": cfg["concurrency_max"],
         "running": running,
         "needs_reconcile": sorted(running + recovery_waiting),
-        "launch": launch,
+        "launch": [] if runtime_hold else launch,
+        "provider_holds": [hold for hold in (runtime_hold, scope_hold) if hold],
+        "health_probes": health_probes,
         "scope": scope,
         "decomposition": decomposition,
-        "repair": repair,
-        "recovery": recovery,
+        "repair": [] if runtime_hold else repair,
+        "recovery": [] if runtime_hold else recovery,
         "recovery_waiting": recovery_waiting,
         "retry_waiting": retry_waiting,
         "legacy_reconciliation": legacy_reconciliation(state),
@@ -1840,7 +1915,7 @@ def plan_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         "stalled": stalled,
         "waiting": waiting,
         "autonomous_work_remaining": bool(
-            running or launch or scope or decomposition or repair or recovery or recovery_waiting or retry_waiting
+            health_probes or running or (launch and not runtime_hold) or scope or decomposition or (repair and not runtime_hold) or (recovery and not runtime_hold) or recovery_waiting or (retry_waiting and not runtime_hold)
         ),
         "over_capacity": max(0, occupied - cfg["concurrency_max"]),
         "spend": spend,
@@ -1872,6 +1947,11 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     if provider not in {"anthropic", "openai"}:
         raise SprintError("batch provider must be anthropic or openai")
 
+    route = llm_route_from_config(cfg["config"], "sprint-worker") if cfg.get("runtime_admission") else None
+    if route and (route["execution"] != "api" or route["provider"] != provider):
+        raise SprintError("batch provider must match the configured API sprint-worker route")
+    if hold := runtime_admission(cfg):
+        raise SprintError("provider admission held: " + json.dumps(hold, sort_keys=True))
     jobs: dict[str, dict[str, Any]] = {}
     for job in raw_jobs:
         if not isinstance(job, dict):
@@ -1901,6 +1981,8 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             raise SprintError(
                 f"ticket {key} batch {input_key} must be a non-empty array"
             )
+        if route and params.get("model") != route["model"]:
+            raise SprintError("batch model must match the resolved sprint-worker route")
         jobs[key] = params
 
     batch_id = uuid.uuid4().hex[:16]
@@ -1989,6 +2071,8 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             run_ref = marker_job["run_ref"]
             run_id = marker_job["run_id"]
             ticket = state["tickets"][key]
+            if route:
+                ticket["reserved_route"] = route
             ticket["state"] = "running"
             ticket["reason"] = ""
             ticket["run_ref"] = run_ref
@@ -2031,6 +2115,7 @@ def prepare_batch(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         request_sha256 = hashlib.sha256(request_path.read_bytes()).hexdigest()
         marker = {
             "schema_version": 2,
+            "reserved_route": route,
             "batch_id": batch_id,
             "sprint_id": state["sprint"]["id"],
             "provider": provider,
@@ -2182,6 +2267,11 @@ def submit_batch(
         raise SprintError(
             "legacy batch is fenced; run inspect-batch for operator recovery"
         )
+    if cfg.get("runtime_admission"):
+        if marker.get("reserved_route") != llm_route_from_config(cfg["config"], "sprint-worker"):
+            raise SprintError("batch route changed after preparation; reconcile before submission")
+        if hold := runtime_admission(cfg):
+            raise SprintError("provider admission held: " + json.dumps(hold, sort_keys=True))
     receipt = run_batch_adapter(
         "submit", marker_path, cfg, in_process_runner=in_process_runner
     )
@@ -2472,6 +2562,8 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     key = normalize_key(args.ticket)
     if not args.run_ref.strip():
         raise SprintError("run reference must not be empty")
+    if hold := runtime_admission(cfg):
+        raise SprintError("provider admission held: " + json.dumps(hold, sort_keys=True))
     with locked(path):
         state = load(path)
         if key not in state["tickets"]:
@@ -2481,6 +2573,8 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             raise SprintError(
                 f"ticket {key} cannot be reserved from state {ticket['state']}"
             )
+        if cfg.get("runtime_admission") and (ticket.get("scope_assessment") or {}).get("verdict") != "ready":
+            raise SprintError("ticket requires bounded pre-implementation scoping")
         reasons = blockers(state, key, cfg)
         if reasons:
             raise SprintError(f"ticket {key} is blocked: {'; '.join(reasons)}")
@@ -2502,6 +2596,8 @@ def reserve(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             raise SprintError(f"ticket {key} is blocked: {limit_reason}")
         if reason := spending_admission_reason(ticket, cfg, usage_snapshots(cfg).get(key, {})):
             raise SprintError(f"ticket {key} is blocked: {reason}")
+        if cfg.get("runtime_admission"):
+            ticket["reserved_route"] = llm_route_from_config(cfg["config"], "sprint-worker")
         ticket["state"] = "running"
         ticket["reason"] = ""
         ticket["run_ref"] = args.run_ref
@@ -2849,6 +2945,13 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             raise SprintError(
                 "attach capability is missing, stale, or already used for a launch"
             )
+        if cfg.get("runtime_admission"):
+            route = llm_route_from_config(cfg["config"], "sprint-worker")
+            if ticket.get("reserved_route") != route:
+                raise SprintError("reservation route is missing or changed; reconcile before launch")
+            if hold := runtime_admission(cfg):
+                raise SprintError("provider admission held: " + json.dumps(hold, sort_keys=True))
+            command = validate_native_command(command, route)
         invocation_id = uuid.uuid4().hex
         runtime_prefix = cfg["state_dir"] / f"execution-{invocation_id}"
         ready_path = runtime_prefix.with_suffix(".ready.json")
@@ -3532,6 +3635,8 @@ def summary_value(state: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     result["sprint_complete"] = bool(state["tickets"]) and all(dependency_complete(state, key, cfg) for key in state["tickets"])
     result["decision_queue"] = plan["decision_queue"]
     result["legacy_reconciliation"] = plan["legacy_reconciliation"]
+    result["provider_holds"] = plan["provider_holds"]
+    result["health_probes"] = plan["health_probes"]
     result["retry_waiting"] = plan["retry_waiting"]
     result["spend"] = spend
     from sprint_metrics import summarize
@@ -3745,6 +3850,10 @@ def parser() -> argparse.ArgumentParser:
     recover_parser.add_argument("--reason", required=True)
     recover_parser.add_argument("--operator-capability", default="")
     recover_parser.set_defaults(func=recover_legacy)
+    health_parser = commands.add_parser("health-check")
+    health_parser.add_argument("--role", default="sprint-worker")
+    health_parser.add_argument("--after-repair", action="store_true")
+    health_parser.set_defaults(func=health_check)
     return result
 
 
@@ -3754,7 +3863,7 @@ def main() -> int:
         cfg = settings(args)
         args.func(args, cfg)
         return 0
-    except (SprintError, AgentError) as exc:
+    except (SprintError, AgentError, HealthError) as exc:
         print(f"sprint-controller: {exc}", file=sys.stderr)
         return 2
 

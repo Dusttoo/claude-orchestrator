@@ -146,6 +146,10 @@ class BudgetError(AgentError):
     pass
 
 
+class ProviderAdmissionError(AgentError):
+    """Shared admission refused before sending this request to the provider."""
+
+
 class ProviderHTTPError(AgentError):
     def __init__(self, status: int, body: str, retry_after_seconds: float | None = None):
         super().__init__(f"provider returned HTTP {status}: {body[:500]}")
@@ -1582,7 +1586,8 @@ class ApiAgent:
         self.ticket = normalize_ticket_scope(ticket)
         self.sprint = normalize_sprint_scope(sprint)
         self.run_id = run_id
-        self.transport = transport
+        from provider_health import ProviderTransport
+        self.transport = ProviderTransport(self.root, transport)
         self.review_authorization = review_authorization
         self.review_pr = review_pr
         self.attempt_capability = attempt_capability
@@ -1611,7 +1616,7 @@ class ApiAgent:
                     ),
                     token=self.attempt_capability, repository=str(self.shared_root),
                     sprint=self.sprint, ticket=self.ticket, role=self.role,
-                    run_id=self.run_id, worker=self.worker_ref,
+                    run_id=self.run_id, worker=self.worker_ref, route=self.route,
                 )
             except AttemptCapabilityError as exc:
                 raise AgentError(str(exc)) from exc
@@ -1801,6 +1806,10 @@ class ApiAgent:
                         last_retry_delay_seconds=delay,
                     )
                     time.sleep(delay)
+        except ProviderAdmissionError as exc:
+            self.ledger.release(reservation, self.run_id, "shared provider admission refused before submission")
+            self._save(status="rejected", pending_reservation=None, pending_request=None, error=str(exc))
+            raise
         except ProviderHTTPError as exc:
             if (400 <= exc.status < 500 and exc.status not in {408, 409}) or exc.status == 529:
                 self.ledger.release(reservation, self.run_id, f"provider rejected HTTP {exc.status}")

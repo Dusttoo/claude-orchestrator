@@ -81,7 +81,8 @@ class NativeGatewayTests(unittest.TestCase):
             with self.assertRaises(ProviderHTTPError):
                 self.gateway.model_request("anthropic", "/messages", {})
         self.assertTrue(self.gateway.startup_retryable())
-        with patch.object(self.transport, "request", return_value={"id": "accepted"}):
+        # The flag contract also covers another already-admitted response settling.
+        with patch.object(self.gateway.health, "status", return_value={"state":"healthy"}), patch.object(self.transport, "request", return_value={"id": "accepted"}):
             self.gateway.model_request("anthropic", "/messages", {})
         self.assertFalse(self.gateway.startup_retryable())
 

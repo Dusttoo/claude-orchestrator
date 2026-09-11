@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from api_agent import (AgentError, BudgetError, HttpTransport, Pricing,
-                       ProviderHTTPError, UsageLedger, budgets_from_config,
+                       ProviderHTTPError, ProviderAdmissionError, UsageLedger, budgets_from_config,
                        normalize_usage)
 
 
@@ -102,6 +102,8 @@ def stream_events(response):
 class NativeGateway:
     def __init__(self, root: Path, config: dict, ticket: str, sprint: str,
                  run_id: str, transport=None):
+        from provider_health import ProviderHealth
+        self.health = ProviderHealth(root)
         self.config = config
         self.ledger = UsageLedger(root)
         self.limits = budgets_from_config(config)
@@ -123,6 +125,10 @@ class NativeGateway:
         self.stopped.set()
 
     def model_request(self, *args, count_only=False, **kwargs):
+        provider = args[0]
+        status = self.health.status(provider)
+        if status["state"] in {"rate_limited", "authentication", "incompatible", "transport"}:
+            raise ProviderAdmissionError("provider admission held: " + status["state"])
         with self.provider_lock:
             self.provider_inflight += 1
         try:
@@ -131,6 +137,10 @@ class NativeGateway:
                 self.provider_accepted = True  # Includes malformed/unsettled responses.
             return response
         except ProviderHTTPError as exc:
+            if exc.status in {401,403}:
+                self.health.failure(provider, "authentication")
+            elif exc.status in {429,529}:
+                self.health.failure(provider, "rate_limited", getattr(exc, "retry_after_seconds", 30))
             if exc.status in {429, 529}:
                 self.provider_rejected = True
             else:
@@ -187,6 +197,9 @@ class NativeGateway:
             response = self.model_request("anthropic", "/messages",
                 body,
                 idempotency_key=reservation)
+        except ProviderAdmissionError:
+            self.ledger.release(reservation, self.context["run_id"], "shared provider admission refused before submission")
+            raise
         except ProviderHTTPError as exc:
             if exc.status in {400, 401, 403, 404, 413, 422, 429, 529}:
                 self.ledger.release(reservation, self.context["run_id"], "native request rejected")
@@ -248,8 +261,10 @@ class NativeGateway:
                     status = 200
                     content_type = "text/event-stream" if streaming else "application/json"
                 except (AgentError, ValueError, TypeError, KeyError) as exc:
+                    if isinstance(exc, AgentError) and str(exc).startswith(("native Codex gateway supports", "native Codex requires", "native gateway supports")):
+                        gateway.health.failure(gateway.context["provider"], "incompatible")
                     rate_limited = isinstance(exc, ProviderHTTPError) and exc.status in {429, 529}
-                    gateway.stop("provider_rate_limited" if rate_limited else str(exc))
+                    gateway.stop("provider_rate_limited" if rate_limited else "provider_authentication" if isinstance(exc, ProviderHTTPError) and exc.status in {401,403} else str(exc))
                     # A local budget refusal is not an upstream rate limit.
                     status, content_type = (429 if rate_limited else 402 if isinstance(exc, BudgetError) else 502), "application/json"
                     body = json.dumps({"type": "error", "error": {

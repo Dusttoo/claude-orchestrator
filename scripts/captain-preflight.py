@@ -13,6 +13,12 @@ REQUIRED = (
     "scripts/sprint-controller.py",
     "scripts/orchestration-engine.py",
     "scripts/api_agent.py",
+    "scripts/provider_health.py",
+    "scripts/runtime_smoke.py",
+    "scripts/native_gateway.py",
+    "scripts/codex_gateway.py",
+    "scripts/ticket_dependencies.py",
+    "scripts/jira_inventory_fetch.py",
     "skills/orchestrate-sprint/SKILL.md",
     "skills/orchestrate-ticket/SKILL.md",
 )
@@ -23,6 +29,8 @@ def main() -> int:
     parser.add_argument("--plugin-root", required=True)
     parser.add_argument("--repo", default=".")
     parser.add_argument("--host", choices=("claude", "codex"), required=True)
+    parser.add_argument("--verify-runtime", action="store_true", help="Run bounded client and authenticated token-count checks")
+    parser.add_argument("--after-repair", action="store_true", help="Permit a fresh probe after correcting an auth/client incident")
     args = parser.parse_args()
     plugin = Path(args.plugin_root).expanduser().resolve()
     repo = Path(args.repo).expanduser().resolve()
@@ -43,8 +51,20 @@ def main() -> int:
     for relative in REQUIRED:
         digest.update(relative.encode())
         digest.update((plugin / relative).read_bytes())
+    from context_pipeline import llm_route_from_config
+    from provider_health import ProviderHealth, route_identity, probe
+    routes = []
+    for role in ("sprint-worker", "ticket-scoper", "implementer", "design-reviewer", "code-reviewer", "security-reviewer"):
+        route = llm_route_from_config(config, role)
+        status = (probe(repo, config, role, args.after_repair) if args.verify_runtime else
+                  ProviderHealth(repo).status(route["provider"], route_identity(route)))
+        routes.append({"role": role, "provider": route["provider"], "model": route["model"], **status})
+    execution_ready = all(item["state"] == "healthy" for item in routes)
     print(json.dumps({
-        "status": "ready",
+        "status": "ready" if execution_ready else "blocked",
+        "installation_status": "ready",
+        "execution_ready": execution_ready,
+        "routes": routes,
         "captain_mode": "controller-only",
         "host": args.host,
         "plugin_root": str(plugin),
@@ -57,7 +77,7 @@ def main() -> int:
             "launch only the exact orchestrate-ticket skill from this plugin root",
         ],
     }, indent=2))
-    return 0
+    return 0 if execution_ready else 2
 
 
 if __name__ == "__main__":

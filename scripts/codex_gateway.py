@@ -8,7 +8,7 @@ import shlex
 import sys
 from pathlib import Path
 
-from api_agent import AgentError, BudgetError, Pricing, ProviderHTTPError, normalize_usage
+from api_agent import AgentError, BudgetError, Pricing, ProviderHTTPError, ProviderAdmissionError, normalize_usage
 from native_gateway import NativeGateway
 
 
@@ -117,6 +117,9 @@ class CodexGateway(NativeGateway):
             limits=self.limits, model=model, **self.context)
         try:
             response = self.model_request("openai", "responses", body, idempotency_key=reservation)
+        except ProviderAdmissionError:
+            self.ledger.release(reservation, self.context["run_id"], "shared provider admission refused before submission")
+            raise
         except ProviderHTTPError as exc:
             if exc.status in {400, 401, 403, 404, 413, 422, 429}:
                 self.ledger.release(reservation, self.context["run_id"], "native Codex request rejected")
@@ -157,6 +160,8 @@ def launch_arguments(command, endpoint):
         "model_providers.orka_metered.requires_openai_auth": False,
         "model_providers.orka_metered.supports_websockets": False,
         "web_search": "disabled",
+        "service_tier": "default",
+        "features.remote_compaction_v2": False,
     }
     overrides = [part for key, value in settings.items() for part in ("-c", key + "=" + json.dumps(value))]
     # Keep overrides on the exec parser; reject caller routing overrides
@@ -171,7 +176,7 @@ def launch_arguments(command, endpoint):
         elif arg.startswith("-c") and arg != "-c":
             value = arg[2:]
         key = value.split("=", 1)[0].strip() if value else ""
-        if (key == "model_provider" or key.startswith("model_providers") or key == "openai_base_url"
+        if (key == "model_provider" or key.startswith("model_providers") or key in {"openai_base_url", "service_tier", "features.remote_compaction_v2"}
                 or arg in {"--oss", "--local-provider"} or arg.startswith("--local-provider=")):
             raise AgentError("native Codex routing overrides conflict with metered execution")
     return [command[0], command[1], *overrides, *command[2:]]

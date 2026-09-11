@@ -10,8 +10,8 @@ On Linux hosts invoke Python scripts with python3; the python alias may be absen
 normalization, atomic lane reservation, checkpoints, recovery, and summaries.
 
 0. Run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/captain-preflight.py
-   --plugin-root ${CLAUDE_PLUGIN_ROOT} --repo . --host claude`. Continue only
-   when it returns `status: ready` and `captain_mode: controller-only`. If this
+   --plugin-root ${CLAUDE_PLUGIN_ROOT} --repo . --host claude --verify-runtime`. Continue only
+   when it returns `status: ready`, `execution_ready: true`, and `captain_mode: controller-only`. If this
    script or this exact command is absent, stop as `user_action`: never infer the
    plugin purpose, invent a similarly named skill, or operate sprint tickets
    directly. Record its plugin version and runtime fingerprint in the first
@@ -231,3 +231,12 @@ Only the controller can award bounded startup credits using stopped execution
 and gateway evidence. Report its actual stop reason; local budget refusal is not
 an upstream rate limit. Claim completion only when `summary.sprint_complete` is
 true; `finished` / `autonomous_work_exhausted` means authorized work is drained.
+
+Before reserving work, follow the installed `orchestrate-sprint` skill's 1.3.0
+provider-aware admission contract. Run captain preflight with `--verify-runtime`;
+require execution readiness, not installation readiness alone. Process
+`plan.health_probes` at their deadlines, consolidate `provider_holds`, and never
+rotate fresh tickets through a failing provider. Authentication/client incidents
+need an actual repair before `health-check --after-repair`. Scoping and existing
+parent-chain binding precede implementation reservation even when automatic
+decomposition is disabled.

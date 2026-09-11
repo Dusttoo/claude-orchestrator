@@ -11,8 +11,8 @@ owns normalization, lane reservations, checkpoints, and exact summaries so Codex
 and Claude Code follow the same state machine.
 
 Before interpreting the sprint request, run `captain-preflight.py` from this
-exact plugin root with `--repo . --host claude|codex`. Continue only when it
-returns `status: ready` and `captain_mode: controller-only`. If the script or
+exact plugin root with `--repo . --host claude|codex --verify-runtime`. Continue only when it
+returns `status: ready`, `execution_ready: true`, and `captain_mode: controller-only`. Installation readiness alone is insufficient. A failed route probe creates one shared provider hold; do not reserve tickets to test it. If the script or
 this exact skill is absent, stop as `user_action`: never infer the plugin's
 purpose, invent a similarly named skill, or operate sprint tickets directly.
 Record the returned plugin version and runtime fingerprint in the first
@@ -80,9 +80,7 @@ repository config. Caller environment and CLI values cannot replace that policy.
 2. **Derive the complete sprint queries.** The controller-owned adapter builds
    the project/sprint JQL and independent child query from canonical repository
    policy. It requests only `key,summary,status,priority,subtasks,parent,issuelinks`
-   plus the configured sprint field. When automatic decomposition is enabled,
-   it additionally requests and sanitizes `description` for `scope-context`;
-   otherwise description/components remain excluded. The controller-owned adapter passes the compact fields plus
+   plus the configured sprint field. It also requests and sanitizes `description` for bounded admission scoping, regardless of decomposition policy. Components remain excluded. Explicit prerequisite sections contribute dependency edges, with external statuses fetched by the adapter. The controller-owned adapter passes the compact fields plus
    scheduler-required relation and configured `jira_sprint_field` fields, runs
    `context_pipeline.py sanitize-jira`, exhausts pagination, derives exact
    sprint identity, priority, and links, and fetches external dependency status.
@@ -133,8 +131,7 @@ repository config. Caller environment and CLI values cannot replace that policy.
    When `plan.scope` is non-empty, process those tickets before `plan.launch`.
    Read each synchronized body through `scope-context`, send it to the fresh
    `ticket-scoper` using the `scope-ticket` contract, and write its schema-v1 assessment beneath
-   `.orchestration/`, and call `record-scope`. A `ready` result becomes
-   launchable. A `decompose` result enters `plan.decomposition`; when repository
+   `.orchestration/`, and call `record-scope`. A `ready` result must explicitly enumerate `prerequisites` and becomes launchable only when those relationships are already in the authenticated scheduler graph. Missing edges require dependency reconciliation, not an implementation attempt. A `tracking_parent` result binds exactly the existing authenticated `children`; record it through `record-scope` without reserving a ticket worker. A `decompose` result enters `plan.decomposition`; when repository
    policy opted in, run `jira_decomposition.py --apply` with that exact artifact,
    perform a fresh controller-owned Jira sync, then call `record-decomposition`
    with the exact returned child keys. The adapter transitions untouched children to configured ready
@@ -380,3 +377,32 @@ supervisor reason: local budget refusal is not an upstream HTTP 429 incident.
 
 Use summary `sprint_complete` to claim sprint completion. `finished` and
 `autonomous_work_exhausted` only indicate that currently authorized work is drained.
+
+## Provider-aware admission (1.3.0)
+
+Scoping is required independently of the automatic-decomposition setting. Never
+reserve an implementation worker just to classify a tracking parent or discover
+prerequisites. Resolve `ticket-scoper`, run the bounded read-only assessment, and
+record its result. The scoper must retain product decisions and may not invent
+Jira links. Update missing relationships only through repository-authorized Jira
+operations, then perform another authenticated sync.
+
+`plan.provider_holds` describes shared incidents rather than ticket failures.
+Process `plan.health_probes` using `health-check --role <role>` at `retry_at`;
+these probes acquire a provider-wide lease and do not consume ticket attempts.
+After three unsuccessful probes, collect the provider issue once for the operator.
+Authentication and client incompatibility require repair followed by
+`health-check --role <role> --after-repair`; never automatically repeat that flag.
+A healthy cached probe lasts five minutes. Honor the next probe deadline rather
+than rotating new tickets through an outage. Never clear provider state by hand.
+
+Reservations bind the resolved `sprint-worker` route. Launch the matching direct
+Claude or Codex executable with exactly that model. Provider/profile overrides,
+unsupported service tiers, and changed routes are rejected before launch; a
+changed/missing reserved route requires reconciliation. Do not switch providers
+based solely on the interactive host or global default.
+
+Codex uses a named metered provider, standard service tier, and client-side
+compaction through normal Responses requests. Preflight forces a tool call and
+compaction against an offline provider before the authenticated token-count probe.
+It never forwards an unbounded remote compaction endpoint.

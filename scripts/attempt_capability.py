@@ -14,7 +14,7 @@ class AttemptCapabilityError(RuntimeError):
 
 def validate(
     *, state_dir: Path, token: str, repository: str, sprint: str,
-    ticket: str, role: str, run_id: str, worker: str,
+    ticket: str, role: str, run_id: str, worker: str, route: dict | None = None,
 ) -> None:
     matches: list[tuple[Path, dict]] = []
     for path in state_dir.glob("*.json"):
@@ -45,3 +45,8 @@ def validate(
             raise AttemptCapabilityError("attempt capability is stale or does not match the active lane")
         if current.get("attempt") != item.get("attempts"):
             raise AttemptCapabilityError("attempt capability is not bound to the current attempt number")
+
+        if route is not None and item.get("reserved_route") is not None:
+            from provider_health import route_identity
+            if route_identity(route) != route_identity(item["reserved_route"]):
+                raise AttemptCapabilityError("worker route differs from its reserved attempt")

@@ -22,6 +22,8 @@ args = controller.parser().parse_args(sys.argv[1:])
 try:
     config = controller.settings(args)
     config["allow_test_evidence"] = True
+    # Scheduling fixtures have no real provider; production CLI always enforces health.
+    config["runtime_admission"] = False
     args.func(args, config)
 except controller.SprintError as exc:
     print(f"sprint-controller test driver: {exc}", file=sys.stderr)
