@@ -35,6 +35,8 @@ from review_permit import (
     consume_completion,
     subject_ledger_candidates,
 )
+from operator_authority import AuthorityError, restart_grant as authorized_restart_grant
+
 from runtime_state import (
     RuntimeStateError,
     canonical_config_path,
@@ -457,11 +459,26 @@ def redesign_pending(state: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def restart_limits(state):
+    subject = state.get("work_subject") or {}
+    if subject.get("kind") != "jira":
+        return {}
+    repository = shared_repository_root(project_root()).resolve()
+    if subject.get("repository") != str(repository):
+        raise LedgerError("restart authority requires this repository's immutable work subject")
+    try:
+        grant = authorized_restart_grant(repository, subject["id"])
+    except AuthorityError as exc:
+        raise LedgerError(str(exc)) from exc
+    return grant["allowances"] if grant else {}
+
+
 def decide(state: dict[str, Any]) -> dict[str, Any]:
     """Derive the loop's next action. Precedence: clear > escalate > redesign > review."""
     recorded = len(state["rounds"])
     next_round = recorded + 1
-    max_rounds = state["max_rounds"]
+    restart = restart_limits(state)
+    max_rounds = max(state["max_rounds"], restart.get("repair_cycles", 0))
     # New ledgers count explicit completed repairs. Old v0.7 ledgers did not
     # record them, so retain their historical failed-pass count on load.
     if "repair_attempts" in state:
@@ -487,7 +504,7 @@ def decide(state: dict[str, Any]) -> dict[str, Any]:
     cap_reached = not pending_review and fix_cycles >= max_rounds and bool(blocking)
     if gates_clear:
         action = ACTION_CLEAR
-    elif state.get("escalated") or cap_reached:
+    elif (state.get("escalated") and not restart) or cap_reached:
         action = ACTION_ESCALATE
     elif pending:
         action = ACTION_REDESIGN
@@ -696,10 +713,9 @@ def cmd_record(args: argparse.Namespace) -> None:
         plan = decide(state)
         if plan["next_action"] == ACTION_ESCALATE:
             raise LedgerError(
-                f"PR {state['pr']} spent its {state['max_rounds']} fix cycles with "
+                f"PR {state['pr']} spent its {plan['max_rounds']} fix cycles with "
                 f"{len(plan['open_blocking'])} blocking component(s) still open. Hand it to a "
-                f"human (`handoff {state['pr']}`), or raise the cap deliberately with "
-                f"`open {state['pr']} --max-rounds N`."
+                f"human (`handoff {state['pr']}`), or request a root-issued ticket restart allowance."
             )
         if args.verdict == "PASS" and args.blocking:
             raise LedgerError(
@@ -1094,17 +1110,19 @@ def _design_state(
 def _design_plan(state: dict[str, Any]) -> dict[str, Any]:
     design = _design_state(state)
     rounds = design["rounds"]
+    restart = restart_limits(state)
+    maximum = max(design["max_rounds"], restart.get("design_rounds", 0))
     if rounds and rounds[-1]["verdict"] == "PASS":
         action = "implement"
-    elif design.get("escalated") or len(rounds) >= design["max_rounds"]:
+    elif (design.get("escalated") and not restart) or len(rounds) >= maximum:
         action = ACTION_ESCALATE
     else:
         action = "redesign"
     return {
         "target": state["pr"],
         "design_rounds": len(rounds),
-        "max_design_rounds": design["max_rounds"],
-        "design_rounds_remaining": max(0, design["max_rounds"] - len(rounds)),
+        "max_design_rounds": maximum,
+        "design_rounds_remaining": max(0, maximum - len(rounds)),
         "next_action": action,
     }
 
@@ -1428,7 +1446,7 @@ def cmd_handoff(args: argparse.Namespace) -> None:
     lines += [
         "",
         "## Options",
-        "- Fix the remaining components yourself and re-open the ledger with a raised cap.",
+        "- Request a root-issued ticket restart allowance; reopening cannot raise stored caps.",
         "- Accept the advisories as follow-up tickets and merge if the blocking set is",
         "  actually empty.",
         "- Return the ticket to scoping: repeated strikes on one component usually mean",

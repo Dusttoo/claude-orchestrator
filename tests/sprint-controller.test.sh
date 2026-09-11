@@ -81,6 +81,7 @@ assert isinstance(scope,dict)
 assert re.fullmatch(r'[A-Z][A-Z0-9_]*-[0-9]+',str(scope.get('ticket') or ''))
 PY
 case "$command" in
+  restart-grant) exit 3 ;;
   budget-ceiling)
     [ -f "${ORCHESTRATION_TEST_BUDGET_ACTIVE:?}" ] || exit 3
     cat "$ORCHESTRATION_TEST_BUDGET_ACTIVE"
@@ -438,7 +439,7 @@ else
   fail_case "external authority recovers a terminal lane with no retained attempt token over stdin"
 fi
 "$CONTROLLER" plan --sprint 47 > "$TMP/terminal-plan.json"
-json_check "authorized terminal lane is launchable below its granted ceiling" "$TMP/terminal-plan.json" '"PROJ-61" in data["launch"] and data["spend"]["PROJ-61"]["state"] != "operator_action"'
+json_check "budget grant does not erase a stalled-progress hold" "$TMP/terminal-plan.json" '"PROJ-61" not in data["launch"] and data["spend"]["PROJ-61"]["state"] != "operator_action" and any("max_usd_without_progress" in reason for item in data["waiting"] if item["key"] == "PROJ-61" for reason in item["reasons"])'
 run_fail "terminal recovery capability is one-shot" "$CONTROLLER" recover-terminal --sprint 47 --ticket PROJ-61 --reason replay --operator-capability terminal-recovery-once
 
 python3 - "$TMP/repo/.orchestration/.sprint-state" <<'PY'
@@ -446,6 +447,8 @@ import json,sys
 from pathlib import Path
 path=next(Path(sys.argv[1]).glob('47-*.json'))
 state=json.loads(path.read_text()); state['tickets']['PROJ-61']['attempts']=3
+# Fixture a previously verified milestone so this section isolates launch ceilings.
+state['tickets']['PROJ-61']['progress']=[{'milestone':'implementation_commit','verified':True,'spent_usd':20.10}]
 path.write_text(json.dumps(state)+'\n')
 PY
 "$CONTROLLER" plan --sprint 47 > "$TMP/relaunch-before.json"

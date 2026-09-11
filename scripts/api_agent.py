@@ -31,7 +31,7 @@ from typing import Any
 
 import context_pipeline
 from attempt_capability import AttemptCapabilityError, validate as validate_attempt_capability
-from operator_authority import AuthorityError, budget_ceiling as authorized_budget_ceiling
+from operator_authority import AuthorityError, budget_ceiling as authorized_budget_ceiling, restart_grant as authorized_restart_grant
 from review_permit import (
     ReviewPermitError,
     cancel_started as cancel_review_permit,
@@ -464,8 +464,8 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
         if result[key] <= 0:
             raise AgentError(f"llm.budgets.{key} must be greater than zero")
     # Repository configuration may tighten incident breakers, never relax them.
-    # Raising these ceilings requires shipping reviewed plugin code, not editing
-    # the worktree a worker already controls.
+    # Ticket-specific host grants are applied separately at admission; editing
+    # the worktree cannot raise these defaults or shared/per-run ceilings.
     for key, maximum in NON_OVERRIDABLE_MAXIMA.items():
         configured = result[key]
         result[key] = maximum if not configured else min(configured, maximum)
@@ -653,9 +653,16 @@ class UsageLedger:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             events = self._events()
             authority_ceiling: Decimal | None = None
+            try:
+                restart = authorized_restart_grant(self.root, ticket) if ticket else None
+            except AuthorityError as exc:
+                raise BudgetError(str(exc)) from exc
+            allowances = restart["allowances"] if restart else {}
             if ticket:
                 try:
                     authority_ceiling = authorized_budget_ceiling(self.root, ticket)
+                    if restart:
+                        authority_ceiling = max(authority_ceiling or Decimal("0"), Decimal(allowances["ticket_usd"]))
                 except AuthorityError as exc:
                     raise BudgetError(str(exc)) from exc
             if ticket:
@@ -693,7 +700,7 @@ class UsageLedger:
                     and event.get("role") != "design-reviewer"
                 }
                 is_new_run = run_id not in run_ids
-                max_runs = limits["max_model_runs_per_ticket"]
+                max_runs = max(limits["max_model_runs_per_ticket"], allowances.get("model_runs", 0))
                 if role != "design-reviewer" and is_new_run and max_runs and len(run_ids) >= max_runs:
                     self._append_locked({
                         "kind": "ticket_budget_pause", "timestamp": utc_now(), "ticket": ticket,
@@ -707,7 +714,7 @@ class UsageLedger:
                     if self._matches(event, "ticket", ticket)
                     and event.get("role") in POST_IMPLEMENTATION_REVIEWER_ROLES
                 }
-                max_reviewers = limits["max_reviewer_runs_per_ticket"]
+                max_reviewers = max(limits["max_reviewer_runs_per_ticket"], allowances.get("review_runs", 0))
                 if (
                     (logical_review_id or run_id) not in reviewer_run_ids
                     and role in POST_IMPLEMENTATION_REVIEWER_ROLES
@@ -734,7 +741,7 @@ class UsageLedger:
                                 if self._matches(event, "ticket", ticket) and event.get("role") == role}
                 if (role in POST_IMPLEMENTATION_REVIEWER_ROLES
                         and logical_review_id not in phase_rounds
-                        and len(phase_rounds) >= 3):
+                        and len(phase_rounds) >= max(3, allowances.get("security_rounds" if role == "security-reviewer" else "code_rounds", 0))):
                     raise BudgetError(f"{role} logical review round ceiling reached")
             scopes = [
                 ("run_id", run_id, "max_usd_per_run"),
@@ -778,7 +785,7 @@ class UsageLedger:
             if ticket:
                 phase = spending_phase(role)
                 phase_key, default_limit = PHASE_BUDGETS[phase]
-                limit = self.phase_limits(events, ticket, limits)[phase]
+                limit = max(self.phase_limits(events, ticket, limits)[phase], Decimal(allowances.get(phase + "_usd", "0")))
                 totals = self.phase_totals(events, ticket)[phase]
                 if totals["spent_usd"] + totals["reserved_usd"] + projected > limit:
                     # This is request admission pressure, not a sticky ticket

@@ -146,3 +146,11 @@ Resist raising it as a reflex. A ticket that repeatedly burns the cap is usually
 telling you the acceptance criteria are too vague to test against -- the same
 signal a component collecting strikes gives. Scope the ticket harder instead;
 that is cheaper than another three rounds.
+
+
+A root-issued ticket restart allowance can authorize higher absolute design and
+repair caps without rewriting the ledger. The authority is checked when deriving
+a review plan or issuing a phase permit; expiry/revocation restores the stored
+caps. Failed verdicts, findings, repair histories, and outstanding phase permits
+remain intact. Reopening with a larger CLI cap cannot substitute for authority.
+See [restart allowances](sprint-controller.md#restart-allowances-and-legacy-reconciliation).

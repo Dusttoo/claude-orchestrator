@@ -311,6 +311,54 @@ class ResilienceTests(unittest.TestCase):
                 self.sync_fixture(fresh)
                 self.assertEqual(self.state["tickets"]["PROJ-1"]["state"], status)
 
+    def excluded_ticket(self, **extra):
+        return self.ticket("PROJ-1", "user_action", **{
+            "raw_status": "Ready", "attempt_token": "", "branch": "", "pr": "", "run_ref": "",
+            "reason": "ticket disappeared from the refreshed Jira sprint query",
+            "history": [{"event": "removed-from-query"}], **extra,
+        })
+
+    def test_returning_inventory_refreshes_ready_done_and_nonready_tickets(self):
+        for status in ("Ready", "Done", "To Do", "Blocked"):
+            with self.subTest(status=status):
+                self.excluded_ticket()
+                controller.save(controller.state_path(self.cfg["state_dir"], "1"), self.state)
+                fresh = copy.deepcopy(self.state)
+                expected = controller.initial_state(status, self.cfg)
+                fresh["tickets"]["PROJ-1"].update(raw_status=status, state=expected[0], reason=expected[1], history=[])
+                self.sync_fixture(fresh)
+                actual = self.state["tickets"]["PROJ-1"]
+                self.assertEqual((actual["state"], actual["reason"]), expected)
+                self.assertEqual(actual["history"][-1]["event"], "returned-to-query")
+                self.sync_fixture(fresh)
+                self.assertEqual(len(self.state["tickets"]["PROJ-1"]["history"]), 2)
+
+    def test_returning_inventory_preserves_execution_and_decision_evidence(self):
+        for evidence in ({"attempts": 1}, {"attempt_token": "fenced"}, {"pr": "123"},
+                         {"worker_identity": {"kind": "execution_unit"}},
+                         {"scope_assessment": {"verdict": "operator_decision"}},
+                         {"history": [{"event": "removed-from-query"}, {"event": "finished"}]},
+                         {"history": []}):
+            with self.subTest(evidence=evidence):
+                previous = copy.deepcopy(self.excluded_ticket(**evidence))
+                controller.save(controller.state_path(self.cfg["state_dir"], "1"), self.state)
+                fresh = copy.deepcopy(self.state)
+                fresh["tickets"]["PROJ-1"].update(state="pending", reason="", history=[])
+                self.sync_fixture(fresh)
+                actual = self.state["tickets"]["PROJ-1"]
+                self.assertEqual((actual["state"], actual["reason"]), (previous["state"], previous["reason"]))
+
+    def test_returning_ready_ticket_still_obeys_dependencies(self):
+        self.excluded_ticket(dependencies=["PROJ-2"])
+        self.ticket("PROJ-2", "blocked")
+        controller.save(controller.state_path(self.cfg["state_dir"], "1"), self.state)
+        fresh = copy.deepcopy(self.state)
+        fresh["tickets"]["PROJ-1"].update(state="pending", reason="", history=[])
+        self.sync_fixture(fresh)
+        plan = controller.plan_value(self.state, self.cfg)
+        self.assertNotIn("PROJ-1", plan["launch"])
+        self.assertIn("PROJ-1", [item["key"] for item in plan["waiting"]])
+
 
 if __name__ == "__main__":
     unittest.main()

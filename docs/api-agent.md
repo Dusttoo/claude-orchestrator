@@ -128,7 +128,7 @@ run ID do not consume extra run slots. Repository configuration may
 tighten the compiled incident ceilings but cannot raise or disable them. There
 is deliberately no same-user CLI approval bypass.
 
-A host operator may authorize one ticket to continue to an exact absolute
+With `issue-budget`, a host operator may authorize one ticket to continue to an exact absolute
 ceiling with the separately installed root authority. This raises only that
 ticket's cost pause and hard ticket-cost ceiling; model-run and
 post-implementation-reviewer-run,
@@ -282,3 +282,10 @@ identifies the original role. Direct native Claude launches currently charge the
 entire process tree to implementation; they do not self-declare review phases.
 Sprint summaries expose spent, reserved, remaining, and exhausted capacity for
 each phase using a consistent locked ledger snapshot.
+
+
+For a coordinated continuation across phase dollars and execution/review counts,
+use the root-issued restart allowance documented in [Sprint controller](sprint-controller.md#restart-allowances-and-legacy-reconciliation).
+Each granted value is an absolute lifetime ceiling, checked at admission against
+the live host authority. Old usage and reservations are never removed. Per-run,
+sprint-wide, token/tool, and uncertain-provider-work safeguards still apply.
