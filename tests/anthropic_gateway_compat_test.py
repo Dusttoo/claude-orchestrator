@@ -35,6 +35,7 @@ class CompatibilityTests(unittest.TestCase):
         ):
             HttpTransport().request("anthropic", "/messages", payload)
             request = send.call_args.args[0]
+            self.assertEqual(send.call_args.kwargs["timeout"], 900)
             self.assertEqual(
                 request.get_header("Anthropic-beta"), "context-management-2025-06-27"
             )

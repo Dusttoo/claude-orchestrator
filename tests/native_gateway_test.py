@@ -55,6 +55,19 @@ class NativeGatewayTests(unittest.TestCase):
                                    pause_usd_per_ticket=Decimal(".3"))
         self.payload = {"model": "test", "messages": [], "max_tokens": 100}
 
+    def test_native_gateway_uses_configured_provider_read_timeout(self):
+        config = {
+            "llm": {
+                "budgets": {"provider_read_timeout_seconds": 811},
+            }
+        }
+        with patch.object(native_gateway, "HttpTransport") as transport:
+            gateway = NativeGateway(
+                self.root, config, "T-2", "1", "configured-timeout"
+            )
+        transport.assert_called_once_with(timeout=811)
+        self.assertIs(gateway.transport, transport.return_value)
+
     def test_http_gateway_authenticates_and_signals_budget_stop(self):
         endpoint = self.gateway.start()
         self.addCleanup(self.gateway.close)
