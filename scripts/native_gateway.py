@@ -14,7 +14,7 @@ from pathlib import Path
 
 from api_agent import (AgentError, BudgetError, HttpTransport, Pricing,
                        ProviderHTTPError, ProviderAdmissionError, UsageLedger, budgets_from_config,
-                       normalize_usage)
+                       normalize_usage, anthropic_context_beta)
 
 
 def claude_child_environment(environment, token, endpoint):
@@ -113,6 +113,8 @@ class NativeGateway:
         self.token = secrets.token_urlsafe(32)
         self.stopped = threading.Event()
         self.reason = ""
+        self.stop_error = None
+        self.stop_lock = threading.Lock()
         self.server = None
         self.provider_accepted = False
         self.provider_uncertain = False
@@ -120,9 +122,17 @@ class NativeGateway:
         self.provider_inflight = 0
         self.provider_lock = threading.Lock()
 
-    def stop(self, reason):
-        self.reason = reason
-        self.stopped.set()
+    def stop(self, reason, error=None):
+        # Preserve the first failure when concurrent/retried requests arrive.
+        with self.stop_lock:
+            if not self.stopped.is_set():
+                self.reason = reason
+                self.stop_error = error
+                self.stopped.set()
+
+    def raise_if_stopped(self):
+        if self.stopped.is_set():
+            raise self.stop_error if self.stop_error is not None else AgentError(self.reason)
 
     def model_request(self, *args, count_only=False, **kwargs):
         provider = args[0]
@@ -141,6 +151,8 @@ class NativeGateway:
                 self.health.failure(provider, "authentication")
             elif exc.status in {429,529}:
                 self.health.failure(provider, "rate_limited", getattr(exc, "retry_after_seconds", 30))
+            if exc.status == 400 and "context_management" in exc.body:
+                self.health.failure(provider, "incompatible")
             if exc.status in {429, 529}:
                 self.provider_rejected = True
             else:
@@ -159,8 +171,8 @@ class NativeGateway:
                     and not self.provider_uncertain and self.provider_inflight == 0)
 
     def request(self, path, payload):
-        if self.stopped.is_set():
-            raise BudgetError(self.reason)
+        self.raise_if_stopped()
+        anthropic_context_beta(payload)
         if path not in {"/v1/messages", "/v1/messages/count_tokens"}:
             raise AgentError("unsupported native gateway endpoint")
         model = payload.get("model", "")
@@ -264,9 +276,9 @@ class NativeGateway:
                     if isinstance(exc, AgentError) and str(exc).startswith(("native Codex gateway supports", "native Codex requires", "native gateway supports")):
                         gateway.health.failure(gateway.context["provider"], "incompatible")
                     rate_limited = isinstance(exc, ProviderHTTPError) and exc.status in {429, 529}
-                    gateway.stop("provider_rate_limited" if rate_limited else "provider_authentication" if isinstance(exc, ProviderHTTPError) and exc.status in {401,403} else str(exc))
+                    gateway.stop("provider_rate_limited" if rate_limited else "provider_authentication" if isinstance(exc, ProviderHTTPError) and exc.status in {401,403} else str(exc), error=exc)
                     # A local budget refusal is not an upstream rate limit.
-                    status, content_type = (429 if rate_limited else 402 if isinstance(exc, BudgetError) else 502), "application/json"
+                    status, content_type = (exc.status if isinstance(exc, ProviderHTTPError) else 402 if isinstance(exc, BudgetError) else 502), "application/json"
                     body = json.dumps({"type": "error", "error": {
                         "type": "budget_error" if isinstance(exc, BudgetError) else "api_error",
                         "message": "Native gateway stopped this lane; inspect its supervisor record."}}).encode()

@@ -651,3 +651,19 @@ subtasks binds the existing chain as `decomposed`, without implementation attemp
 or new Jira children. Use this only when children own all parent acceptance
 criteria. Changed description, summary, dependencies, or subtasks invalidate a
 pending scope assessment on the next sync.
+
+
+## Anthropic compatibility and failure reporting (1.3.1)
+
+The interactive controller host does not select the worker provider. A Codex
+captain with an Anthropic desktop worker route launches Claude through the native
+gateway. For supported `context_management` edits, the credential-owning HTTP
+transport derives the required context-management beta header; it does not
+forward arbitrary client headers. Supported edits clear tool results or thinking
+blocks. Server-side compaction is rejected because it lacks gateway accounting.
+See [Anthropic context editing](https://platform.claude.com/docs/en/build-with-claude/context-editing).
+
+The first stopped-gateway failure retains its original exception classification
+and upstream HTTP status. Only an actual local `BudgetError` becomes a local 402.
+A compatibility rejection involving `context_management` holds the provider;
+repair and an explicit readiness probe are required before more ticket launches.
