@@ -109,7 +109,13 @@ class NativeGateway:
         self.limits = budgets_from_config(config)
         self.context = dict(ticket=ticket, sprint=sprint, run_id=run_id,
                             provider="anthropic", role="implementer")
-        self.transport = transport or HttpTransport()
+        self.transport = (
+            transport
+            if transport is not None
+            else HttpTransport(
+                timeout=self.limits["provider_read_timeout_seconds"]
+            )
+        )
         self.token = secrets.token_urlsafe(32)
         self.stopped = threading.Event()
         self.reason = ""

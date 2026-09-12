@@ -100,6 +100,7 @@ TRANSIENT_PAUSE_REASONS = {
     "max_model_runs_per_ticket", "max_reviewer_runs_per_ticket",
     "max_usd_per_sprint",
 }
+DEFAULT_PROVIDER_READ_TIMEOUT_SECONDS = 900
 DEFAULT_BUDGETS = {
     "max_usd_per_run": Decimal("10.00"),
     "max_usd_per_ticket": Decimal("30.00"),
@@ -112,6 +113,7 @@ DEFAULT_BUDGETS = {
     "max_tool_rounds": 8,
     "max_tool_output_chars": 12000,
     "tool_timeout_seconds": 300,
+    "provider_read_timeout_seconds": DEFAULT_PROVIDER_READ_TIMEOUT_SECONDS,
     "max_pre_ack_retries": 2,
     "max_rate_limit_retries": 8,
     "max_rate_limit_wait_seconds": 600,
@@ -450,6 +452,7 @@ def budgets_from_config(config: dict[str, Any]) -> dict[str, Any]:
         "max_tool_rounds",
         "max_tool_output_chars",
         "tool_timeout_seconds",
+        "provider_read_timeout_seconds",
         "max_pre_ack_retries",
         "max_rate_limit_retries",
         "max_rate_limit_wait_seconds",
@@ -997,7 +1000,11 @@ def anthropic_context_beta(payload):
 
 
 class HttpTransport:
-    def __init__(self, timeout: int = 120, bedrock_client: Any | None = None):
+    def __init__(
+        self,
+        timeout: int = DEFAULT_PROVIDER_READ_TIMEOUT_SECONDS,
+        bedrock_client: Any | None = None,
+    ):
         self.timeout = timeout
         self._bedrock_client = bedrock_client
 
@@ -1580,7 +1587,7 @@ class ApiAgent:
         ticket: str | None,
         sprint: str | None,
         run_id: str,
-        transport: HttpTransport | Any,
+        transport: HttpTransport | Any | None,
         review_authorization: str | None = None,
         review_pr: str | None = None,
         attempt_capability: str | None = None,
@@ -1602,14 +1609,21 @@ class ApiAgent:
         self.ticket = normalize_ticket_scope(ticket)
         self.sprint = normalize_sprint_scope(sprint)
         self.run_id = run_id
+        self.budgets = budgets_from_config(self.config)
         from provider_health import ProviderTransport
-        self.transport = ProviderTransport(self.root, transport)
+        self.transport = ProviderTransport(
+            self.root,
+            transport
+            if transport is not None
+            else HttpTransport(
+                timeout=self.budgets["provider_read_timeout_seconds"]
+            ),
+        )
         self.review_authorization = review_authorization
         self.review_pr = review_pr
         self.attempt_capability = attempt_capability
         self.worker_ref = worker_ref or run_id
         self.pricing = Pricing.from_config(self.config, self.model)
-        self.budgets = budgets_from_config(self.config)
         # Tool execution stays sandboxed to this worktree; spend accounting and
         # run state are repository-wide so concurrent lanes share one ceiling.
         self.shared_root = shared_repository_root(self.root)
@@ -2556,7 +2570,7 @@ def main() -> int:
                 ticket=args.ticket,
                 sprint=args.sprint,
                 run_id=run_id,
-                transport=HttpTransport(),
+                transport=None,
                 review_authorization=args.review_authorization,
                 review_pr=args.review_pr,
                 attempt_capability=args.attempt_capability,

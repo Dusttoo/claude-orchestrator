@@ -114,6 +114,7 @@ llm:
     max_tool_rounds: 3
     max_tool_output_chars: 2000
     tool_timeout_seconds: 10
+    provider_read_timeout_seconds: 777
     max_pre_ack_retries: 2
     retry_backoff_seconds: 0
   pricing:
@@ -1191,6 +1192,7 @@ self_check:
         self.assertEqual(legacy["max_model_runs_per_ticket"], 12)
         self.assertEqual(legacy["max_reviewer_runs_per_ticket"], 6)
         self.assertEqual(legacy["pause_usd_per_ticket"], api_agent.Decimal("20"))
+        self.assertEqual(legacy["provider_read_timeout_seconds"], 900)
         raised = api_agent.budgets_from_config({"llm": {"budgets": {
             "max_usd_per_run": 999, "max_usd_per_ticket": 999,
             "max_usd_per_sprint": 9999, "pause_usd_per_ticket": 998,
@@ -1201,6 +1203,22 @@ self_check:
         self.assertEqual(raised["pause_usd_per_ticket"], api_agent.Decimal("20"))
         self.assertEqual(raised["max_model_runs_per_ticket"], 12)
         self.assertEqual(raised["max_reviewer_runs_per_ticket"], 6)
+
+    def test_direct_api_agent_uses_configured_provider_read_timeout(self):
+        permit = self.phase_permit()
+        with mock.patch.object(api_agent, "HttpTransport") as transport:
+            api_agent.ApiAgent(
+                root=self.root,
+                config_path=self.config(),
+                role="code-reviewer",
+                ticket="PROJ-1",
+                sprint="SPRINT-1",
+                run_id="configured-provider-timeout",
+                transport=None,
+                review_authorization=permit,
+                review_pr="1",
+            )
+        transport.assert_called_once_with(timeout=777)
 
     def test_free_form_accounting_scopes_fail_closed(self):
         with self.assertRaisesRegex(api_agent.AgentError, "canonical Jira key"):

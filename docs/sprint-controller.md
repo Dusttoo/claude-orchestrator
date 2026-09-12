@@ -667,3 +667,18 @@ The first stopped-gateway failure retains its original exception classification
 and upstream HTTP status. Only an actual local `BudgetError` becomes a local 402.
 A compatibility rejection involving `context_management` holds the provider;
 repair and an explicit readiness probe are required before more ticket launches.
+
+## Provider response timeouts (1.3.2)
+
+`llm.budgets.provider_read_timeout_seconds` independently bounds each upstream
+model response. It defaults to 900 seconds for both direct API agents and the
+native Claude admission gateway. `tool_timeout_seconds` continues to govern only
+repository tool commands and does not shorten model generation.
+
+The native gateway currently obtains a complete, non-streaming provider response
+before returning Anthropic-compatible streaming events to Claude Code. Large
+contexts, high reasoning, and large output caps can therefore legitimately take
+longer than two minutes without producing an upstream byte. The provider timeout
+remains finite and the worker supervisor provides an additional outer lifetime
+bound. If the timeout does expire after submission, Orka keeps the reservation
+for reconciliation and does not blindly retry potentially billed work.

@@ -80,6 +80,14 @@ reservation and client request id. Explicit overload rejections use the smaller
 `max_pre_ack_retries` policy. The runner never retries a model submission
 timeout or another ambiguous transport/server outcome.
 
+`llm.budgets.provider_read_timeout_seconds` controls how long Orka waits for one
+upstream model response and defaults to 900 seconds. This is separate from
+`tool_timeout_seconds`, which applies only to repository commands. The longer
+provider window is especially important for non-streaming native Claude turns
+with large contexts, high reasoning, or large output caps. If the provider
+window still expires after submission, Orka preserves the reservation for
+reconciliation instead of submitting a potentially duplicate billed request.
+
 Rate-limit retries preserve a ticket lane instead of losing its checkpoint, but
 they do not create throughput. Size TPM for the configured concurrency and keep
 `max_completion_tokens` close to expected output because Azure may include the
