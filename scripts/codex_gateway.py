@@ -84,8 +84,7 @@ class CodexGateway(NativeGateway):
         return response_events(response)
 
     def request(self, path, payload):
-        if self.stopped.is_set():
-            raise BudgetError(self.reason)
+        self.raise_if_stopped()
         if path != "/v1/responses":
             raise AgentError("native Codex gateway supports /v1/responses only; compaction and other endpoints are not metered")
         if (payload.get("background") or payload.get("previous_response_id") or payload.get("conversation")

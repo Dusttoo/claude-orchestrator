@@ -982,6 +982,20 @@ class UsageLedger:
         }
 
 
+def anthropic_context_beta(payload):
+    """Enable only context editing that cannot introduce extra generation turns."""
+    if "context_management" not in payload:
+        return None
+    context = payload["context_management"]
+    if (not isinstance(context, dict) or set(context) != {"edits"}
+            or not isinstance(context["edits"], list)
+            or any(not isinstance(edit, dict) or edit.get("type") not in {
+                "clear_tool_uses_20250919", "clear_thinking_20251015"
+            } for edit in context["edits"])):
+        raise AgentError("native gateway supports bounded context editing only; server compaction is not metered")
+    return "context-management-2025-06-27"
+
+
 class HttpTransport:
     def __init__(self, timeout: int = 120, bedrock_client: Any | None = None):
         self.timeout = timeout
@@ -1119,6 +1133,8 @@ class HttpTransport:
             if not base.rstrip("/").endswith("/v1"):
                 base = base.rstrip("/") + "/v1"
             headers = {"x-api-key": key or "", "anthropic-version": "2023-06-01"}
+            if beta := anthropic_context_beta(payload):
+                headers["anthropic-beta"] = beta
         elif provider == "azure_adm":
             key = os.environ.get("AZURE_ADM_API_KEY")
             base = os.environ.get("AZURE_ADM_BASE_URL", "")
