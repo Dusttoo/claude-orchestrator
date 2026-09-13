@@ -11,7 +11,7 @@ override values from that file.
 ```yaml
 llm:
   execution: desktop
-  provider: anthropic
+  provider: openai
   model: ""
   effort: ""
   fallback: none
@@ -52,6 +52,19 @@ scripts/context_pipeline.py route --config .orchestration/config.yaml \
 ```
 
 - `execution: desktop` launches the existing native Claude Code or Codex agent.
+  With an empty `model`, `provider: openai` selects the installed Codex client
+  and uses its existing ChatGPT subscription login and configured default model.
+  Orka removes inherited API keys and custom base URLs from the child environment
+  and does not contact a provider health endpoint. It requires `codex login
+  status` to confirm ChatGPT subscription authentication, ignores user
+  configuration, and pins the built-in OpenAI provider. Because
+  subscription usage does not expose API billing receipts, USD/token accounting
+  is unavailable for those turns; lane concurrency, attempts, review limits,
+  worker lifetime, leases, and merge gates remain enforced. Explicit-model
+  desktop routes, including Claude routes, retain the metered gateway behavior
+  and require the matching API key. Model-less Claude routing fails closed
+  because Claude Code lacks reliable evidence distinguishing subscription from
+  Console/API billing.
 - `execution: api` builds the provider request with `context_pipeline.py payload
   --config ... --role ...`, then submits it through `api_agent.py run`. The
   runner owns the constrained tool-call loop, usage ledger, and budget stops.

@@ -39,6 +39,11 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    resolve their own overrides. A
    desktop fallback may reuse the provisional reservation only when no
    provider/run id was created. Uncertain API work remains reserved.
+   A model-less OpenAI desktop route is subscription-backed and selects Codex.
+   Omit model flags, API credentials, base URLs, and provider profiles. Report subscription turns
+   as unmetered while retaining every non-spend controller and review gate.
+   Model-less Claude routes are unsupported; Claude requires an explicit model
+   and the metered gateway.
 
    Resolve `ticket-scoper` separately for `plan.scope`. Run its bounded role
    brief in a fresh worker—never in the captain context. A desktop route uses a
@@ -123,7 +128,8 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    For Codex CLI, pass `--stdin-file <prompt-file>` to `launch-local` and use `-`
    as the `codex exec` prompt so the file contents, not its pathname, reach stdin.
    The complete input-bearing form is
-   `launch-local --sprint <id> --ticket <key> --attach-capability <attach_capability> --output <checkpoint-dir>/<run-ref>.jsonl --stdin-file <checkpoint-dir>/<run-ref>.prompt -- <codex-bin> exec --ephemeral --json --sandbox danger-full-access --model <configured-model> --cd <repository> -`.
+   `launch-local --sprint <id> --ticket <key> --attach-capability <attach_capability> --output <checkpoint-dir>/<run-ref>.jsonl --stdin-file <checkpoint-dir>/<run-ref>.prompt -- <codex-bin> exec --ephemeral --json --sandbox danger-full-access [--model <configured-model>] --cd <repository> -`.
+   Include `--model` only when the resolved route has a nonempty model.
    A native task reference is display metadata, not liveness evidence; if no
    supported adapter exposes its process identity, leave it reserved for
    explicit operator recovery.

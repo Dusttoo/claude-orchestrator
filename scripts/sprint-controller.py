@@ -35,8 +35,18 @@ from api_agent import (
     AgentError, Pricing, UsageLedger, budgets_from_config, load_yaml,
     TRANSIENT_PAUSE_REASONS, load_orchestration_env, PHASE_BUDGETS,
 )
-from provider_health import ProviderHealth, HealthError, route_identity, validate_native_command, probe
-from context_pipeline import llm_route_from_config
+from provider_health import (
+    ProviderHealth,
+    HealthError,
+    desktop_subscription_status,
+    model_less_desktop_route,
+    probe,
+    route_identity,
+    subscription_child_environment,
+    subscription_launch_command,
+    validate_native_command,
+)
+from context_pipeline import ContextError, llm_route_from_config
 
 from operator_authority import (
     AuthorityError,
@@ -1754,6 +1764,13 @@ def runtime_admission(cfg, role="sprint-worker"):
     if not cfg.get("runtime_admission"):
         return None
     route = llm_route_from_config(cfg["config"], role)
+    if model_less_desktop_route(route):
+        status = desktop_subscription_status(route)
+        return (
+            None
+            if status["state"] == "healthy"
+            else {"provider": route["provider"], "role": role, **status}
+        )
     if not route.get("model"):
         return {"provider": route["provider"], "state": "unconfigured", "reason": "explicit role model required"}
     status = ProviderHealth(cfg["shared_root"]).status(route["provider"], route_identity(route))
@@ -2736,6 +2753,9 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
     gateway = None
     stop_reason = ""
     child_env = dict(os.environ)
+    # Older internal callers and recovery fixtures construct the supervisor
+    # namespace directly, so absence means the existing metered desktop path.
+    subscription_route = bool(getattr(args, "subscription_route", False))
     started = time.monotonic()
     checkpoint = state_path(_cfg["state_dir"], args.sprint)
     max_seconds = min(3600, max(1, int(config_scalar_any_depth(_cfg["config"], "max_worker_seconds", "1800"))))
@@ -2747,7 +2767,15 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
     signal.signal(signal.SIGTERM, forward)
     signal.signal(signal.SIGINT, forward)
     try:
-        if Path(command[0]).name == "claude":
+        if subscription_route:
+            route = llm_route_from_config(_cfg["config"], "sprint-worker")
+            if not model_less_desktop_route(route):
+                raise SprintError("subscription launch no longer matches repository policy")
+            command = subscription_launch_command(command, route)
+            child_env = subscription_child_environment(
+                child_env, str(route["provider"])
+            )
+        elif Path(command[0]).name == "claude":
             from native_gateway import NativeGateway, claude_child_environment, claude_launch_arguments
             load_orchestration_env(_cfg["config"])
             if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -2812,7 +2840,14 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
                     break
                 time.sleep(0.1)
             returncode = child.wait()
-    except (OSError, subprocess.SubprocessError, AgentError, SprintError) as exc:
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        AgentError,
+        ContextError,
+        HealthError,
+        SprintError,
+    ) as exc:
         terminal = {
             "invocation_id": args.invocation_id,
             "phase": "terminal",
@@ -2930,6 +2965,7 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     )
     if input_path is not None and not input_path.is_file():
         raise SprintError("worker input must be an existing repository file")
+    route = None
     with locked(path):
         state = load(path)
         ticket = state["tickets"].get(key)
@@ -2999,6 +3035,8 @@ def launch_local(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         ]
         if input_path is not None:
             supervisor.extend(["--stdin-file", str(input_path)])
+        if route and model_less_desktop_route(route):
+            supervisor.append("--subscription-route")
         supervisor.extend(["--", *command])
         containment = "cooperative-session"
         unit_name = ""
@@ -3758,6 +3796,7 @@ def parser() -> argparse.ArgumentParser:
     supervisor_parser.add_argument("--tombstone", required=True)
     supervisor_parser.add_argument("--output", required=True)
     supervisor_parser.add_argument("--stdin-file")
+    supervisor_parser.add_argument("--subscription-route", action="store_true")
     supervisor_parser.add_argument("command", nargs=argparse.REMAINDER)
     supervisor_parser.set_defaults(func=supervise_local)
     finish_parser = commands.add_parser("finish")

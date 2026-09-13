@@ -50,8 +50,10 @@ worker_trust_profile: cooperative-worker  # cooperative-worker | isolated-worker
 # a desktop fallback then could duplicate writes, PRs, or billing.
 llm:
   execution: desktop             # desktop | api
-  provider: anthropic            # anthropic | openai | azure_adm | bedrock | bedrock_mantle
-  model: ""                      # required when effective execution is api
+  # A model-less OpenAI desktop route selects Codex using its verified ChatGPT
+  # subscription login and default model. Claude/API routes require a model id.
+  provider: openai               # anthropic | openai | azure_adm | bedrock | bedrock_mantle
+  model: ""                      # blank OpenAI desktop = subscription; otherwise required
   effort: ""                     # optional: low | medium | high | xhigh | max
   fallback: none                 # desktop | none; applies only to API launch
   # Hard ceilings are checked before every provider request. The runner reserves

@@ -34,6 +34,12 @@ only after proving the API request failed before any provider/run id existed.
 Submitted, timed-out, or uncertain API work remains reserved for reconciliation
 and must never be duplicated.
 
+For a model-less OpenAI desktop route, use Codex's ChatGPT subscription login
+and configured default model; do not add an API credential, base URL, or model
+override. These turns have no API usage receipt, but every non-spend workflow
+gate remains mandatory. Model-less Claude routes are unsupported because their
+subscription authentication cannot be proven mechanically.
+
 ## Relaying information (do not hand down stale facts)
 
 You are a lossy relay. Every hop -- an agent's report into your brief, a brief
