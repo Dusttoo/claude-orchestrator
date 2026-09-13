@@ -34,6 +34,12 @@ only after proving the API request failed before any provider/run id existed.
 Submitted, timed-out, or uncertain API work remains reserved for reconciliation
 and must never be duplicated.
 
+For model-less desktop routes, `provider: openai` selects Codex and
+`provider: anthropic` selects Claude. Use the installed client's subscription
+login and configured default model; do not add an API credential, base URL, or
+model override. These turns have no API usage receipt, but every non-spend
+workflow gate remains mandatory.
+
 ## Relaying information (do not hand down stale facts)
 
 You are a lossy relay. Every hop -- an agent's report into your brief, a brief

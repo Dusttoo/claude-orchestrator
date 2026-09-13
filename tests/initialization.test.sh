@@ -7,9 +7,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/.."
 PREFLIGHT_REPO="$(mktemp -d)"
 INCOMPLETE_PLUGIN="$(mktemp -d)"
-trap 'rm -rf "$PREFLIGHT_REPO" "$INCOMPLETE_PLUGIN"' EXIT
+FAKE_BIN="$(mktemp -d)"
+trap 'rm -rf "$PREFLIGHT_REPO" "$INCOMPLETE_PLUGIN" "$FAKE_BIN"' EXIT
 mkdir -p "$PREFLIGHT_REPO/.orchestration"
 cp "$ROOT/templates/config.yaml" "$PREFLIGHT_REPO/.orchestration/config.yaml"
+printf '#!/bin/sh\nexit 0\n' > "$FAKE_BIN/claude"
+chmod +x "$FAKE_BIN/claude"
 
 fails=0
 ok() { printf 'ok   %s\n' "$1"; }
@@ -110,6 +113,19 @@ assert sys.argv[2]=='2' and v['installation_status']=='ready' and not v['executi
 CHECK
 }
 check "captain separates installed plugin from unverified provider readiness" check_runtime_unverified
+check_runtime_verified_subscription() {
+  PATH="$FAKE_BIN:$PATH" python3 "$ROOT/scripts/captain-preflight.py" \
+    --plugin-root "$ROOT" --repo "$PREFLIGHT_REPO" --host claude \
+    --verify-runtime > "$PREFLIGHT_REPO/subscription-preflight.json"
+  python3 - "$PREFLIGHT_REPO/subscription-preflight.json" <<'CHECK'
+import json,sys
+v=json.load(open(sys.argv[1]))
+assert v['status']=='ready' and v['execution_ready']
+assert all(x['state']=='healthy' and x['mode']=='subscription' for x in v['routes'])
+CHECK
+}
+check "verified preflight accepts model-less desktop subscription routes" \
+  check_runtime_verified_subscription
 check "captain preflight fails when the active plugin is incomplete" \
   sh -c '! python3 "$1/scripts/captain-preflight.py" --plugin-root "$2" --repo "$3" --host claude' sh "$ROOT" "$INCOMPLETE_PLUGIN" "$PREFLIGHT_REPO"
 

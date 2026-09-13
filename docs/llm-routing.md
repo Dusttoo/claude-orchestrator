@@ -52,6 +52,15 @@ scripts/context_pipeline.py route --config .orchestration/config.yaml \
 ```
 
 - `execution: desktop` launches the existing native Claude Code or Codex agent.
+  With an empty `model`, `provider: openai` selects the installed Codex client
+  and `provider: anthropic` selects the installed Claude client. This
+  model-less form uses that client's existing subscription login and configured
+  default model. Orka removes inherited API keys and custom base URLs from the
+  child environment and does not contact a provider health endpoint. Because
+  subscription usage does not expose API billing receipts, USD/token accounting
+  is unavailable for those turns; lane concurrency, attempts, review limits,
+  worker lifetime, leases, and merge gates remain enforced. Setting an explicit
+  model retains the metered gateway behavior and requires the matching API key.
 - `execution: api` builds the provider request with `context_pipeline.py payload
   --config ... --role ...`, then submits it through `api_agent.py run`. The
   runner owns the constrained tool-call loop, usage ledger, and budget stops.

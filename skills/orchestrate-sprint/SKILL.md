@@ -70,6 +70,12 @@ repository config. Caller environment and CLI values cannot replace that policy.
    reuse the provisional reservation only when
    no provider/run id was created; uncertain API work remains reserved.
 
+   A model-less desktop route is subscription-backed: `provider: openai`
+   selects Codex and `provider: anthropic` selects Claude. Do not add a model
+   flag, API key, base URL, or provider profile to that launch. Subscription
+   turns have no API billing receipt, so report them as unmetered while retaining
+   all controller attempt, concurrency, lifetime, review, lease, and merge gates.
+
    Resolve `ticket-scoper` independently before processing `plan.scope`. Use a
    fresh worker with `agents/orchestration-ticket-scoper.md`; never perform the
    assessment in the captain context. Desktop routing uses a fresh native task.
@@ -214,7 +220,7 @@ repository config. Caller environment and CLI values cannot replace that policy.
      --attach-capability <attach_capability> --output <checkpoint-dir>/<run-ref>.jsonl \
      --stdin-file <checkpoint-dir>/<run-ref>.prompt \
      -- <codex-bin> exec --ephemeral --json --sandbox danger-full-access \
-     --model <configured-model> --cd <repository> -
+     [--model <configured-model>] --cd <repository> -
    ```
 
    Pass the ticket body through a temporary file or stdin; never interpolate
@@ -397,7 +403,8 @@ A healthy cached probe lasts five minutes. Honor the next probe deadline rather
 than rotating new tickets through an outage. Never clear provider state by hand.
 
 Reservations bind the resolved `sprint-worker` route. Launch the matching direct
-Claude or Codex executable with exactly that model. Provider/profile overrides,
+Claude or Codex executable with exactly the configured model when nonempty; omit
+the model option for a model-less subscription route. Provider/profile overrides,
 unsupported service tiers, and changed routes are rejected before launch; a
 changed/missing reserved route requires reconciliation. Do not switch providers
 based solely on the interactive host or global default.

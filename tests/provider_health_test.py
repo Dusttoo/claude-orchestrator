@@ -1,13 +1,20 @@
 """Shared failures block admission across tickets, without granting ticket capacity."""
 
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from provider_health import ProviderHealth, validate_native_command, HealthError
+from provider_health import (
+    ProviderHealth,
+    HealthError,
+    probe,
+    subscription_child_environment,
+    validate_native_command,
+)
 
 
 class HealthTests(unittest.TestCase):
@@ -71,6 +78,58 @@ class HealthTests(unittest.TestCase):
                 -2:
             ],
             ["--effort", "high"],
+        )
+
+    def test_model_less_desktop_route_uses_client_default(self):
+        route = dict(
+            provider="openai", model="", execution="desktop", effort=""
+        )
+        with patch("provider_health.shutil.which", return_value="/bin/echo"):
+            command = validate_native_command(["codex", "exec", "prompt"], route)
+            self.assertEqual(command, ["/bin/echo", "exec", "prompt"])
+            with self.assertRaisesRegex(HealthError, "default model"):
+                validate_native_command(
+                    ["codex", "exec", "--model", "gpt-test", "prompt"], route
+                )
+
+    def test_model_less_desktop_probe_never_contacts_provider(self):
+        config = self.root / "config.yaml"
+        config.write_text(
+            "llm:\n  execution: desktop\n  provider: openai\n  model: ''\n"
+        )
+        transport = Mock()
+        with patch("provider_health.shutil.which", return_value="/bin/echo"):
+            state = probe(self.root, config, transport=transport)
+        self.assertEqual(state["state"], "healthy")
+        self.assertEqual(state["mode"], "subscription")
+        self.assertEqual(state["client"], "codex")
+        transport.request.assert_not_called()
+
+    def test_subscription_environment_cannot_inherit_api_routing(self):
+        environment = {
+            "PATH": "/bin",
+            "OPENAI_API_KEY": "secret",
+            "CODEX_API_KEY": "secret",
+            "OPENAI_BASE_URL": "https://api.example",
+        }
+        self.assertEqual(
+            subscription_child_environment(environment, "openai"),
+            {"PATH": "/bin"},
+        )
+        self.assertEqual(
+            subscription_child_environment(
+                {
+                    "PATH": "/bin",
+                    "ANTHROPIC_API_KEY": "secret",
+                    "ANTHROPIC_AUTH_TOKEN": "secret",
+                    "ANTHROPIC_BASE_URL": "https://api.example",
+                    "CLAUDE_CODE_USE_BEDROCK": "1",
+                    "CLAUDE_CODE_USE_VERTEX": "1",
+                    "CLAUDE_CODE_USE_FOUNDRY": "1",
+                },
+                "anthropic",
+            ),
+            {"PATH": "/bin"},
         )
 
     def test_absent_token_never_clears_incident(self):
@@ -224,6 +283,50 @@ class AdmissionTests(unittest.TestCase):
         after = self.c.load(self.path)["tickets"]["T-1"]
         self.assertEqual(after["attach_capability"], ticket["attach_capability"])
         self.assertFalse(after["launch_evidence"])
+
+    def test_model_less_desktop_admission_and_launch_use_subscription(self):
+        config = Path(self.cfg["config"])
+        config.write_text(
+            "llm:\n  execution: desktop\n  provider: openai\n  model: ''\n"
+        )
+        binary = self.root / "bin/codex"
+        binary.parent.mkdir()
+        binary.write_text(
+            "#!/bin/sh\n"
+            "test -z \"${OPENAI_API_KEY+x}\" || exit 9\n"
+            "test -z \"${CODEX_API_KEY+x}\" || exit 9\n"
+            "test -z \"${OPENAI_BASE_URL+x}\" || exit 9\n"
+            "printf subscription-clean\n"
+        )
+        binary.chmod(0o755)
+        ready = self.root / "ready.json"
+        ack = self.root / "ack"
+        tombstone = self.root / "terminal.json"
+        output = self.root / "output.log"
+        ack.touch()
+        args = self.N(
+            command=[str(binary), "exec"],
+            ready=str(ready),
+            ack=str(ack),
+            tombstone=str(tombstone),
+            output=str(output),
+            invocation_id="subscription-launch",
+            ticket="T-1",
+            sprint="1",
+            stdin_file=None,
+            subscription_route=True,
+        )
+        environment = {
+            "PATH": str(binary.parent) + os.pathsep + os.environ.get("PATH", ""),
+            "OPENAI_API_KEY": "must-not-reach-child",
+            "CODEX_API_KEY": "must-not-reach-child",
+            "OPENAI_BASE_URL": "https://api.example",
+        }
+        with patch.dict(os.environ, environment, clear=False):
+            self.assertIsNone(self.c.runtime_admission(self.cfg))
+            self.c.supervise_local(args, self.cfg)
+        self.assertEqual(output.read_text(), "subscription-clean")
+        self.assertEqual(self.c.read_json(ready, label="ready")["phase"], "terminal")
 
     def test_scope_required_with_decomposition_disabled(self):
         self.healthy()

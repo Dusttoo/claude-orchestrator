@@ -20,6 +20,53 @@ class HealthError(RuntimeError):
     pass
 
 
+DESKTOP_CLIENTS = {"openai": "codex", "anthropic": "claude"}
+SUBSCRIPTION_ENVIRONMENT_KEYS = {
+    "openai": {"OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"},
+    "anthropic": {
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    },
+}
+
+
+def model_less_desktop_route(route):
+    return route.get("execution") == "desktop" and not route.get("model")
+
+
+def desktop_subscription_status(route):
+    """Validate a model-less subscription client without provider traffic."""
+    if not model_less_desktop_route(route):
+        raise HealthError("route is not a model-less desktop subscription route")
+    client = DESKTOP_CLIENTS.get(route.get("provider"))
+    executable = shutil.which(client) if client else None
+    if not executable:
+        return {
+            "state": "incompatible",
+            "reason": "configured desktop subscription client is unavailable",
+            "client": client,
+        }
+    return {
+        "state": "healthy",
+        "mode": "subscription",
+        "client": client,
+        "executable": str(Path(executable).resolve()),
+        "route": route_identity(route),
+    }
+
+
+def subscription_child_environment(environment, provider):
+    """Prevent inherited API credentials from overriding subscription login."""
+    result = dict(environment)
+    for key in SUBSCRIPTION_ENVIRONMENT_KEYS.get(provider, set()):
+        result.pop(key, None)
+    return result
+
+
 class ProviderHealth:
     def __init__(self, root):
         from runtime_state import shared_repository_root
@@ -163,7 +210,7 @@ def route_identity(route):
     # No credentials or credential digests are persisted.
     identity = {k: v for k, v in route.items() if k != "role"}
     if route.get("execution") == "desktop":
-        client = {"openai": "codex", "anthropic": "claude"}.get(route.get("provider"))
+        client = DESKTOP_CLIENTS.get(route.get("provider"))
         executable = shutil.which(client) if client else None
         identity["executable"] = executable
         if executable:
@@ -178,12 +225,12 @@ def route_identity(route):
 
 
 def validate_native_command(command, route):
-    """Enforce explicit model and prevent profiles/config from replacing routing."""
+    """Enforce the resolved model policy and prevent routing overrides."""
     command = list(command)
-    expected = {"anthropic": "claude", "openai": "codex"}.get(route.get("provider"))
-    if route.get("execution") != "desktop" or not expected or not route.get("model"):
+    expected = DESKTOP_CLIENTS.get(route.get("provider"))
+    if route.get("execution") != "desktop" or not expected:
         raise HealthError(
-            "native launch requires an explicit supported desktop worker route"
+            "native launch requires a supported desktop worker route"
         )
     if not command or Path(command[0]).name != expected:
         raise HealthError(
@@ -259,8 +306,11 @@ def validate_native_command(command, route):
             key = value.split("=", 1)[0].strip()
             if key not in {"sandbox_mode", "approval_policy"}:
                 raise HealthError("worker config override is not controller-authorized")
-    if values != [route["model"]]:
-        raise HealthError("worker must specify the resolved model exactly once")
+    if route.get("model"):
+        if values != [route["model"]]:
+            raise HealthError("worker must specify the resolved model exactly once")
+    elif values:
+        raise HealthError("model-less desktop route must use the client's default model")
     effort = route.get("effort")
     if efforts and efforts != [effort]:
         raise HealthError("worker effort differs from resolved route")
@@ -273,7 +323,7 @@ def validate_native_command(command, route):
 
 
 def probe(root, config, role="sprint-worker", repair=False, transport=None):
-    """One bounded, serialized token-count probe; no ticket reservation or model generation."""
+    """Verify one route without a ticket reservation or paid generation."""
     from context_pipeline import llm_route_from_config
     from api_agent import (
         AgentError,
@@ -286,6 +336,8 @@ def probe(root, config, role="sprint-worker", repair=False, transport=None):
     provider = route["provider"]
     identity = route_identity(route)
     health = ProviderHealth(root)
+    if model_less_desktop_route(route):
+        return desktop_subscription_status(route)
     if not route.get("model"):
         raise HealthError("configured route has no explicit model")
     existing = health.status(provider, identity)
