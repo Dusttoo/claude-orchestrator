@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 from pathlib import Path
 import time
 import uuid
@@ -22,7 +23,16 @@ class HealthError(RuntimeError):
 
 DESKTOP_CLIENTS = {"openai": "codex", "anthropic": "claude"}
 SUBSCRIPTION_ENVIRONMENT_KEYS = {
-    "openai": {"OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"},
+    "openai": {
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "OPENAI_ORG_ID",
+        "OPENAI_PROJECT_ID",
+        "AZURE_OPENAI_API_KEY",
+        "AZURE_OPENAI_ENDPOINT",
+    },
     "anthropic": {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
@@ -30,6 +40,7 @@ SUBSCRIPTION_ENVIRONMENT_KEYS = {
         "CLAUDE_CODE_USE_BEDROCK",
         "CLAUDE_CODE_USE_VERTEX",
         "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CONFIG_DIR",
     },
 }
 
@@ -50,6 +61,55 @@ def desktop_subscription_status(route):
             "reason": "configured desktop subscription client is unavailable",
             "client": client,
         }
+    if client == "codex":
+        environment = subscription_child_environment(os.environ, "openai")
+        try:
+            login = subprocess.run(
+                [executable, "login", "status"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=environment,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {
+                "state": "incompatible",
+                "reason": f"Codex subscription login could not be verified: {exc}",
+                "client": client,
+            }
+        login_status = (login.stdout + "\n" + login.stderr).strip()
+        if login.returncode != 0 or "logged in using chatgpt" not in login_status.lower():
+            return {
+                "state": "incompatible",
+                "reason": "Codex is not authenticated with a ChatGPT subscription",
+                "client": client,
+            }
+    elif client == "claude":
+        managed_paths = [
+            Path("/etc/claude-code/managed-settings.json"),
+            Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+        ]
+        for path in managed_paths:
+            if not path.is_file():
+                continue
+            try:
+                settings = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                return {
+                    "state": "incompatible",
+                    "reason": f"Claude managed settings cannot be verified: {exc}",
+                    "client": client,
+                }
+            managed_env = settings.get("env", {})
+            if settings.get("apiKeyHelper") or (
+                isinstance(managed_env, dict)
+                and SUBSCRIPTION_ENVIRONMENT_KEYS["anthropic"] & managed_env.keys()
+            ):
+                return {
+                    "state": "incompatible",
+                    "reason": "Claude managed settings configure API-backed routing",
+                    "client": client,
+                }
     return {
         "state": "healthy",
         "mode": "subscription",
@@ -65,6 +125,32 @@ def subscription_child_environment(environment, provider):
     for key in SUBSCRIPTION_ENVIRONMENT_KEYS.get(provider, set()):
         result.pop(key, None)
     return result
+
+
+def subscription_launch_command(command, route):
+    """Bind a model-less client to subscription-safe configuration sources."""
+    status = desktop_subscription_status(route)
+    if status.get("state") != "healthy":
+        raise HealthError(str(status.get("reason") or "subscription route is unavailable"))
+    command = validate_native_command(command, route)
+    provider = route.get("provider")
+    if provider == "openai":
+        # CLI configuration has highest precedence. Ignore the user's base
+        # config and force the built-in OpenAI provider; authentication was
+        # separately proven to be ChatGPT rather than an API key.
+        command[2:2] = [
+            "--ignore-user-config",
+            "-c",
+            'model_provider="openai"',
+        ]
+    elif provider == "anthropic":
+        # Claude settings may contain an env block that is applied after the
+        # process environment. Loading no user/project/local setting source
+        # prevents it from restoring an API endpoint or cloud-provider mode.
+        command.extend(["--setting-sources", ""])
+    else:
+        raise HealthError("unsupported desktop subscription provider")
+    return command
 
 
 class ProviderHealth:
@@ -281,6 +367,8 @@ def validate_native_command(command, route):
             "--fallback-model",
             "--oss",
             "--local-provider",
+            "--ignore-user-config",
+            "--plugin-dir",
         } or any(
             arg.startswith(x + "=")
             for x in [
@@ -290,6 +378,7 @@ def validate_native_command(command, route):
                 "--agent",
                 "--agents",
                 "--fallback-model",
+                "--plugin-dir",
             ]
         ):
             raise HealthError(

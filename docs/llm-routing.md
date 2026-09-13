@@ -56,7 +56,11 @@ scripts/context_pipeline.py route --config .orchestration/config.yaml \
   and `provider: anthropic` selects the installed Claude client. This
   model-less form uses that client's existing subscription login and configured
   default model. Orka removes inherited API keys and custom base URLs from the
-  child environment and does not contact a provider health endpoint. Because
+  child environment and does not contact a provider health endpoint. Codex
+  routes additionally require `codex login status` to confirm ChatGPT
+  subscription authentication and pin the built-in OpenAI provider; Claude
+  routes disable user, project, and local settings sources so they cannot
+  restore API routing after environment cleanup. Because
   subscription usage does not expose API billing receipts, USD/token accounting
   is unavailable for those turns; lane concurrency, attempts, review limits,
   worker lifetime, leases, and merge gates remain enforced. Setting an explicit

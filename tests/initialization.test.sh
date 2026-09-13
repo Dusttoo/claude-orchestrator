@@ -12,7 +12,8 @@ trap 'rm -rf "$PREFLIGHT_REPO" "$INCOMPLETE_PLUGIN" "$FAKE_BIN"' EXIT
 mkdir -p "$PREFLIGHT_REPO/.orchestration"
 cp "$ROOT/templates/config.yaml" "$PREFLIGHT_REPO/.orchestration/config.yaml"
 printf '#!/bin/sh\nexit 0\n' > "$FAKE_BIN/claude"
-chmod +x "$FAKE_BIN/claude"
+printf '#!/bin/sh\n[ "$1 $2" = "login status" ] && echo "Logged in using ChatGPT"\nexit 0\n' > "$FAKE_BIN/codex"
+chmod +x "$FAKE_BIN/claude" "$FAKE_BIN/codex"
 
 fails=0
 ok() { printf 'ok   %s\n' "$1"; }

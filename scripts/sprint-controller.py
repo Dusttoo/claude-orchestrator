@@ -43,6 +43,7 @@ from provider_health import (
     probe,
     route_identity,
     subscription_child_environment,
+    subscription_launch_command,
     validate_native_command,
 )
 from context_pipeline import llm_route_from_config
@@ -2755,14 +2756,6 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
     # Older internal callers and recovery fixtures construct the supervisor
     # namespace directly, so absence means the existing metered desktop path.
     subscription_route = bool(getattr(args, "subscription_route", False))
-    if subscription_route:
-        route = llm_route_from_config(_cfg["config"], "sprint-worker")
-        if not model_less_desktop_route(route):
-            raise SprintError("subscription launch no longer matches repository policy")
-        command = validate_native_command(command, route)
-        child_env = subscription_child_environment(
-            child_env, str(route["provider"])
-        )
     started = time.monotonic()
     checkpoint = state_path(_cfg["state_dir"], args.sprint)
     max_seconds = min(3600, max(1, int(config_scalar_any_depth(_cfg["config"], "max_worker_seconds", "1800"))))
@@ -2775,7 +2768,13 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
     signal.signal(signal.SIGINT, forward)
     try:
         if subscription_route:
-            pass
+            route = llm_route_from_config(_cfg["config"], "sprint-worker")
+            if not model_less_desktop_route(route):
+                raise SprintError("subscription launch no longer matches repository policy")
+            command = subscription_launch_command(command, route)
+            child_env = subscription_child_environment(
+                child_env, str(route["provider"])
+            )
         elif Path(command[0]).name == "claude":
             from native_gateway import NativeGateway, claude_child_environment, claude_launch_arguments
             load_orchestration_env(_cfg["config"])
@@ -2841,7 +2840,7 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
                     break
                 time.sleep(0.1)
             returncode = child.wait()
-    except (OSError, subprocess.SubprocessError, AgentError, SprintError) as exc:
+    except (OSError, subprocess.SubprocessError, AgentError, HealthError, SprintError) as exc:
         terminal = {
             "invocation_id": args.invocation_id,
             "phase": "terminal",

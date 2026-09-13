@@ -13,6 +13,7 @@ from provider_health import (
     HealthError,
     probe,
     subscription_child_environment,
+    subscription_launch_command,
     validate_native_command,
 )
 
@@ -98,12 +99,28 @@ class HealthTests(unittest.TestCase):
             "llm:\n  execution: desktop\n  provider: openai\n  model: ''\n"
         )
         transport = Mock()
-        with patch("provider_health.shutil.which", return_value="/bin/echo"):
+        login = Mock(returncode=0, stdout="Logged in using ChatGPT\n", stderr="")
+        with patch("provider_health.shutil.which", return_value="/bin/echo"), patch(
+            "provider_health.subprocess.run", return_value=login
+        ):
             state = probe(self.root, config, transport=transport)
         self.assertEqual(state["state"], "healthy")
         self.assertEqual(state["mode"], "subscription")
         self.assertEqual(state["client"], "codex")
         transport.request.assert_not_called()
+
+    def test_model_less_codex_rejects_api_authentication(self):
+        config = self.root / "config.yaml"
+        config.write_text(
+            "llm:\n  execution: desktop\n  provider: openai\n  model: ''\n"
+        )
+        login = Mock(returncode=0, stdout="Logged in using an API key\n", stderr="")
+        with patch("provider_health.shutil.which", return_value="/bin/echo"), patch(
+            "provider_health.subprocess.run", return_value=login
+        ):
+            state = probe(self.root, config)
+        self.assertEqual(state["state"], "incompatible")
+        self.assertIn("ChatGPT subscription", state["reason"])
 
     def test_subscription_environment_cannot_inherit_api_routing(self):
         environment = {
@@ -111,11 +128,32 @@ class HealthTests(unittest.TestCase):
             "OPENAI_API_KEY": "secret",
             "CODEX_API_KEY": "secret",
             "OPENAI_BASE_URL": "https://api.example",
+            "AZURE_OPENAI_API_KEY": "secret",
+            "AZURE_OPENAI_ENDPOINT": "https://azure.example",
         }
         self.assertEqual(
             subscription_child_environment(environment, "openai"),
             {"PATH": "/bin"},
         )
+
+    def test_subscription_launch_pins_client_configuration(self):
+        login = Mock(returncode=0, stdout="Logged in using ChatGPT\n", stderr="")
+        with patch("provider_health.shutil.which", return_value="/bin/echo"), patch(
+            "provider_health.subprocess.run", return_value=login
+        ):
+            codex = subscription_launch_command(
+                ["codex", "exec", "--json", "prompt"],
+                dict(provider="openai", model="", execution="desktop", effort=""),
+            )
+            claude = subscription_launch_command(
+                ["claude", "-p", "prompt"],
+                dict(provider="anthropic", model="", execution="desktop", effort=""),
+            )
+        self.assertEqual(
+            codex[2:5],
+            ["--ignore-user-config", "-c", 'model_provider="openai"'],
+        )
+        self.assertEqual(claude[-2:], ["--setting-sources", ""])
         self.assertEqual(
             subscription_child_environment(
                 {
@@ -293,9 +331,17 @@ class AdmissionTests(unittest.TestCase):
         binary.parent.mkdir()
         binary.write_text(
             "#!/bin/sh\n"
+            "if [ \"$1 $2\" = \"login status\" ]; then\n"
+            "  printf 'Logged in using ChatGPT\\n'\n"
+            "  exit 0\n"
+            "fi\n"
             "test -z \"${OPENAI_API_KEY+x}\" || exit 9\n"
             "test -z \"${CODEX_API_KEY+x}\" || exit 9\n"
             "test -z \"${OPENAI_BASE_URL+x}\" || exit 9\n"
+            "test -z \"${AZURE_OPENAI_API_KEY+x}\" || exit 9\n"
+            "test -z \"${AZURE_OPENAI_ENDPOINT+x}\" || exit 9\n"
+            "printf '%s\\n' \"$@\" | grep -qx -- '--ignore-user-config' || exit 9\n"
+            "printf '%s\\n' \"$@\" | grep -qx -- 'model_provider=\"openai\"' || exit 9\n"
             "printf subscription-clean\n"
         )
         binary.chmod(0o755)
@@ -321,12 +367,41 @@ class AdmissionTests(unittest.TestCase):
             "OPENAI_API_KEY": "must-not-reach-child",
             "CODEX_API_KEY": "must-not-reach-child",
             "OPENAI_BASE_URL": "https://api.example",
+            "AZURE_OPENAI_API_KEY": "must-not-reach-child",
+            "AZURE_OPENAI_ENDPOINT": "https://azure.example",
         }
         with patch.dict(os.environ, environment, clear=False):
             self.assertIsNone(self.c.runtime_admission(self.cfg))
             self.c.supervise_local(args, self.cfg)
         self.assertEqual(output.read_text(), "subscription-clean")
         self.assertEqual(self.c.read_json(ready, label="ready")["phase"], "terminal")
+
+    def test_subscription_route_drift_writes_terminal_without_spawning(self):
+        config = Path(self.cfg["config"])
+        config.write_text(
+            "llm:\n  execution: desktop\n  provider: openai\n  model: gpt-test\n"
+        )
+        ready = self.root / "drift-ready.json"
+        ack = self.root / "drift-ack"
+        tombstone = self.root / "drift-terminal.json"
+        output = self.root / "drift-output.log"
+        ack.touch()
+        args = self.N(
+            command=["codex", "exec", "prompt"],
+            ready=str(ready),
+            ack=str(ack),
+            tombstone=str(tombstone),
+            output=str(output),
+            invocation_id="subscription-drift",
+            ticket="T-1",
+            sprint="1",
+            stdin_file=None,
+            subscription_route=True,
+        )
+        self.c.supervise_local(args, self.cfg)
+        terminal = self.c.read_json(tombstone, label="terminal")
+        self.assertFalse(terminal["spawned"])
+        self.assertIn("no longer matches", terminal["error"])
 
     def test_scope_required_with_decomposition_disabled(self):
         self.healthy()
