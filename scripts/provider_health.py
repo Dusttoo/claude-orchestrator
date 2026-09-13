@@ -46,7 +46,11 @@ SUBSCRIPTION_ENVIRONMENT_KEYS = {
 
 
 def model_less_desktop_route(route):
-    return route.get("execution") == "desktop" and not route.get("model")
+    return (
+        route.get("execution") == "desktop"
+        and route.get("provider") == "openai"
+        and not route.get("model")
+    )
 
 
 def desktop_subscription_status(route):
@@ -84,32 +88,6 @@ def desktop_subscription_status(route):
                 "reason": "Codex is not authenticated with a ChatGPT subscription",
                 "client": client,
             }
-    elif client == "claude":
-        managed_paths = [
-            Path("/etc/claude-code/managed-settings.json"),
-            Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
-        ]
-        for path in managed_paths:
-            if not path.is_file():
-                continue
-            try:
-                settings = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                return {
-                    "state": "incompatible",
-                    "reason": f"Claude managed settings cannot be verified: {exc}",
-                    "client": client,
-                }
-            managed_env = settings.get("env", {})
-            if settings.get("apiKeyHelper") or (
-                isinstance(managed_env, dict)
-                and SUBSCRIPTION_ENVIRONMENT_KEYS["anthropic"] & managed_env.keys()
-            ):
-                return {
-                    "state": "incompatible",
-                    "reason": "Claude managed settings configure API-backed routing",
-                    "client": client,
-                }
     return {
         "state": "healthy",
         "mode": "subscription",
@@ -143,11 +121,6 @@ def subscription_launch_command(command, route):
             "-c",
             'model_provider="openai"',
         ]
-    elif provider == "anthropic":
-        # Claude settings may contain an env block that is applied after the
-        # process environment. Loading no user/project/local setting source
-        # prevents it from restoring an API endpoint or cloud-provider mode.
-        command.extend(["--setting-sources", ""])
     else:
         raise HealthError("unsupported desktop subscription provider")
     return command

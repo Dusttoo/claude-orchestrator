@@ -39,10 +39,11 @@ normalization, atomic lane reservation, checkpoints, recovery, and summaries.
    resolve their own overrides. A
    desktop fallback may reuse the provisional reservation only when no
    provider/run id was created. Uncertain API work remains reserved.
-   A model-less desktop route is subscription-backed: `provider: openai`
-   selects Codex and `provider: anthropic` selects Claude. Omit model flags,
-   API credentials, base URLs, and provider profiles. Report subscription turns
+   A model-less OpenAI desktop route is subscription-backed and selects Codex.
+   Omit model flags, API credentials, base URLs, and provider profiles. Report subscription turns
    as unmetered while retaining every non-spend controller and review gate.
+   Model-less Claude routes are unsupported; Claude requires an explicit model
+   and the metered gateway.
 
    Resolve `ticket-scoper` separately for `plan.scope`. Run its bounded role
    brief in a fresh worker—never in the captain context. A desktop route uses a

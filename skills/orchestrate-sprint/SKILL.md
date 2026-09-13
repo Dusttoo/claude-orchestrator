@@ -70,11 +70,11 @@ repository config. Caller environment and CLI values cannot replace that policy.
    reuse the provisional reservation only when
    no provider/run id was created; uncertain API work remains reserved.
 
-   A model-less desktop route is subscription-backed: `provider: openai`
-   selects Codex and `provider: anthropic` selects Claude. Do not add a model
-   flag, API key, base URL, or provider profile to that launch. Subscription
+   A model-less OpenAI desktop route is subscription-backed and selects Codex.
+   Do not add a model flag, API key, base URL, or provider profile to that launch. Subscription
    turns have no API billing receipt, so report them as unmetered while retaining
    all controller attempt, concurrency, lifetime, review, lease, and merge gates.
+   Model-less Claude routes are unsupported; use an explicit-model metered route.
 
    Resolve `ticket-scoper` independently before processing `plan.scope`. Use a
    fresh worker with `agents/orchestration-ticket-scoper.md`; never perform the

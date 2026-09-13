@@ -145,15 +145,15 @@ class HealthTests(unittest.TestCase):
                 ["codex", "exec", "--json", "prompt"],
                 dict(provider="openai", model="", execution="desktop", effort=""),
             )
-            claude = subscription_launch_command(
-                ["claude", "-p", "prompt"],
-                dict(provider="anthropic", model="", execution="desktop", effort=""),
-            )
+            with self.assertRaisesRegex(HealthError, "model-less"):
+                subscription_launch_command(
+                    ["claude", "-p", "prompt"],
+                    dict(provider="anthropic", model="", execution="desktop", effort=""),
+                )
         self.assertEqual(
             codex[2:5],
             ["--ignore-user-config", "-c", 'model_provider="openai"'],
         )
-        self.assertEqual(claude[-2:], ["--setting-sources", ""])
         self.assertEqual(
             subscription_child_environment(
                 {
@@ -402,6 +402,33 @@ class AdmissionTests(unittest.TestCase):
         terminal = self.c.read_json(tombstone, label="terminal")
         self.assertFalse(terminal["spawned"])
         self.assertIn("no longer matches", terminal["error"])
+
+    def test_malformed_subscription_route_writes_terminal_without_spawning(self):
+        config = Path(self.cfg["config"])
+        config.write_text(
+            "llm:\n  execution: desktop\n  provider: unsupported\n  model: ''\n"
+        )
+        ready = self.root / "malformed-ready.json"
+        ack = self.root / "malformed-ack"
+        tombstone = self.root / "malformed-terminal.json"
+        output = self.root / "malformed-output.log"
+        ack.touch()
+        args = self.N(
+            command=["codex", "exec", "prompt"],
+            ready=str(ready),
+            ack=str(ack),
+            tombstone=str(tombstone),
+            output=str(output),
+            invocation_id="subscription-malformed",
+            ticket="T-1",
+            sprint="1",
+            stdin_file=None,
+            subscription_route=True,
+        )
+        self.c.supervise_local(args, self.cfg)
+        terminal = self.c.read_json(tombstone, label="terminal")
+        self.assertFalse(terminal["spawned"])
+        self.assertIn("provider must be one of", terminal["error"])
 
     def test_scope_required_with_decomposition_disabled(self):
         self.healthy()

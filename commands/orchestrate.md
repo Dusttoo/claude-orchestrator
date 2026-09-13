@@ -36,11 +36,11 @@ usage, and budget enforcement. Desktop fallback is legal only when the runner
 proves the API request failed before any provider/run id existed; submitted or
 uncertain work stays reserved for reconciliation and is never duplicated.
 
-For a model-less desktop route, `provider: openai` selects Codex and
-`provider: anthropic` selects Claude. Use the installed client's subscription
-login and default model without an API credential, custom base URL, or model
-override. Subscription turns are unmetered by Orka, but all non-spend workflow
-gates remain mandatory.
+For a model-less OpenAI desktop route, use Codex's ChatGPT subscription login
+and default model without an API credential, custom base URL, or model override.
+Subscription turns are unmetered by Orka, but all non-spend workflow gates
+remain mandatory. Model-less Claude routes are unsupported because Claude Code
+does not expose reliable subscription-auth evidence.
 
 **You are a lossy relay -- do not hand down stale facts.** Every hop from an
 agent's report into a brief into a durable doc can drop the uncertainty marker.

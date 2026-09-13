@@ -291,12 +291,11 @@ lanes waiting on providers do not justify oversubscribing those local commands.
 
 ### Native worker spending and supervision
 
-A model-less desktop route is the subscription-backed alternative. Set
-`provider: openai` for Codex or `provider: anthropic` for Claude and leave
-`model: ""`. The controller launches the matching installed client with its
+A model-less OpenAI desktop route is the subscription-backed alternative. Set
+`provider: openai` and leave `model: ""`. The controller launches Codex with its
 configured default model, removes inherited API credentials and alternate base
-URLs, binds Codex to verified ChatGPT authentication or isolates Claude from
-user/project/local settings, and does not insert the metered gateway. These turns cannot contribute
+URLs, binds it to verified ChatGPT authentication, and does not insert the
+metered gateway. These turns cannot contribute
 provider receipts to Orka's USD/token ledger. The execution unit, lane and
 review counts, no-progress milestones, worker lifetime, repository lease, CI,
 and merge gates remain authoritative.
@@ -620,8 +619,9 @@ Run `captain-preflight.py --plugin-root <installation> --repo <repository>
 files/config exist. `execution_ready: true` requires bounded installed-client
 checks and authenticated token-count probes for explicit-model routes.
 Model-less desktop subscription routes instead verify that the selected client
-is installed and executable without contacting a provider endpoint. Codex also
-must report that it is logged in through ChatGPT.
+is installed and executable without contacting a provider endpoint. Codex must
+also report that it is logged in through ChatGPT. Model-less Claude routes are
+unsupported because Claude Code lacks reliable subscription-auth evidence.
 Probe credentials use the same environment precedence as the runtime; an invalid
 process-environment key will still override a corrected repository `.env`.
 Never print credential values. No credential is changed by these commands.

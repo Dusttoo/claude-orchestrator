@@ -46,7 +46,7 @@ from provider_health import (
     subscription_launch_command,
     validate_native_command,
 )
-from context_pipeline import llm_route_from_config
+from context_pipeline import ContextError, llm_route_from_config
 
 from operator_authority import (
     AuthorityError,
@@ -2840,7 +2840,14 @@ def supervise_local(args: argparse.Namespace, _cfg: dict[str, Any]) -> None:
                     break
                 time.sleep(0.1)
             returncode = child.wait()
-    except (OSError, subprocess.SubprocessError, AgentError, HealthError, SprintError) as exc:
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        AgentError,
+        ContextError,
+        HealthError,
+        SprintError,
+    ) as exc:
         terminal = {
             "invocation_id": args.invocation_id,
             "phase": "terminal",
