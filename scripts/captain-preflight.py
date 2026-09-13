@@ -51,13 +51,17 @@ def main() -> int:
     for relative in REQUIRED:
         digest.update(relative.encode())
         digest.update((plugin / relative).read_bytes())
-    from context_pipeline import llm_route_from_config
-    from provider_health import ProviderHealth, route_identity, probe
+    from context_pipeline import ContextError, llm_route_from_config
+    from provider_health import HealthError, ProviderHealth, route_identity, probe
     routes = []
     for role in ("sprint-worker", "ticket-scoper", "implementer", "design-reviewer", "code-reviewer", "security-reviewer"):
-        route = llm_route_from_config(config, role)
-        status = (probe(repo, config, role, args.after_repair) if args.verify_runtime else
-                  ProviderHealth(repo).status(route["provider"], route_identity(route)))
+        route = {"provider": "unknown", "model": ""}
+        try:
+            route = llm_route_from_config(config, role)
+            status = (probe(repo, config, role, args.after_repair) if args.verify_runtime else
+                      ProviderHealth(repo).status(route["provider"], route_identity(route)))
+        except (ContextError, HealthError) as exc:
+            status = {"state": "incompatible", "reason": str(exc)}
         routes.append({"role": role, "provider": route["provider"], "model": route["model"], **status})
     execution_ready = all(item["state"] == "healthy" for item in routes)
     print(json.dumps({

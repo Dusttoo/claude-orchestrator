@@ -11,7 +11,7 @@ override values from that file.
 ```yaml
 llm:
   execution: desktop
-  provider: anthropic
+  provider: openai
   model: ""
   effort: ""
   fallback: none

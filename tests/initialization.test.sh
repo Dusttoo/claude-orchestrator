@@ -7,10 +7,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/.."
 PREFLIGHT_REPO="$(mktemp -d)"
 INCOMPLETE_PLUGIN="$(mktemp -d)"
+UNSUPPORTED_ROUTE_REPO="$(mktemp -d)"
 FAKE_BIN="$(mktemp -d)"
-trap 'rm -rf "$PREFLIGHT_REPO" "$INCOMPLETE_PLUGIN" "$FAKE_BIN"' EXIT
+trap 'rm -rf "$PREFLIGHT_REPO" "$INCOMPLETE_PLUGIN" "$UNSUPPORTED_ROUTE_REPO" "$FAKE_BIN"' EXIT
 mkdir -p "$PREFLIGHT_REPO/.orchestration"
 cp "$ROOT/templates/config.yaml" "$PREFLIGHT_REPO/.orchestration/config.yaml"
+mkdir -p "$UNSUPPORTED_ROUTE_REPO/.orchestration"
+python3 - "$ROOT/templates/config.yaml" "$UNSUPPORTED_ROUTE_REPO/.orchestration/config.yaml" <<'PY'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+Path(sys.argv[2]).write_text(source.replace("provider: openai", "provider: anthropic", 1))
+PY
 printf '#!/bin/sh\nexit 0\n' > "$FAKE_BIN/claude"
 printf '#!/bin/sh\n[ "$1 $2" = "login status" ] && echo "Logged in using ChatGPT"\nexit 0\n' > "$FAKE_BIN/codex"
 chmod +x "$FAKE_BIN/claude" "$FAKE_BIN/codex"
@@ -127,6 +135,19 @@ CHECK
 }
 check "verified preflight accepts model-less desktop subscription routes" \
   check_runtime_verified_subscription
+check_unsupported_claude_route() {
+  ! PATH="$FAKE_BIN:$PATH" python3 "$ROOT/scripts/captain-preflight.py" \
+    --plugin-root "$ROOT" --repo "$UNSUPPORTED_ROUTE_REPO" --host claude \
+    --verify-runtime > "$UNSUPPORTED_ROUTE_REPO/blocked-preflight.json"
+  python3 - "$UNSUPPORTED_ROUTE_REPO/blocked-preflight.json" <<'CHECK'
+import json,sys
+v=json.load(open(sys.argv[1]))
+assert v['status']=='blocked' and not v['execution_ready']
+assert any(x['state']=='incompatible' and 'explicit model' in x['reason'] for x in v['routes'])
+CHECK
+}
+check "model-less Claude preflight fails closed with structured status" \
+  check_unsupported_claude_route
 check "captain preflight fails when the active plugin is incomplete" \
   sh -c '! python3 "$1/scripts/captain-preflight.py" --plugin-root "$2" --repo "$3" --host claude' sh "$ROOT" "$INCOMPLETE_PLUGIN" "$PREFLIGHT_REPO"
 
